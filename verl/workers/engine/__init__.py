@@ -47,13 +47,24 @@ except ImportError:
 
 # Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
 try:
-    from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead, MindSpeedMegatronEngineWithLMHead
+    from .mindspeed import (
+        MindspeedEngineWithLMHead,
+        MindspeedEngineWithValueHead,
+        MindSpeedMegatronEngineWithLMHead,
+        MindSpeedFSDPEngineWithLMHead,
+    )
 
-    __all__ += ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedMegatronEngineWithLMHead"]
+    __all__ += [
+        "MindspeedEngineWithLMHead",
+        "MindspeedEngineWithValueHead",
+        "MindSpeedMegatronEngineWithLMHead",
+        "MindSpeedFSDPEngineWithLMHead",
+    ]
 except ImportError:
     MindspeedEngineWithLMHead = None
     MindspeedEngineWithValueHead = None
     MindSpeedMegatronEngineWithLMHead = None
+    MindSpeedFSDPEngineWithLMHead = None
 
 try:
     from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead

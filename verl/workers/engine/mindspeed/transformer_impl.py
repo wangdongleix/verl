@@ -21,21 +21,34 @@ except ImportError:
     repatch = None
 
 from verl.trainer.config import CheckpointConfig
-from verl.utils.megatron.router_replay_patch import RouterReplay
 from verl.utils.model import print_model_size
+from verl.utils.debug import log_gpu_memory_usage
 from verl.workers.config import (
     HFModelConfig,
     McoreEngineConfig,
     McoreOptimizerConfig,
+    MindSpeedOptimizerConfig,
     MindSpeedEngineConfig,
 )
 
-from ..base import EngineRegistry
-from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+from ..base import EngineRegistry, BaseEngine
+
+try:
+    from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+except ImportError:
+    MegatronEngineWithLMHead = BaseEngine
+    MegatronEngineWithValueHead = BaseEngine
+
+try:
+    from ..fsdp import FSDPEngineWithLMHead
+except ImportError:
+    FSDPEngineWithLMHead = BaseEngine
+
 from .utils import (
     apply_patch,
     gpt_model_provider,
     reset_fp8_reuse_quantized_weight,
+    fsdp_turbo_module,
 )
 
 logger = logging.getLogger(__file__)
@@ -112,7 +125,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
         self,
         model_config: HFModelConfig,
         engine_config: MindSpeedEngineConfig,
-        optimizer_config: McoreOptimizerConfig,
+        optimizer_config: MindSpeedOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
@@ -148,6 +161,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
             print_model_size(module[0])
 
         if self.enable_routing_replay:
+            from verl.utils.megatron.router_replay_patch import RouterReplay
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
 
         return module
@@ -164,3 +178,66 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
         """
         reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+
+@EngineRegistry.register(model_type="language_model", backend="mindspeed_fsdp", device="npu")
+class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
+    def __init__(
+            self,
+            model_config: HFModelConfig,
+            engine_config: MindSpeedEngineConfig,
+            optimizer_config: MindSpeedOptimizerConfig,
+            checkpoint_config: CheckpointConfig,
+    ):
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+
+    def _build_model_optimizer(self):
+        # Load base model with specified configuration and dtype
+        module = self._build_module()
+        # Apply LoRA adapters if low-rank adaptation is enabled
+        if self._is_lora:
+            module = self._build_lora_module(module)
+
+        # Apply QAT before FSDP wrapping (training only)
+        if self._qat_enabled and not self.engine_config.forward_only:
+            module = self._apply_qat(module)
+
+        # Synchronize all distributed processes before proceeding
+        import torch.distributed
+        torch.distributed.barrier()
+        if self.rank == 0:
+            print_model_size(module)
+        log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+
+        # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
+        log_gpu_memory_usage("Before FSDP", logger=None)
+        full_state = module.state_dict()
+        module = fsdp_turbo_module(self.engine_config.fsdp_kwargs, module)
+        # full_state = {f"model.{k}": v for k, v in full_state.items()}
+        from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+        fsdp2_load_full_state_dict(module, full_state)
+        log_gpu_memory_usage("After FSDP", logger=None)
+
+        if not self.engine_config.forward_only:
+            # Initialize optimizer with model parameters and config settings
+            optimizer = self._build_optimizer(module)
+            # Create learning rate scheduler with warmup and decay settings
+            lr_scheduler = self._build_lr_scheduler(optimizer)
+        else:
+            optimizer = None
+            lr_scheduler = None
+
+        self.module = module
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+
+    # def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    #     per_tensor_param, peft_config_dict = super().get_per_tensor_param(
+    #         layered_summon=layered_summon, base_sync_done=base_sync_done, **kwargs
+    #     )
+    #     # 去掉fsdp turbo引入的"model."前缀，适配vllm期望格式
+    #     per_tensor_param = (
+    #         (name[len("model."):], param) if name.startswith("model.") else (name, param)
+    #         for name, param in per_tensor_param
+    #     )
+    #     return per_tensor_param, peft_config_dict

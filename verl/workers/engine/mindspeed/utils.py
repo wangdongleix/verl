@@ -238,3 +238,14 @@ def reset_fp8_reuse_quantized_weight(engine, device: str, model: bool, optimizer
         # we need to keep its high-precision weights for offloading. For actor_update model, the high-precision
         # weights will be released if possible, and then recovered before optimizer step
         set_weight_release_enabled(getattr(engine, "mode", None) == "train")
+
+
+def fsdp_turbo_module(fsdp_config, module):
+    from dacite import from_dict
+    from fsdp_turbo.fsdp_turbo import FSDPTurbo
+    from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+
+    fsdp_turbo_config = from_dict(FSDPTurboConfig, fsdp_config)
+    module = FSDPTurbo(fsdp_turbo_config, module)
+
+    return module.model
