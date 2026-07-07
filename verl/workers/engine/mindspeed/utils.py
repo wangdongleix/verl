@@ -240,12 +240,79 @@ def reset_fp8_reuse_quantized_weight(engine, device: str, model: bool, optimizer
         set_weight_release_enabled(getattr(engine, "mode", None) == "train")
 
 
-def fsdp_turbo_module(fsdp_config, module):
-    from dacite import from_dict
-    from fsdp_turbo.fsdp_turbo import FSDPTurbo
-    from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+def convert_model_dtype(model, dtype):
+    for param in model.parameters():
+        param.data = param.data.to(dtype)
+    for buffer in model.buffers():
+        buffer.data = buffer.data.to(dtype)
 
-    fsdp_turbo_config = from_dict(FSDPTurboConfig, fsdp_config)
-    module = FSDPTurbo(fsdp_turbo_config, module)
 
-    return module.model
+def apply_clip_grad_norm_patch():
+    import torch.nn.utils.clip_grad as clip_grad
+    from torch.distributed.tensor import DTensor
+
+    # === Patch 1: _get_total_norm ===
+    if not getattr(clip_grad._get_total_norm, '_dtensor_patched', False):
+        _original_norm_fn = clip_grad._get_total_norm
+
+        def _patched_get_total_norm(grads, norm_type, error_if_nonfinite, foreach):
+            has_dtensor = any(isinstance(g, DTensor) for g in grads)
+            if not has_dtensor:
+                return _original_norm_fn(grads, norm_type, error_if_nonfinite, foreach)
+
+            individual_norms = []
+            for g in grads:
+                if isinstance(g, DTensor):
+                    # torch.norm 走 DTensor op dispatch，自动处理 Shard 的 all-reduce
+                    # 返回标量 Replicate DTensor，无需手动获取 group
+                    norm = torch.norm(g, p=norm_type)
+                    # Replicate 标量 to_local = 全局值，无需通信
+                    if isinstance(norm, DTensor):
+                        norm = norm.to_local()
+                    individual_norms.append(norm)
+                else:
+                    individual_norms.append(torch.norm(g, p=norm_type))
+
+            # 全部是普通 tensor，stack 不会触发 sharding propagation
+            if individual_norms:
+                total_norm = torch.stack(individual_norms).norm(p=norm_type)
+            else:
+                total_norm = torch.tensor(0.0)
+
+            if error_if_nonfinite and not torch.isfinite(total_norm):
+                raise RuntimeError(f'Non-finite total norm: {total_norm}')
+            return total_norm
+
+        _patched_get_total_norm._dtensor_patched = True
+        _patched_get_total_norm._original_fn = _original_norm_fn
+        clip_grad._get_total_norm = _patched_get_total_norm
+
+    # === Patch 2: _clip_grads_with_norm_ ===
+    if not getattr(clip_grad._clip_grads_with_norm_, '_dtensor_patched', False):
+        _original_clip_fn = clip_grad._clip_grads_with_norm_
+
+        def _patched_clip_grads_with_norm_(parameters, max_norm, total_norm, foreach=None):
+            if isinstance(parameters, torch.Tensor):
+                parameters = [parameters]
+
+            has_dtensor = any(
+                isinstance(p.grad, DTensor)
+                for p in parameters
+                if p.grad is not None
+            )
+            if not has_dtensor:
+                return _original_clip_fn(parameters, max_norm, total_norm, foreach)
+
+            # DTensor 梯度存在：用 for 循环逐个 mul_，避免 _foreach_mul_ 跨 mesh 报错
+            # mul_(python_float) 是标量乘法，不触发 sharding propagation
+            clip_coef = max_norm / (total_norm.item() + 1e-6)
+            clip_coef = min(max(clip_coef, 0.0), 1.0)
+
+            if clip_coef < 1.0:
+                for p in parameters:
+                    if p.grad is not None:
+                        p.grad.mul_(clip_coef)
+
+        _patched_clip_grads_with_norm_._dtensor_patched = True
+        _patched_clip_grads_with_norm_._original_fn = _original_clip_fn
+        clip_grad._clip_grads_with_norm_ = _patched_clip_grads_with_norm_

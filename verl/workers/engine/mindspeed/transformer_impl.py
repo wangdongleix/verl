@@ -22,7 +22,6 @@ except ImportError:
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils.model import print_model_size
-from verl.utils.debug import log_gpu_memory_usage
 from verl.workers.config import (
     HFModelConfig,
     McoreEngineConfig,
@@ -48,7 +47,8 @@ from .utils import (
     apply_patch,
     gpt_model_provider,
     reset_fp8_reuse_quantized_weight,
-    fsdp_turbo_module,
+    convert_model_dtype,
+    apply_clip_grad_norm_patch,
 )
 
 logger = logging.getLogger(__file__)
@@ -190,54 +190,53 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
             checkpoint_config: CheckpointConfig,
     ):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+        apply_clip_grad_norm_patch()
 
-    def _build_model_optimizer(self):
-        # Load base model with specified configuration and dtype
-        module = self._build_module()
-        # Apply LoRA adapters if low-rank adaptation is enabled
-        if self._is_lora:
-            module = self._build_lora_module(module)
+    def _init_device_mesh(self):
+        self._parallel_state = None
+        super()._init_device_mesh()
+        self._init_parallel_state()
 
-        # Apply QAT before FSDP wrapping (training only)
-        if self._qat_enabled and not self.engine_config.forward_only:
-            module = self._apply_qat(module)
+    def _init_parallel_state(self):
+        from dacite import from_dict
+        from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+        from fsdp_turbo.distributed.parallel_state import init_parallel_state, get_parallel_state
 
-        # Synchronize all distributed processes before proceeding
-        import torch.distributed
-        torch.distributed.barrier()
-        if self.rank == 0:
-            print_model_size(module)
-        log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+        self.fsdp_turbo_config = from_dict(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
+        init_parallel_state(fsdp_turbo_config)
+        self._parallel_state = get_parallel_state()
 
-        # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
-        log_gpu_memory_usage("Before FSDP", logger=None)
-        full_state = module.state_dict()
-        module = fsdp_turbo_module(self.engine_config.fsdp_kwargs, module)
-        # full_state = {f"model.{k}": v for k, v in full_state.items()}
+    def _build_fsdp_module(self, module):
+        from fsdp_turbo.fsdp_turbo import FSDPTurbo
         from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+
+        full_state = module.state_dict()
+        convert_model_dtype(module, fsdp_turbo_config.model.torch_dtype)
+        module = FSDPTurbo(self.fsdp_turbo_config, module).model
         fsdp2_load_full_state_dict(module, full_state)
-        log_gpu_memory_usage("After FSDP", logger=None)
 
-        if not self.engine_config.forward_only:
-            # Initialize optimizer with model parameters and config settings
-            optimizer = self._build_optimizer(module)
-            # Create learning rate scheduler with warmup and decay settings
-            lr_scheduler = self._build_lr_scheduler(optimizer)
-        else:
-            optimizer = None
-            lr_scheduler = None
+    def _is_ep_enabled(self):
+        return (
+            self._parallel_state is not None
+            and self._parallel_state.is_group_enable("ep")
+        )
 
-        self.module = module
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
+    def get_data_parallel_rank(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_rank("edp")
+        return super().get_data_parallel_rank()
 
-    # def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
-    #     per_tensor_param, peft_config_dict = super().get_per_tensor_param(
-    #         layered_summon=layered_summon, base_sync_done=base_sync_done, **kwargs
-    #     )
-    #     # 去掉fsdp turbo引入的"model."前缀，适配vllm期望格式
-    #     per_tensor_param = (
-    #         (name[len("model."):], param) if name.startswith("model.") else (name, param)
-    #         for name, param in per_tensor_param
-    #     )
-    #     return per_tensor_param, peft_config_dict
+    def get_data_parallel_size(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_group_size("edp")
+        return super().get_data_parallel_size()
+
+    def get_data_parallel_group(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_group("edp")
+        return super().get_data_parallel_group()
+
+    def is_mp_src_rank_with_outputs(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_rank("ep") == 0
+        return super().is_mp_src_rank_with_outputs()

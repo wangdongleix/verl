@@ -60,6 +60,8 @@ fsdp_kwargs:
 
       apply_modules:
         model.visual.blocks.{*}: {}
+        model.visual.patch_embed: {}
+        model.visual.pos_embed: {}
         model.language_model.embed_tokens: {}
         model.language_model.layers.{*}: {}
         lm_head: {}
