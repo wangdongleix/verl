@@ -14,9 +14,14 @@
 
 """Unit tests for save_lora_only checkpoint support in FSDPCheckpointManager."""
 
+from collections import namedtuple
+
 import pytest
 
 from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
+
+# Return type mimicking torch.nn.Module.load_state_dict with strict=False
+_LoadStateDictResult = namedtuple("_LoadStateDictResult", ["missing_keys", "unexpected_keys"])
 
 
 class TestBaseCheckpointManagerLoraOnly:
@@ -144,7 +149,7 @@ class TestFSDPCheckpointManagerLoraOnly:
         state_dict = torch.load(saved_path, weights_only=False)
         for key in state_dict:
             assert "lora_" in key or ".adapter_" in key, "Unexpected base key: {}".format(key)
-        assert len(state_dict) == 2
+        assert len(state_dict) == 4
 
     def test_save_lora_only_no_lora_saves_full(self, tmp_path):
         model = _FakeFSDPModel(has_lora=False)
@@ -224,17 +229,29 @@ class TestFSDPCheckpointManagerLoraOnly:
         assert model_after._fsdp_wrapped_module.base_weight.item() == 42.0
 
 
+class _FakeConfig:
+    """Minimal config mock that supports save_pretrained."""
+
+    def save_pretrained(self, path):
+        pass
+
+
 class _FakeFSDPModel:
     """A fake FSDP-wrapped model that mimics the interface used by FSDPCheckpointManager."""
 
     def __init__(self, has_lora=True):
         self._fsdp_wrapped_module = _FakePEFTModel(has_lora=has_lora)
+        self.config = self._fsdp_wrapped_module.config
+        self.can_generate = self._fsdp_wrapped_module.can_generate
 
     def state_dict(self):
         return self._fsdp_wrapped_module.state_dict()
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        return self._fsdp_wrapped_module.load_state_dict(state_dict, strict=strict, assign=assign)
+        result = self._fsdp_wrapped_module.load_state_dict(state_dict, strict=strict, assign=assign)
+        if result is None:
+            return _LoadStateDictResult(missing_keys=[], unexpected_keys=[])
+        return result
 
     def named_buffers(self):
         return {}.items()
@@ -249,7 +266,7 @@ class _FakePEFTModel:
         self.base_weight = torch.nn.Parameter(torch.tensor(1.0))
         self.lora_A_weight = torch.nn.Parameter(torch.tensor(0.5))
         self.lora_B_weight = torch.nn.Parameter(torch.tensor(0.3))
-        self.config = None
+        self.config = _FakeConfig()
         self.can_generate = lambda: False
 
         if has_lora:
@@ -267,6 +284,7 @@ class _FakePEFTModel:
         return d
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
+        unexpected_keys = []
         for key, tensor in state_dict.items():
             if "base.weight" in key or key == "base.weight":
                 self.base_weight.data.copy_(tensor)
@@ -274,3 +292,6 @@ class _FakePEFTModel:
                 self.lora_A_weight.data.copy_(tensor)
             elif "lora_B" in key:
                 self.lora_B_weight.data.copy_(tensor)
+            else:
+                unexpected_keys.append(key)
+        return _LoadStateDictResult(missing_keys=[], unexpected_keys=unexpected_keys)
