@@ -9,6 +9,14 @@ export MULTI_STREAM_MEMORY_REUSE=2
 export OMP_NUM_THREADS=1
 
 gen_tp=8
+turbo_cp_size=2
+
+FSDP_TURBO_ROOT=${FSDP_TURBO_ROOT:-/Users/albert/code/ascend/FSDPTurbo}
+if [[ ! -d "${FSDP_TURBO_ROOT}/fsdp_turbo" ]]; then
+    echo "FSDP-Turbo was not found at ${FSDP_TURBO_ROOT}; set FSDP_TURBO_ROOT to its source or install path."
+    exit 1
+fi
+export PYTHONPATH="${FSDP_TURBO_ROOT}:${PYTHONPATH:-}"
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3.5-35B-A3B"}
@@ -92,21 +100,24 @@ MINDSPEED_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.fsdp_plan.hook_modules="['model.language_model.layers.{*}']"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.tp_plan.colwise_parallel="['*.q_proj', '*.k_proj', '*.v_proj']"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.tp_plan.rowwise_parallel="['*.o_proj']"
+    actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.fully_shard_parallel_size=16
+    +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ulysses_parallel_size=${turbo_cp_size}
+    +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.cp_plan.ulysses_function_patches="[{target_functions:['transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.eager_attention_forward'],type:full_attention},{target_functions:['transformers.loss.loss_utils.ForCausalLMLoss'],type:causal_lm_loss}]"
+    +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.module_patches="[{target_function:transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.forward,patch_function:examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_gated_delta_net_forward},{target_function:transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward,patch_function:examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_model_forward}]"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ep_plan.apply_modules="['model.language_model.layers.{*}.mlp.experts']"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ep_plan.dispatcher=eager
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.memory.recompute_plan="['model.language_model.layers.{*}','model.visual.blocks.{*}']"
     actor_rollout_ref.actor.mindspeed.reshard_after_forward=True
-    actor_rollout_ref.actor.mindspeed.ulysses_sequence_parallel_size=1
-    actor_rollout_ref.ref.mindspeed.ulysses_sequence_parallel_size=1
     actor_rollout_ref.ref.mindspeed.reshard_after_forward=True
     actor_rollout_ref.actor.mindspeed.entropy_from_logits_with_chunking=True
     actor_rollout_ref.ref.mindspeed.entropy_from_logits_with_chunking=True
     actor_rollout_ref.ref.mindspeed.wrap_policy.min_num_params=0
-    actor_rollout_ref.actor.mindspeed.offload_policy=True
-    actor_rollout_ref.ref.mindspeed.offload_policy=True
-    actor_rollout_ref.actor.mindspeed.param_offload=True
-    actor_rollout_ref.actor.mindspeed.optimizer_offload=True
-    actor_rollout_ref.ref.mindspeed.param_offload=True
+    # FSDP-Turbo's native FSDP2 wrappers own placement.
+    actor_rollout_ref.actor.mindspeed.offload_policy=False
+    actor_rollout_ref.ref.mindspeed.offload_policy=False
+    actor_rollout_ref.actor.mindspeed.param_offload=False
+    actor_rollout_ref.actor.mindspeed.optimizer_offload=False
+    actor_rollout_ref.ref.mindspeed.param_offload=False
 )
 
 REF_CONFIG=(

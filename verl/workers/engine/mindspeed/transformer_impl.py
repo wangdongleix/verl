@@ -198,22 +198,62 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
         self._init_parallel_state()
 
     def _init_parallel_state(self):
-        from dacite import from_dict
-        from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+        from omegaconf import OmegaConf
+        from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, _dict_to_dataclass
         from fsdp_turbo.distributed.parallel_state import init_parallel_state, get_parallel_state
 
-        self.fsdp_turbo_config = from_dict(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
-        init_parallel_state(fsdp_turbo_config)
+        fsdp_kwargs = self.engine_config.fsdp_kwargs
+        if OmegaConf.is_config(fsdp_kwargs):
+            fsdp_kwargs = OmegaConf.to_container(fsdp_kwargs, resolve=True)
+        self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, fsdp_kwargs)
+        init_parallel_state(self.fsdp_turbo_config)
         self._parallel_state = get_parallel_state()
+
+        self._turbo_cp_enabled = self._parallel_state.get_ulysses_group_size() > 1
+        if self._turbo_cp_enabled and not self.use_remove_padding:
+            raise ValueError(
+                "FSDP-Turbo CP for Qwen3.5 currently requires "
+                "actor_rollout_ref.model.use_remove_padding=True so that verl's "
+                "existing CP output path can gather local log-probs."
+            )
+        if self._turbo_cp_enabled and self.ulysses_sequence_parallel_size > 1:
+            raise ValueError(
+                "Do not enable both FSDP-Turbo CP and verl Ulysses SP. "
+                "Use fsdp_kwargs.distributed.ulysses_parallel_size for Turbo CP "
+                "and set ulysses_sequence_parallel_size=1."
+            )
+        if self._turbo_cp_enabled:
+            # Reuse the parent FSDP engine's CP input/output lifecycle, but make
+            # FSDP-Turbo the owner of the actual Ulysses process group.
+            self.ulysses_sequence_parallel_size = self._parallel_state.get_ulysses_group_size()
+            self.ulysses_parallel_group = self._parallel_state.get_ulysses_group()
+            self.use_ulysses_sp = True
+
+    def _build_module(self):
+        # Do not let verl's Qwen VLM monkey patch slice the text model before
+        # FSDP-Turbo's post-fusion model patch does the CP split.
+        cp_size = self.ulysses_sequence_parallel_size
+        self.ulysses_sequence_parallel_size = 1
+        try:
+            return super()._build_module()
+        finally:
+            self.ulysses_sequence_parallel_size = cp_size
+
+    def prepare_model_inputs(self, micro_batch):
+        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+        if self._turbo_cp_enabled:
+            model_inputs["_fsdp_turbo_post_fusion_ulysses"] = True
+        return model_inputs, output_args
 
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
         from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
 
         full_state = module.state_dict()
-        convert_model_dtype(module, fsdp_turbo_config.model.torch_dtype)
+        convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
         fsdp2_load_full_state_dict(module, full_state)
+        return module
 
     def _is_ep_enabled(self):
         return (
@@ -224,19 +264,33 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
     def get_data_parallel_rank(self):
         if self._is_ep_enabled():
             return self._parallel_state.get_rank("edp")
+        if self._parallel_state is not None:
+            return self._parallel_state.get_rank("dp")
         return super().get_data_parallel_rank()
 
     def get_data_parallel_size(self):
         if self._is_ep_enabled():
             return self._parallel_state.get_group_size("edp")
+        if self._parallel_state is not None:
+            return self._parallel_state.get_group_size("dp")
         return super().get_data_parallel_size()
 
     def get_data_parallel_group(self):
         if self._is_ep_enabled():
             return self._parallel_state.get_group("edp")
+        if self._parallel_state is not None:
+            return self._parallel_state.get_group("dp")
         return super().get_data_parallel_group()
 
+    def get_context_parallel_group(self):
+        if self._parallel_state is not None:
+            return self._parallel_state.get_cp_group()
+        return super().get_context_parallel_group()
+
     def is_mp_src_rank_with_outputs(self):
-        if self._is_ep_enabled():
-            return self._parallel_state.get_rank("ep") == 0
+        if self._parallel_state is not None:
+            is_cp_src = self._parallel_state.get_rank("ulysses") == 0
+            is_ep_src = not self._is_ep_enabled() or self._parallel_state.get_rank("ep") == 0
+            is_tp_src = not self._parallel_state.is_group_enable("tp") or self._parallel_state.get_rank("tp") == 0
+            return is_cp_src and is_ep_src and is_tp_src
         return super().is_mp_src_rank_with_outputs()
