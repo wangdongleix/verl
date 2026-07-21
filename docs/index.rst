@@ -128,6 +128,7 @@ verl is fast with:
    advance/delta_weight_sync
    advance/fully_async
    advance/async-on-policy-distill
+   advance/dynamic_schedule
 
 .. toctree::
    :maxdepth: 1
