@@ -43,4 +43,46 @@ mcore_kwargs:
   init_method_std: 0.01
   hidden_dropout: 0.0
 
-fsdp_kwargs: {}
+# mindspeed_fsdp backend config
+fsdp_kwargs:
+  distributed:
+    fully_shard_parallel_size: 16
+    tensor_parallel_size: 1
+    expert_parallel_size: 1
+    expert_fully_shard_parallel_size: 1
+    ulysses_parallel_size: 1
+    fsdp_plan:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      output_dtype: bf16
+      fsdp_implementation: native
+      num_to_forward_prefetch: 1
+      num_to_backward_prefetch: 1
+
+      apply_modules:
+        model.visual.blocks.{*}: {}
+        model.visual.patch_embed: {}
+        model.visual.pos_embed: {}
+        model.language_model.embed_tokens: {}
+        model.language_model.layers.{*}: {}
+        lm_head: {}
+
+#    cp_plan:
+#      ulysses_function_patches:
+#        - target_functions:
+#            - transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.eager_attention_forward
+#          type: full_attention
+#        - target_functions:
+#            - transformers.loss.loss_utils.ForCausalLMLoss
+#          type: causal_lm_loss
+#      batch_sequence_split:
+#        enabled: true
+#
+#  module_patches:
+#    - target_function: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.forward
+#      patch_function: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_gated_delta_net_forward
+#    - target_function: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward
+#      patch_function: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_model_forward
+
+  memory:
+    recompute: true

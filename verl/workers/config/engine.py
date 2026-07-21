@@ -612,7 +612,7 @@ class AutomodelEngineConfig(EngineConfig):
 
 
 @dataclass
-class MindSpeedEngineConfig(McoreEngineConfig):
+class MindSpeedEngineConfig(McoreEngineConfig, FSDPEngineConfig):
     """Configuration for mindspeed parallelism.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.

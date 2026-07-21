@@ -2,11 +2,12 @@
 defaults:
 
   # mindspeed optimizer config
-  - ../optim@optim: megatron
+  - ../optim@optim: mindspeed
 
   # mindspeed engine config
   - ../engine@mindspeed:
       - megatron
+      - fsdp
       - mindspeed
 
   # dp actor config, inheriting from trainer/config/critic/critic.yaml

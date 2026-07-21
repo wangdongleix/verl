@@ -27,6 +27,7 @@ __all__ = [
     "VeOmniOptimizerConfig",
     "TorchtitanOptimizerConfig",
     "AutomodelOptimizerConfig",
+    "MindSpeedOptimizerConfig",
 ]
 
 
@@ -237,6 +238,15 @@ class AutomodelOptimizerConfig(OptimizerConfig):
     def __post_init__(self):
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]
         return super().__post_init__()
+
+
+@dataclass
+class MindSpeedOptimizerConfig(McoreOptimizerConfig, FSDPOptimizerConfig):
+    """MindSpeed optimizer configuration extending base OptimizerConfig.
+    """
+
+    optimizer: str = "adam"
+    lr_warmup_ratio: float = 0.1
 
 
 def build_optimizer(parameters, config: FSDPOptimizerConfig):

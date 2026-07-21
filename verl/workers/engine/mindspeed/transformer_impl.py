@@ -21,21 +21,34 @@ except ImportError:
     repatch = None
 
 from verl.trainer.config import CheckpointConfig
-from verl.utils.megatron.router_replay_patch import RouterReplay
 from verl.utils.model import print_model_size
 from verl.workers.config import (
     HFModelConfig,
     McoreEngineConfig,
     McoreOptimizerConfig,
+    MindSpeedOptimizerConfig,
     MindSpeedEngineConfig,
 )
 
-from ..base import EngineRegistry
-from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+from ..base import EngineRegistry, BaseEngine
+
+try:
+    from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+except ImportError:
+    MegatronEngineWithLMHead = BaseEngine
+    MegatronEngineWithValueHead = BaseEngine
+
+try:
+    from ..fsdp import FSDPEngineWithLMHead
+except ImportError:
+    FSDPEngineWithLMHead = BaseEngine
+
 from .utils import (
     apply_patch,
     gpt_model_provider,
     reset_fp8_reuse_quantized_weight,
+    convert_model_dtype,
+    apply_clip_grad_norm_patch,
 )
 
 logger = logging.getLogger(__file__)
@@ -119,7 +132,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
         self,
         model_config: HFModelConfig,
         engine_config: MindSpeedEngineConfig,
-        optimizer_config: McoreOptimizerConfig,
+        optimizer_config: MindSpeedOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
@@ -155,6 +168,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
             print_model_size(module[0])
 
         if self.enable_routing_replay:
+            from verl.utils.megatron.router_replay_patch import RouterReplay
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
 
         return module
@@ -171,3 +185,67 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
         """
         reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+
+@EngineRegistry.register(model_type="language_model", backend="mindspeed_fsdp", device="npu")
+class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
+    def __init__(
+            self,
+            model_config: HFModelConfig,
+            engine_config: MindSpeedEngineConfig,
+            optimizer_config: MindSpeedOptimizerConfig,
+            checkpoint_config: CheckpointConfig,
+    ):
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+        apply_clip_grad_norm_patch()
+
+    def _init_device_mesh(self):
+        self._parallel_state = None
+        super()._init_device_mesh()
+        self._init_parallel_state()
+
+    def _init_parallel_state(self):
+        from dacite import from_dict
+        from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+        from fsdp_turbo.distributed.parallel_state import init_parallel_state, get_parallel_state
+
+        self.fsdp_turbo_config = from_dict(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
+        init_parallel_state(self.fsdp_turbo_config)
+        self._parallel_state = get_parallel_state()
+
+    def _build_fsdp_module(self, module):
+        from fsdp_turbo.fsdp_turbo import FSDPTurbo
+        from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+
+        full_state = module.state_dict()
+        convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
+        module = FSDPTurbo(self.fsdp_turbo_config, module).model
+        fsdp2_load_full_state_dict(module, full_state)
+
+        return module
+
+    def _is_ep_enabled(self):
+        return (
+            self._parallel_state is not None
+            and self._parallel_state.is_group_enable("ep")
+        )
+
+    def get_data_parallel_rank(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_rank("edp")
+        return super().get_data_parallel_rank()
+
+    def get_data_parallel_size(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_group_size("edp")
+        return super().get_data_parallel_size()
+
+    def get_data_parallel_group(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_group("edp")
+        return super().get_data_parallel_group()
+
+    def is_mp_src_rank_with_outputs(self):
+        if self._is_ep_enabled():
+            return self._parallel_state.get_rank("ep") == 0
+        return super().is_mp_src_rank_with_outputs()
