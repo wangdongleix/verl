@@ -265,21 +265,28 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
         if self._is_ep_enabled():
             return self._parallel_state.get_rank("edp")
         if self._parallel_state is not None:
-            return self._parallel_state.get_rank("dp")
+            if hasattr(self._parallel_state, "get_data_parallel_rank"):
+                return self._parallel_state.get_data_parallel_rank()
+            fsdp_size = self._parallel_state.get_group_size("fsdp")
+            return self._parallel_state.get_rank("dp") * fsdp_size + self._parallel_state.get_rank("fsdp")
         return super().get_data_parallel_rank()
 
     def get_data_parallel_size(self):
         if self._is_ep_enabled():
             return self._parallel_state.get_group_size("edp")
         if self._parallel_state is not None:
-            return self._parallel_state.get_group_size("dp")
+            if hasattr(self._parallel_state, "get_data_parallel_size"):
+                return self._parallel_state.get_data_parallel_size()
+            return self._parallel_state.get_group_size("dp") * self._parallel_state.get_group_size("fsdp")
         return super().get_data_parallel_size()
 
     def get_data_parallel_group(self):
         if self._is_ep_enabled():
             return self._parallel_state.get_group("edp")
         if self._parallel_state is not None:
-            return self._parallel_state.get_group("dp")
+            if hasattr(self._parallel_state, "get_data_parallel_group"):
+                return self._parallel_state.get_data_parallel_group()
+            return self._parallel_state.get_group("dp_fsdp")
         return super().get_data_parallel_group()
 
     def get_context_parallel_group(self):
