@@ -253,15 +253,14 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
 
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
-        from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+        from verl.utils.fsdp_utils import CPUOffloadPolicy, fsdp2_load_full_state_dict
 
         full_state = module.state_dict()
-        convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
-        convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
-        module = FSDPTurbo(self.fsdp_turbo_config, module).model
-        fsdp2_load_full_state_dict(module, full_state)
-
-        return module
+        # convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
+        offload_policy = CPUOffloadPolicy(pin_memory=True) if self.engine_config.offload_policy else None
+        self._uses_fsdp2_cpu_offload_policy = offload_policy is not None
+        module = FSDPTurbo(self.fsdp_turbo_config, module, offload_policy=offload_policy,).model
+        fsdp2_load_full_state_dict(module, full_state, cpu_offload=offload_policy)
 
         return module
 
