@@ -59,6 +59,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     build_mtp_speculative_config,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
+    resolve_load_format,
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
@@ -171,9 +172,14 @@ class vLLMHttpServer:
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
 
-        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+        resolved_load_format = resolve_load_format(
+            self.config.load_format,
+            self.rollout_mode,
+            self.model_config.random_init,
+        )
+        if resolved_load_format != self.config.load_format:
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
-            self.config.load_format = "auto"
+            self.config.load_format = resolved_load_format
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")

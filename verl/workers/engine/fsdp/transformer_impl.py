@@ -82,6 +82,25 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _load_hf_language_model(auto_class, model_config, torch_dtype, seed):
+    if model_config.random_init:
+        logger.info("Initializing the language model from config with random weights")
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            return auto_class.from_config(
+                model_config.hf_config,
+                torch_dtype=torch_dtype,
+                trust_remote_code=model_config.trust_remote_code,
+            )
+
+    return auto_class.from_pretrained(
+        pretrained_model_name_or_path=model_config.local_path,
+        torch_dtype=torch_dtype,
+        config=model_config.hf_config,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -249,11 +268,11 @@ class FSDPEngine(BaseEngine):
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
 
-                module = auto_class.from_pretrained(
-                    pretrained_model_name_or_path=self.model_config.local_path,
+                module = _load_hf_language_model(
+                    auto_class=auto_class,
+                    model_config=self.model_config,
                     torch_dtype=torch_dtype,
-                    config=self.model_config.hf_config,
-                    trust_remote_code=self.model_config.trust_remote_code,
+                    seed=self.engine_config.seed,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
@@ -269,6 +288,8 @@ class FSDPEngine(BaseEngine):
                 assert self.model_config.model_type == "value_model", (
                     f"Unsupported model type: {self.model_config.model_type}"
                 )
+                if self.model_config.random_init:
+                    raise ValueError("random_init is only supported for language_model")
                 self.model_config.hf_config.num_labels = 1
                 self.model_config.hf_config.classifier_dropout = 0.0
                 self.model_config.hf_config.hidden_dropout = "0"

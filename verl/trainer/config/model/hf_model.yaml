@@ -21,6 +21,9 @@ use_shm: False
 # whether to trust remote code.
 trust_remote_code: False
 
+# whether to initialize model weights from the HF config instead of loading them from path
+random_init: False
+
 # custom chat template for the model
 custom_chat_template: null
 

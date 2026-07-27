@@ -381,6 +381,7 @@ actor_rollout_ref:
     tokenizer_path: null
     use_shm: false
     trust_remote_code: false
+    random_init: false
     custom_chat_template: null
     external_lib: null
     override_config: {}
@@ -595,6 +596,7 @@ critic:
     tokenizer_path: null
     use_shm: false
     trust_remote_code: false
+    random_init: false
     custom_chat_template: null
     external_lib: null
     override_config: {}

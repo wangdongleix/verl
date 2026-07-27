@@ -107,6 +107,9 @@ class HFModelConfig(BaseConfig):
     use_shm: bool = False
     trust_remote_code: bool = False
 
+    # whether to initialize model weights from the HF config instead of loading them from path
+    random_init: bool = False
+
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
 

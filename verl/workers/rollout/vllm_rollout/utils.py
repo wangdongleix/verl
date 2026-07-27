@@ -30,6 +30,7 @@ from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
@@ -41,6 +42,12 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def resolve_load_format(load_format: str, rollout_mode: RolloutMode, random_init: bool) -> str:
+    if rollout_mode != RolloutMode.HYBRID and load_format == "dummy" and not random_init:
+        return "auto"
+    return load_format
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
