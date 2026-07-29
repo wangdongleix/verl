@@ -16,6 +16,8 @@
 import types
 import warnings
 
+from verl.utils.model_adapters import ProcessorAdapter, adapt_processor
+
 __all__ = [
     "hf_tokenizer",
     "hf_processor",
@@ -224,6 +226,8 @@ def hf_processor(name_or_path, **kwargs):
                 model_class = Glm4vModel
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "KimiK3Processor":
+                pass  # Kimi K3 uses a custom processor without a verl model-side RoPE binding
             case "Gemma4Processor":
                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
                 # per-image-token check (which Qwen's processor lacks).
@@ -235,6 +239,8 @@ def hf_processor(name_or_path, **kwargs):
             processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)
             if hasattr(model_class, "get_vision_position_ids"):
                 processor.get_vision_position_ids = types.MethodType(model_class.get_vision_position_ids, processor)
+
+        processor = adapt_processor(processor)
     except Exception as e:
         processor = None
         # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
@@ -242,7 +248,11 @@ def hf_processor(name_or_path, **kwargs):
         warnings.warn(f"Failed to create processor: {e}. This may affect multimodal processing", stacklevel=1)
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/auto/processing_auto.py#L344
-    if processor is not None and "Processor" not in processor.__class__.__name__:
+    if (
+        processor is not None
+        and "Processor" not in processor.__class__.__name__
+        and not isinstance(processor, ProcessorAdapter)
+    ):
         processor = None
 
     return processor
