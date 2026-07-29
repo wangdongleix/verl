@@ -102,6 +102,7 @@ MINDSPEED_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.tp_plan.rowwise_parallel="['*.o_proj']"
     actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.fully_shard_parallel_size=16
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ulysses_parallel_size=${turbo_cp_size}
+    +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.model.attn_implementation=eager
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.cp_plan.ulysses_function_patches="[{target_functions:['transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.eager_attention_forward'],type:full_attention},{target_functions:['transformers.loss.loss_utils.ForCausalLMLoss'],type:causal_lm_loss}]"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.module_patches="[{target_function:transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.forward,patch_function:examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_gated_delta_net_forward},{target_function:transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward,patch_function:examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_model_forward}]"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ep_plan.apply_modules="['model.language_model.layers.{*}.mlp.experts']"

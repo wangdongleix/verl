@@ -209,6 +209,14 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
         from fsdp_turbo.distributed.parallel_state import init_parallel_state, get_parallel_state
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
+        attn_implementation = self.fsdp_turbo_config.model.attn_implementation
+        for config in (
+            self.model_config.hf_config,
+            getattr(self.model_config.hf_config, "text_config", None),
+            getattr(self.model_config.hf_config, "vision_config", None),
+        ):
+            if config is not None:
+                config._attn_implementation = attn_implementation
         init_parallel_state(self.fsdp_turbo_config)
         self._parallel_state = get_parallel_state()
 
@@ -226,11 +234,6 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
                 "and set ulysses_sequence_parallel_size=1."
             )
         if self._turbo_cp_enabled:
-            self.model_config.hf_config._attn_implementation = "eager"
-            text_config = getattr(self.model_config.hf_config, "text_config", None)
-            if text_config is not None:
-                text_config._attn_implementation = "eager"
-
             self.ulysses_sequence_parallel_size = self._parallel_state.get_ulysses_group_size()
             self.ulysses_parallel_group = self._parallel_state.get_ulysses_group()
             self.use_ulysses_sp = True

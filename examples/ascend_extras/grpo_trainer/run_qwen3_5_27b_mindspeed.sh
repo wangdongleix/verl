@@ -101,6 +101,7 @@ MINDSPEED_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.tp_plan.rowwise_parallel="['*.o_proj']"
     actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.fully_shard_parallel_size=8
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.ulysses_parallel_size=${turbo_cp_size}
+    +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.model.attn_implementation=eager
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.distributed.cp_plan.ulysses_function_patches="[{target_functions:['transformers.models.qwen3_5.modeling_qwen3_5.eager_attention_forward'],type:full_attention},{target_functions:['transformers.loss.loss_utils.ForCausalLMLoss'],type:causal_lm_loss}]"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.module_patches="[{target_function:transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet.forward,patch_function:examples.qwen3_5.modeling_qwen3_5.qwen3_5_gated_delta_net_forward},{target_function:transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Model.forward,patch_function:examples.qwen3_5.modeling_qwen3_5.qwen3_5_model_forward}]"
     +actor_rollout_ref.actor.mindspeed.fsdp_kwargs.memory.recompute_plan="['model.language_model.layers.{*}','model.visual.blocks.{*}']"
