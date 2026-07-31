@@ -256,9 +256,29 @@ def apply_clip_grad_norm_patch():
                 else:
                     individual_norms.append(torch.norm(g, p=norm_type))
 
-            # 全部是普通 tensor，stack 不会触发 sharding propagation
+            # DTensor 的本地标量可能因 CPU offload 位于 CPU，而其它
+            # 参数的范数位于加速卡。先在各自设备内归约，再只传输每个
+            # 设备的一个标量；逐参数传输 CPU norm 会造成大量小 H2D 拷贝。
             if individual_norms:
-                total_norm = torch.stack(individual_norms).norm(p=norm_type)
+                if norm_type == 0:
+                    # p=0 统计非零参数范数个数，不能先按设备归约。
+                    per_device_norms = individual_norms
+                else:
+                    norms_by_device = {}
+                    for norm in individual_norms:
+                        norms_by_device.setdefault(norm.device, []).append(norm)
+                    per_device_norms = [
+                        torch.stack(norms).norm(p=norm_type) for norms in norms_by_device.values()
+                    ]
+                target_device = next(
+                    (norm.device for norm in per_device_norms if norm.device.type != "cpu"),
+                    per_device_norms[0].device,
+                )
+                per_device_norms = [
+                    norm if norm.device == target_device else norm.to(target_device, non_blocking=True)
+                    for norm in per_device_norms
+                ]
+                total_norm = torch.stack(per_device_norms).norm(p=norm_type)
             else:
                 total_norm = torch.tensor(0.0)
 
