@@ -28,6 +28,12 @@ class ProcessorAdapter:
 
 
 class KimiK3Adapter(ProcessorAdapter):
+    # Kimi maps this token to ``media_placeholder_token_id`` (163605 in the
+    # released config). It has no meaning in a generated response because no
+    # image feature accompanies it. Exposing the token lets the generic
+    # rollout logits mask resolve and ban it via ``get_processor_token_id``.
+    image_token = "<|media_pad|>"
+
     _MEDIA_PROMPT_PATTERN = re.compile(
         r"<\|media_begin\|>image \d+x\d+<\|media_content\|><\|media_pad\|><\|media_end\|>"
     )
