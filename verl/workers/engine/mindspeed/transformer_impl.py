@@ -310,6 +310,10 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
         if self._parallel_state is not None:
             is_cp_src = self._parallel_state.get_rank("ulysses") == 0
             is_ep_src = not self._is_ep_enabled() or self._parallel_state.get_rank("ep") == 0
+            is_efsdp_src = (
+                not self._parallel_state.is_group_enable("efsdp")
+                or self._parallel_state.get_rank("efsdp") == 0
+            )
             is_tp_src = not self._parallel_state.is_group_enable("tp") or self._parallel_state.get_rank("tp") == 0
-            return is_cp_src and is_ep_src and is_tp_src
+            return is_cp_src and is_ep_src and is_efsdp_src and is_tp_src
         return super().is_mp_src_rank_with_outputs()
