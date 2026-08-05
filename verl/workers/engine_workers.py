@@ -33,6 +33,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug.weight_sync import trace_weight_stream
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
@@ -700,6 +701,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            per_tensor_param = trace_weight_stream(
+                per_tensor_param,
+                stage="actor_export",
+                context={"global_steps": global_steps, "mode": effective_mode},
+            )
             await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return
 
@@ -726,10 +732,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
             )
+            per_tensor_param_base = trace_weight_stream(
+                per_tensor_param_base,
+                stage="actor_export_base",
+                context={"global_steps": global_steps, "mode": effective_mode},
+            )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
             )
 
+        per_tensor_param = trace_weight_stream(
+            per_tensor_param,
+            stage="actor_export",
+            context={"global_steps": global_steps, "mode": effective_mode},
+        )
         await self.rollout.update_weights(
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
         )

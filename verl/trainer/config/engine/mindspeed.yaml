@@ -79,10 +79,10 @@ fsdp_kwargs:
 #        enabled: true
 #
 #  module_patches:
-#    - target_function: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.forward
-#      patch_function: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_gated_delta_net_forward
-#    - target_function: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward
-#      patch_function: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_model_forward
+  #  - target: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.forward
+  #    replacement: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_gated_delta_net_forward
+  #  - target: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward
+  #    replacement: examples.qwen3_5_moe.modeling_qwen3_5_moe.qwen3_5_moe_model_forward
 
   memory:
     recompute: true

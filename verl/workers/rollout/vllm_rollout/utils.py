@@ -26,6 +26,7 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.plugin.platform import get_platform
+from verl.utils.debug.weight_sync import log_loaded_model_parameters, log_received_weights
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -255,7 +256,13 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        global_steps: int = None,
+    ):
         """Update the weights of the rollout model."""
         from vllm.platforms import current_platform
 
@@ -307,6 +314,7 @@ class vLLMColocateWorkerExtension:
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
                 quant_prepared=bool(quant_reload_state),
+                global_steps=global_steps,
             )
         )
 
@@ -352,8 +360,18 @@ class vLLMColocateWorkerExtension:
         peft_config: dict,
         base_sync_done: bool,
         quant_prepared: bool = False,
+        global_steps: int = None,
     ):
         if peft_config and base_sync_done:
+            log_received_weights(
+                weights,
+                stage="vllm_receive_lora",
+                context={
+                    "global_steps": global_steps,
+                    "base_sync_done": base_sync_done,
+                    "quant_prepared": quant_prepared,
+                },
+            )
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
             # past this callback, so views into the freed/overwritten buffer crash later (#6454).
             weights = {name: tensor.clone() for name, tensor in weights}
@@ -367,6 +385,15 @@ class vLLMColocateWorkerExtension:
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
+            log_received_weights(
+                weights,
+                stage="vllm_receive",
+                context={
+                    "global_steps": global_steps,
+                    "base_sync_done": base_sync_done,
+                    "quant_prepared": quant_prepared,
+                },
+            )
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -377,6 +404,12 @@ class vLLMColocateWorkerExtension:
                 loaded_params = (
                     load_quanted_weights(param_updates, self.model_runner, **reload_kwargs) if param_updates else []
                 )
+                log_loaded_model_parameters(
+                    self.model_runner.model,
+                    loaded_params,
+                    stage="vllm_loaded",
+                    context={"global_steps": global_steps, "model_index": 0, "quantized": True},
+                )
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync() and param_updates:
                     load_quanted_weights(param_updates, self.model_runner, is_drafter=True, **reload_kwargs)
@@ -386,8 +419,18 @@ class vLLMColocateWorkerExtension:
                 )
             else:
                 if param_updates:
-                    for model in self._iter_all_models():
-                        model.load_weights(param_updates)
+                    for model_index, model in enumerate(self._iter_all_models()):
+                        loaded_names = model.load_weights(param_updates)
+                        log_loaded_model_parameters(
+                            model,
+                            loaded_names,
+                            stage="vllm_loaded",
+                            context={
+                                "global_steps": global_steps,
+                                "model_index": model_index,
+                                "quantized": False,
+                            },
+                        )
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"Loading standard weights (non-FP8, async), "

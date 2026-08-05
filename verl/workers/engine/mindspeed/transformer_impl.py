@@ -26,11 +26,11 @@ from verl.workers.config import (
     HFModelConfig,
     McoreEngineConfig,
     McoreOptimizerConfig,
-    MindSpeedOptimizerConfig,
     MindSpeedEngineConfig,
+    MindSpeedOptimizerConfig,
 )
 
-from ..base import EngineRegistry, BaseEngine
+from ..base import BaseEngine, EngineRegistry
 
 try:
     from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
@@ -44,11 +44,10 @@ except ImportError:
     FSDPEngineWithLMHead = BaseEngine
 
 from .utils import (
+    apply_clip_grad_norm_patch,
     apply_patch,
     gpt_model_provider,
     reset_fp8_reuse_quantized_weight,
-    convert_model_dtype,
-    apply_clip_grad_norm_patch,
 )
 
 logger = logging.getLogger(__file__)
@@ -169,6 +168,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
 
         if self.enable_routing_replay:
             from verl.utils.megatron.router_replay_patch import RouterReplay
+
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
 
         return module
@@ -190,11 +190,11 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
 @EngineRegistry.register(model_type="language_model", backend="mindspeed_fsdp", device="npu")
 class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
     def __init__(
-            self,
-            model_config: HFModelConfig,
-            engine_config: MindSpeedEngineConfig,
-            optimizer_config: MindSpeedOptimizerConfig,
-            checkpoint_config: CheckpointConfig,
+        self,
+        model_config: HFModelConfig,
+        engine_config: MindSpeedEngineConfig,
+        optimizer_config: MindSpeedOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
     ):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
         apply_clip_grad_norm_patch()
@@ -205,8 +205,8 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
         self._init_parallel_state()
 
     def _init_parallel_state(self):
+        from fsdp_turbo.distributed.parallel_state import get_parallel_state, init_parallel_state
         from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, _dict_to_dataclass
-        from fsdp_turbo.distributed.parallel_state import init_parallel_state, get_parallel_state
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
         attn_implementation = self.fsdp_turbo_config.model.attn_implementation
@@ -256,49 +256,35 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
 
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
+
         from verl.utils.fsdp_utils import CPUOffloadPolicy, fsdp2_load_full_state_dict
 
         full_state = module.state_dict()
         # convert_model_dtype(module, self.fsdp_turbo_config.model.torch_dtype)
         offload_policy = CPUOffloadPolicy(pin_memory=True) if self.engine_config.offload_policy else None
         self._uses_fsdp2_cpu_offload_policy = offload_policy is not None
-        module = FSDPTurbo(self.fsdp_turbo_config, module, offload_policy=offload_policy,).model
+        module = FSDPTurbo(
+            self.fsdp_turbo_config,
+            module,
+            offload_policy=offload_policy,
+        ).model
         fsdp2_load_full_state_dict(module, full_state, cpu_offload=offload_policy)
 
         return module
 
-    def _is_ep_enabled(self):
-        return (
-            self._parallel_state is not None
-            and self._parallel_state.is_group_enable("ep")
-        )
-
     def get_data_parallel_rank(self):
-        if self._is_ep_enabled():
-            return self._parallel_state.get_rank("edp")
         if self._parallel_state is not None:
-            if hasattr(self._parallel_state, "get_data_parallel_rank"):
-                return self._parallel_state.get_data_parallel_rank()
-            fsdp_size = self._parallel_state.get_group_size("fsdp")
-            return self._parallel_state.get_rank("dp") * fsdp_size + self._parallel_state.get_rank("fsdp")
+            return self._parallel_state.get_data_parallel_rank()
         return super().get_data_parallel_rank()
 
     def get_data_parallel_size(self):
-        if self._is_ep_enabled():
-            return self._parallel_state.get_group_size("edp")
         if self._parallel_state is not None:
-            if hasattr(self._parallel_state, "get_data_parallel_size"):
-                return self._parallel_state.get_data_parallel_size()
-            return self._parallel_state.get_group_size("dp") * self._parallel_state.get_group_size("fsdp")
+            return self._parallel_state.get_data_parallel_size()
         return super().get_data_parallel_size()
 
     def get_data_parallel_group(self):
-        if self._is_ep_enabled():
-            return self._parallel_state.get_group("edp")
         if self._parallel_state is not None:
-            if hasattr(self._parallel_state, "get_data_parallel_group"):
-                return self._parallel_state.get_data_parallel_group()
-            return self._parallel_state.get_group("dp_fsdp")
+            return self._parallel_state.get_data_parallel_group()
         return super().get_data_parallel_group()
 
     def get_context_parallel_group(self):
@@ -308,12 +294,7 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
 
     def is_mp_src_rank_with_outputs(self):
         if self._parallel_state is not None:
-            is_cp_src = self._parallel_state.get_rank("ulysses") == 0
-            is_ep_src = not self._is_ep_enabled() or self._parallel_state.get_rank("ep") == 0
-            is_efsdp_src = (
-                not self._parallel_state.is_group_enable("efsdp")
-                or self._parallel_state.get_rank("efsdp") == 0
-            )
+            is_cp_src = self._parallel_state.get_rank("cp") == 0
             is_tp_src = not self._parallel_state.is_group_enable("tp") or self._parallel_state.get_rank("tp") == 0
-            return is_cp_src and is_ep_src and is_efsdp_src and is_tp_src
+            return is_cp_src and is_tp_src
         return super().is_mp_src_rank_with_outputs()
