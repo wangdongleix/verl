@@ -1,0 +1,14 @@
+{
+  "task": "statistics",
+  "rank": [],
+  "step": [0],
+  "level": "L0",
+  "async_dump": false,
+  "tensor": {
+    "scope": [],
+    "list": [],
+    "tensor_list": [],
+    "data_mode": ["all"],
+    "summary_mode": "statistics"
+  }
+}

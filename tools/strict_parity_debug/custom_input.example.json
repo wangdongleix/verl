@@ -1,0 +1,6 @@
+{
+  "input_ids": [[101, 202, 303, 404, 505]],
+  "attention_mask": [[1, 1, 1, 1, 1]],
+  "position_ids": [[0, 1, 2, 3, 4]],
+  "response_mask": [[0, 0, 0, 1, 1]]
+}
