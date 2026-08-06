@@ -33,6 +33,20 @@ BACKEND=veomni SP_SIZE=2 FSDP_SIZE=4 NUM_GPUS=8 FSDP_STRATEGY=fsdp2 bash tests/s
 echo "run with tp2 pp2 vpp2 cp2 num_gpus8"
 BACKEND=megatron TP_SIZE=2 PP_SIZE=2 VPP_SIZE=${VPP_SIZE} CP_SIZE=2 NUM_GPUS=8 bash tests/special_e2e/sft/run_sft_engine.sh
 
+# MindSpeed FSDP-Turbo requires an Ascend runner, FSDP-Turbo source, and a
+# standalone Kimi language-model checkpoint, so it is opt-in for that CI lane.
+if [ "${RUN_MINDSPEED_FSDP_TURBO_SFT:-0}" = "1" ]; then
+  : "${FSDP_TURBO_ROOT:?Set FSDP_TURBO_ROOT for MindSpeed FSDP-Turbo SFT}"
+  : "${KIMI_K3_MODEL_PATH:?Set KIMI_K3_MODEL_PATH for MindSpeed FSDP-Turbo SFT}"
+  : "${KIMI_K3_DATASET_DIR:?Set KIMI_K3_DATASET_DIR for MindSpeed FSDP-Turbo SFT}"
+  echo "run Kimi K3 with MindSpeed FSDP-Turbo on Ascend"
+  BACKEND=mindspeed_fsdp_turbo \
+    MODEL_PATH="${KIMI_K3_MODEL_PATH}" \
+    DATASET_DIR="${KIMI_K3_DATASET_DIR}" \
+    FSDP_SIZE=8 EP_SIZE=1 TURBO_CP_SIZE=1 USE_REMOVE_PADDING=False NUM_GPUS=8 \
+    bash tests/special_e2e/sft/run_sft_engine.sh
+fi
+
 # test with cp in ray
 echo "run with tp2 pp2 vpp2 cp2 num_gpus8 mode=ray"
 BACKEND=megatron TP_SIZE=2 PP_SIZE=2 VPP_SIZE=${VPP_SIZE} CP_SIZE=2 NUM_GPUS=8 mode=ray bash tests/special_e2e/sft/run_sft_engine.sh

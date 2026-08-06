@@ -1,0 +1,21 @@
+defaults:
+  - sft_trainer_engine
+  - override engine@engine: mindspeed_fsdp_turbo
+  - override optim@optim: mindspeed
+  - _self_
+
+# Remote-code language-model checkpoint settings.
+model:
+  trust_remote_code: true
+  use_remove_padding: false
+  enable_gradient_checkpointing: false
+
+# Text-only multi-turn SFT input.
+data:
+  messages_key: messages
+  ignore_input_ids_mismatch: true
+  pad_mode: no_padding
+
+# Ascend is required because mindspeed_fsdp is registered for NPU devices.
+trainer:
+  device: npu

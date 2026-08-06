@@ -36,6 +36,28 @@ from verl.utils.model import extract_multi_modal_inputs
 custom_model_prefix = Path("~/models").expanduser().resolve()
 
 
+def test_multiturn_sft_dataset_reads_kimi_image_patch_size(monkeypatch):
+    """Kimi's image processor stores patch size in media_proc_cfg."""
+
+    class KimiImageProcessor:
+        media_proc_cfg = {"patch_size": 14}
+
+    class KimiProcessor:
+        image_processor = KimiImageProcessor()
+
+    monkeypatch.setattr(MultiTurnSFTDataset, "_download", lambda self: None)
+    monkeypatch.setattr(MultiTurnSFTDataset, "_read_files_and_process", lambda self: None)
+
+    dataset = MultiTurnSFTDataset(
+        parquet_files=["unused.parquet"],
+        tokenizer=object(),
+        processor=KimiProcessor(),
+        config={},
+    )
+
+    assert dataset.image_patch_size == 14
+
+
 @pytest.mark.parametrize(
     "model_path, ignore_input_ids_mismatch",
     [
