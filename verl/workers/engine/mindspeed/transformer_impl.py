@@ -210,13 +210,24 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.fsdp_kwargs)
         attn_implementation = self.fsdp_turbo_config.model.attn_implementation
+        # A VLM can intentionally use a different attention implementation in
+        # its encoder and decoder.  In particular, Kimi-K3 rollout executes the
+        # vision tower with vLLM's fused MMEncoderAttention, while the language
+        # model remains on eager attention.  Propagating the text setting to the
+        # vision sub-config silently changes the training-side vision graph.
+        vision_attn_implementation = os.getenv(
+            "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
+            attn_implementation,
+        )
         for config in (
             self.model_config.hf_config,
             getattr(self.model_config.hf_config, "text_config", None),
-            getattr(self.model_config.hf_config, "vision_config", None),
         ):
             if config is not None:
                 config._attn_implementation = attn_implementation
+        vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            vision_config._attn_implementation = vision_attn_implementation
         init_parallel_state(self.fsdp_turbo_config)
         self._parallel_state = get_parallel_state()
 
