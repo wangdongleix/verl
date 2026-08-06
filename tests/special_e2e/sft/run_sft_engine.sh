@@ -38,6 +38,8 @@ TP_SIZE=${TP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
 VPP_SIZE=${VPP_SIZE:-null}
 CP_SIZE=${CP_SIZE:-1}
+EP_SIZE=${EP_SIZE:-1}
+TURBO_CP_SIZE=${TURBO_CP_SIZE:-1}
 
 PAD_MODE=${PAD_MODE:-no_padding}
 
@@ -131,6 +133,24 @@ AUTOMODEL_ENGINE_CONFIG="\
     engine.cp_size=${CP_SIZE} \
     engine.use_torch_compile=False"
 
+MINDSPEED_FSDP_TURBO_ENGINE_CONFIG="\
+    engine=mindspeed_fsdp_turbo \
+    model=hf_model \
+    model.path=${MODEL_PATH} \
+    model.trust_remote_code=True \
+    optim=mindspeed \
+    optim.lr=1e-5 \
+    optim.lr_warmup_ratio=0.2 \
+    optim.weight_decay=0.1 \
+    optim.betas="[0.9,0.95]" \
+    optim.clip_grad=1.0 \
+    optim.min_lr=1e-6 \
+    optim.lr_decay_style=cosine \
+    engine.fsdp_kwargs.distributed.fully_shard_parallel_size=${FSDP_SIZE} \
+    engine.fsdp_kwargs.distributed.expert_parallel_size=${EP_SIZE} \
+    engine.fsdp_kwargs.distributed.ulysses_parallel_size=${TURBO_CP_SIZE} \
+    trainer.device=npu"
+
 
 if [ "$backend" = "fsdp" ]; then
     ENGINE_CONFIG="$FSDP_ENGINE_CONFIG"
@@ -148,6 +168,15 @@ elif [ "$backend" = "automodel" ]; then
     ENGINE_CONFIG="$AUTOMODEL_ENGINE_CONFIG"
     echo "Using automodel engine"
     exp_name=gsm8k-${backend}-tp${TP_SIZE}-pp${PP_SIZE}-cp${CP_SIZE}-pad-${PAD_MODE}-use_remove_padding-${USE_REMOVE_PADDING}-mode-${mode}
+elif [ "$backend" = "mindspeed_fsdp_turbo" ]; then
+    if [[ -z "${FSDP_TURBO_ROOT:-}" || ! -d "${FSDP_TURBO_ROOT}/fsdp_turbo" ]]; then
+        echo "Set FSDP_TURBO_ROOT to run the mindspeed_fsdp_turbo SFT test." >&2
+        exit 1
+    fi
+    export PYTHONPATH="${FSDP_TURBO_ROOT}:${PYTHONPATH:-}"
+    ENGINE_CONFIG="$MINDSPEED_FSDP_TURBO_ENGINE_CONFIG"
+    echo "Using MindSpeed FSDP-Turbo engine"
+    exp_name=gsm8k-${backend}-cp${TURBO_CP_SIZE}-ep${EP_SIZE}-fsdp${FSDP_SIZE}-pad-${PAD_MODE}-use_remove_padding-${USE_REMOVE_PADDING}-mode-${mode}
 else
     ENGINE_CONFIG="$MEGATRON_ENGINE_CONFIG"
     echo "Using megatron engine"

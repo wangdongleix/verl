@@ -1,0 +1,60 @@
+# Target class for the MindSpeed FSDP-Turbo engine configuration.
+_target_: verl.workers.config.MindSpeedEngineConfig
+
+# Select the NPU-only FSDP-Turbo engine registered by verl.
+strategy: mindspeed_fsdp
+
+# Do not use verl Ulysses; FSDP-Turbo owns context parallelism below.
+ulysses_sequence_parallel_size: 1
+
+# Keep graph compilation disabled until the Kimi kernel stack is validated.
+use_torch_compile: false
+
+# FSDP-Turbo handles parameter placement internally.
+param_offload: false
+
+# FSDP-Turbo handles optimizer-state placement internally.
+optimizer_offload: false
+
+# Offload FSDP states only when the target hardware needs the memory trade-off.
+offload_policy: false
+
+# Reshard model parameters after each forward pass.
+reshard_after_forward: true
+
+# FSDP-Turbo configuration passed to fsdp_turbo.FSDPTurbo.
+fsdp_kwargs:
+  model:
+    attn_implementation: flash_attention_2
+
+  distributed:
+    fully_shard_parallel_size: 1
+    tensor_parallel_size: 1
+    ulysses_parallel_size: 1
+    expert_parallel_size: 1
+    expert_fully_shard_parallel_size: 1
+
+    fsdp_plan:
+      ignored_modules: []
+      param_dtype: bf16
+      reduce_dtype: fp32
+      output_dtype: bf16
+      fsdp_implementation: native
+      num_to_forward_prefetch: 1
+      num_to_backward_prefetch: 1
+      apply_modules:
+        language_model.model.embed_tokens: {}
+        language_model.model.layers.{*}: {}
+        language_model.lm_head: {}
+      hook_modules:
+        - language_model.model.layers.{*}
+
+    ep_plan:
+      apply_modules:
+        - language_model.model.layers.{*}.block_sparse_moe.experts
+      dispatcher: eager
+
+  memory:
+    recompute: true
+    recompute_plan:
+      - language_model.model.layers.{*}
