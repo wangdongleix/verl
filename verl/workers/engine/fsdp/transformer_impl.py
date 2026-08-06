@@ -61,6 +61,7 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.model_adapters import kimi_k3_logits_to_input_indices
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.seqlen_balancing import ceildiv
 from verl.utils.torch_functional import logprobs_from_logits
@@ -82,6 +83,26 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _select_raw_token_logits(logits: torch.Tensor, indices: torch.Tensor | None) -> torch.Tensor:
+    """Contract image-expanded logits back to the raw input-token sequence."""
+    if indices is None:
+        return logits
+    if logits.ndim != 3 or indices.ndim != 2 or logits.shape[0] != indices.shape[0]:
+        raise ValueError(
+            "Invalid multimodal logit alignment shapes: "
+            f"logits={tuple(logits.shape)}, indices={tuple(indices.shape)}"
+        )
+    indices = indices.to(device=logits.device, dtype=torch.long)
+    expanded_length = int(indices.max().item()) + 1
+    if logits.shape[1] != expanded_length:
+        raise ValueError(
+            "Multimodal logit length does not match the reconstructed expanded sequence: "
+            f"logits={logits.shape[1]}, reconstructed={expanded_length}"
+        )
+    batch_indices = torch.arange(logits.shape[0], device=logits.device)[:, None]
+    return logits[batch_indices, indices]
 
 
 class FSDPEngine(BaseEngine):
@@ -1298,6 +1319,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
 
+        logits_to_input_indices = kimi_k3_logits_to_input_indices(
+            model_inputs["input_ids"], multi_modal_inputs, self.model_config.hf_config
+        )
+        if logits_to_input_indices is not None:
+            if use_fused_kernels:
+                raise NotImplementedError("Kimi K3 image-expanded logits are not supported by fused log-prob kernels")
+            if self.use_ulysses_sp:
+                raise NotImplementedError("Kimi K3 image-expanded logit alignment is not implemented with Ulysses SP")
+            output_args["logits_to_input_indices"] = logits_to_input_indices
+
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
@@ -1345,10 +1376,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits = output.logits
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
-                if isinstance(logits_rmpad, DTensor):
-                    logits_rmpad = logits_rmpad.full_tensor()
+                if isinstance(logits, DTensor):
+                    logits = logits.full_tensor()
+                logits = _select_raw_token_logits(logits, output_args.get("logits_to_input_indices"))
+                logits_rmpad = logits.squeeze(0)  # (total_nnz, vocab_size)
                 logits_rmpad = logits_rmpad / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
 
                 log_probs = None
@@ -1442,6 +1475,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
+                logits = _select_raw_token_logits(logits, output_args.get("logits_to_input_indices"))
                 logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
                 if calculate_entropy:
@@ -1624,6 +1658,23 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.turbo_config)
         self.fsdp_turbo_config.distributed.fsdp_plan.cpu_offload = self.engine_config.offload_policy
+        attn_implementation = self.fsdp_turbo_config.model.attn_implementation
+        # Keep the language model and vision tower attention implementations
+        # independent: rollout may use a fused vision attention implementation
+        # while the language model uses the FSDP-Turbo setting.
+        vision_attn_implementation = os.getenv(
+            "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
+            attn_implementation,
+        )
+        for config in (
+            self.model_config.hf_config,
+            getattr(self.model_config.hf_config, "text_config", None),
+        ):
+            if config is not None:
+                config._attn_implementation = attn_implementation
+        vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            vision_config._attn_implementation = vision_attn_implementation
         init_parallel_state(self.fsdp_turbo_config)
         self._parallel_state = get_parallel_state()
         if self._is_ulysses_enabled():
