@@ -1,0 +1,23 @@
+{
+  "task": "tensor",
+  "rank": [0],
+  "step": [0],
+  "level": "L0",
+  "async_dump": false,
+  "tensor": {
+    "scope": [],
+    "list": [
+      "vision_tower.patch_embed.MoonVision3dPatchEmbed",
+      "vision_tower.encoder.blocks.0.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.1.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.4.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.8.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.13.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.20.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.blocks.26.FSDPMoonViTEncoderLayer",
+      "vision_tower.encoder.MoonViT3dEncoder",
+      "mm_projector.FSDPPatchMergerMLPV2"
+    ],
+    "data_mode": ["all"]
+  }
+}

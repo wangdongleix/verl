@@ -1,0 +1,23 @@
+{
+  "task": "tensor",
+  "rank": [0],
+  "step": [0],
+  "level": "L0",
+  "async_dump": false,
+  "tensor": {
+    "scope": [],
+    "list": [
+      "vision_tower.patch_embed.KimiK3VisionPatchEmbed",
+      "vision_tower.encoder.blocks.0.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.1.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.4.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.8.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.13.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.20.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.blocks.26.KimiK3VisionEncoderLayer",
+      "vision_tower.encoder.KimiK3VisionEncoder",
+      "mm_projector.KimiK3MultiModalProjector"
+    ],
+    "data_mode": ["all"]
+  }
+}
