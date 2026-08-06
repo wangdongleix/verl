@@ -2,7 +2,7 @@
 """Compare actor-export and vLLM-receive weight-sync debug records.
 
 The input may be a mixed Ray/vLLM log.  It looks for JSON records emitted by
-``verl.utils.debug.weight_sync`` and compares the set of signatures observed
+``tools/weight_sync_debug`` and compares the set of signatures observed
 for each parameter name.  Repeated records from data/TP ranks are intentionally
 deduplicated.
 """

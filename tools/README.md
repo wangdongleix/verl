@@ -27,3 +27,5 @@ tools/<tool_name>/
 
 - [`strict_parity_debug`](strict_parity_debug/README.md)：固定输入并采集训练、推理
   前向，用于严格训推一致性定位。
+- [`weight_sync_debug`](weight_sync_debug/README.md)：通过外部 monkey patch 记录
+  actor 到 vLLM 的权重同步张量签名，不修改 `verl` 源码。
