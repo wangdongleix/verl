@@ -16,6 +16,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import json
 import logging
 import os
 import warnings
@@ -103,7 +104,43 @@ def _select_raw_token_logits(logits: torch.Tensor, indices: torch.Tensor | None)
     return logits[batch_indices, indices]
 
 
-def _load_hf_language_model(auto_class, model_config, torch_dtype, seed):
+def _is_weight_source_rank(mesh) -> bool:
+    """Return whether this rank should read the Hugging Face checkpoint.
+
+    FSDP2 broadcasts the full state dict from the rank whose last mesh
+    coordinate is zero.  Loading a checkpoint on every rank is both wasteful
+    and incorrect when the other ranks are inside ``init_empty_weights``:
+    ``from_pretrained`` still opens every shard even though it cannot put the
+    values into meta tensors.
+    """
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    if mesh is None:
+        return torch.distributed.get_rank() == 0
+    coordinate = mesh.get_coordinate()
+    return coordinate is None or coordinate[-1] == 0
+
+
+def _missing_checkpoint_shards(local_path: str) -> list[str]:
+    """Return missing safetensor shards referenced by a local HF index."""
+
+    index_path = os.path.join(local_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return []
+
+    try:
+        with open(index_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
+    except (OSError, ValueError):
+        # Let Transformers produce its normal error for a malformed index.
+        return []
+
+    shard_names = sorted(set(index.get("weight_map", {}).values()))
+    return [name for name in shard_names if not os.path.isfile(os.path.join(local_path, name))]
+
+
+def _load_hf_language_model(auto_class, model_config, torch_dtype, seed, load_pretrained=True):
     if model_config.random_init:
         logger.info("Initializing the language model from config with random weights")
         with torch.random.fork_rng(devices=[]):
@@ -113,6 +150,26 @@ def _load_hf_language_model(auto_class, model_config, torch_dtype, seed):
                 torch_dtype=torch_dtype,
                 trust_remote_code=model_config.trust_remote_code,
             )
+
+    if not load_pretrained:
+        logger.info("Building an empty language model on a non-source FSDP rank")
+        return auto_class.from_config(
+            model_config.hf_config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=model_config.trust_remote_code,
+        )
+
+    missing_shards = _missing_checkpoint_shards(model_config.local_path)
+    if missing_shards:
+        preview = ", ".join(missing_shards[:8])
+        if len(missing_shards) > 8:
+            preview += f", ... ({len(missing_shards)} missing total)"
+        raise FileNotFoundError(
+            "random_init=False requires a complete local Hugging Face checkpoint, "
+            f"but {model_config.local_path!r} is missing: {preview}. "
+            "Use a checkpoint directory containing the shards referenced by "
+            "model.safetensors.index.json, or keep random_init=True for a config-only run."
+        )
 
     return auto_class.from_pretrained(
         pretrained_model_name_or_path=model_config.local_path,
@@ -279,9 +336,12 @@ class FSDPEngine(BaseEngine):
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
-        )
+        use_meta_tensor = not self.model_config.hf_config.tie_word_embeddings
+        init_context = get_init_weight_context_manager(use_meta_tensor=use_meta_tensor, mesh=self.device_mesh)
+        # The source rank owns the real CPU state dict.  With a meta init
+        # context, every other rank only needs the module structure; FSDP2
+        # receives the values through fsdp2_load_full_state_dict below.
+        load_pretrained = _is_weight_source_rank(self.device_mesh) or not use_meta_tensor
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -294,6 +354,7 @@ class FSDPEngine(BaseEngine):
                     model_config=self.model_config,
                     torch_dtype=torch_dtype,
                     seed=self.engine_config.seed,
+                    load_pretrained=load_pretrained,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
