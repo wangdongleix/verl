@@ -12,8 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import functools
 import logging
 import os
+
+import torch
+
+
+def _install_kimi_fp32_router(module):
+    """Run Kimi's router outside NPU autocast to preserve FP32 semantics."""
+    for gate in module.modules():
+        if gate.__class__.__name__ != "KimiMoEGate":
+            continue
+        if getattr(gate, "_verl_kimi_fp32_router", False):
+            continue
+
+        original_forward = gate.forward
+
+        @functools.wraps(original_forward)
+        def _forward(hidden_states, _original=original_forward):
+            # KimiMoEGate casts its operands to FP32, but NPU autocast can
+            # still cast F.linear's result back to BF16.  Disable autocast
+            # only for the gate; the rest of the model remains BF16.
+            if hidden_states.device.type == "npu":
+                autocast = torch.autocast(device_type="npu", enabled=False)
+            else:
+                autocast = contextlib.nullcontext()
+            with autocast:
+                return _original(hidden_states)
+
+        gate.forward = _forward
+        gate._verl_kimi_fp32_router = True
+
 
 try:
     from mindspeed.megatron_adaptor import repatch
@@ -330,6 +361,10 @@ class MindSpeedFSDPEngineWithLMHead(FSDPEngineWithLMHead):
             fsdp2_load_full_state_dict(module, full_state, cpu_offload=offload_policy)
         finally:
             _restore_kimi_moe_external_state_dict_export(previous_kimi_moe_export)
+
+        # Install after FSDP-Turbo has replaced expert parameters so the
+        # wrapper is attached to the actual gate used by the actor.
+        _install_kimi_fp32_router(module)
 
         return module
 

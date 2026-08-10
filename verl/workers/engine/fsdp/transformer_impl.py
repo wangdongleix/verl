@@ -104,6 +104,26 @@ def _select_raw_token_logits(logits: torch.Tensor, indices: torch.Tensor | None)
     return logits[batch_indices, indices]
 
 
+def _move_multimodal_inputs_to_device(value, device):
+    """Move tensor leaves of Kimi's multimodal batch to the model device.
+
+    ``multi_modal_inputs`` is carried as non-tensor data by the replay path,
+    so its leaves do not participate in the outer ``TensorDict.to(device)``.
+    A strict replay can therefore leave ``pixel_values`` on CPU while the
+    vision tower has already been placed on NPU.  Keep the container shape
+    intact (some processors use lists) and move only tensor leaves.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, list):
+        return [_move_multimodal_inputs_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_multimodal_inputs_to_device(item, device) for item in value)
+    if isinstance(value, dict):
+        return {key: _move_multimodal_inputs_to_device(item, device) for key, item in value.items()}
+    return value
+
+
 def _is_weight_source_rank(mesh) -> bool:
     """Return whether this rank should read the Hugging Face checkpoint.
 
@@ -1069,9 +1089,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
-        multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        multi_modal_inputs = _move_multimodal_inputs_to_device(
+            extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", [])),
+            input_ids.device,
+        )
 
         if not isinstance(temperature, torch.Tensor):
             temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
