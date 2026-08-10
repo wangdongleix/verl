@@ -294,12 +294,15 @@ async def _strict_replay(self) -> dict:
     # replay forward without any model/backend source change.
     sampling_params = {
         "max_tokens": 1,
-        "prompt_logprobs": 1,
+        # verl's extractor treats 0 as the target token's log-prob; a
+        # positive value requests top-k candidates, which is not the value
+        # used by the training-side actor metric.
+        "prompt_logprobs": 0,
         "temperature": 0.0,
         "detokenize": False,
         "ignore_eos": True,
     }
-    replay_generate = type(self)._strict_parity_generate
+    replay_generate = getattr(type(self), "_strict_parity_generate", type(self)._strict_parity_original_generate)
     manage_sleep = bool(getattr(self.config, "free_cache_engine", False))
     try:
         # The same image was already used by the ordinary rollout that produced
@@ -332,8 +335,19 @@ async def _strict_replay(self) -> dict:
                 await self.collective_rpc(_DISABLE_MSPROBE_METHOD)
     finally:
         if manage_sleep:
-            logger.warning("[strict-parity] returning vLLM to sleep after replay")
-            await self.sleep()
+            # The normal NPU rollout path deliberately uses sleep(level=1),
+            # because vLLM-Ascend historically did not support level-2 sleep.
+            # That leaves the model weights resident on every colocated NPU,
+            # however, and the following FSDP actor forward can OOM before its
+            # profile is written.  Strict replay is a terminal diagnostic
+            # request for this iteration, so release weights as well.  Keep a
+            # compatibility fallback for engines that reject the level kwarg.
+            logger.warning("[strict-parity] releasing vLLM weights after replay")
+            try:
+                await self.engine.sleep(level=2)
+            except (AttributeError, TypeError, RuntimeError) as exc:
+                logger.warning("[strict-parity] level-2 sleep unavailable (%s); falling back to normal sleep", exc)
+                await self.sleep()
     result = {
         "request_id": _REPLAY_REQUEST_ID,
         "replay_path": str(resolved_replay_path),

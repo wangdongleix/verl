@@ -1,0 +1,21 @@
+{
+  "task": "tensor",
+  "rank": [0],
+  "step": [0],
+  "level": "L0",
+  "async_dump": false,
+  "tensor": {
+    "scope": [],
+    "list": [
+      "language_model.model.norm",
+      "language_model.model.layers.0",
+      "language_model.model.layers.1",
+      "language_model.model.layers.2",
+      "language_model.model.layers.3",
+      "language_model.model.layers.1.block_sparse_moe.gate.AscendReplicatedLinear",
+      "language_model.model.layers.1.block_sparse_moe.KimiK3MoE",
+      "language_model.model.layers.1.block_sparse_moe.router_logits_debug._KimiRouterLogitsDebug"
+    ],
+    "data_mode": ["all"]
+  }
+}

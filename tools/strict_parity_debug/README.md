@@ -1,9 +1,9 @@
 # 严格训推一致性采集
 
-这个 `tools/strict_parity_debug` 目录主体是一组可移除的 monkey patch，不修改 verl、FSDPTurbo、vLLM
-或 vLLM-Ascend 的跟踪源码。为了让 strict replay 能绕过普通 rollout 的 Kimi prompt 适配器，并取得
-vLLM 多模态处理前后的真实 token ID，工具会在目标模块加载后动态包装
-`vllm_async_server.vLLMHttpServer.generate()`；普通 rollout 请求仍然直接调用原方法。它完成三件事：
+这个 `tools/strict_parity_debug` 目录主体是一组可移除的 monkey patch。为了让 strict replay 能绕过普通
+rollout 的 Kimi prompt 适配器，并取得 vLLM 多模态处理前后的真实 token ID，本次还给 verl 的
+`vllm_async_server.generate()` 增加了一个默认关闭的诊断参数；FSDPTurbo、vLLM 和 vLLM-Ascend 的公共接口
+不受影响。它完成三件事：
 
 1. 在 verl V1 的 `_compute_old_log_prob` 入口抓取完整 TransferQueue batch，保存
    `input_ids`、`attention_mask`、`position_ids`、`response_mask`、`prompts`、

@@ -249,7 +249,7 @@ class DeferredPatchTest(unittest.TestCase):
                 events.append("generate")
                 return types.SimpleNamespace(token_ids=[1], extra_fields={})
 
-        Server._strict_parity_generate = Server._original_generate
+        Server._strict_parity_original_generate = Server._original_generate
         payload = {"fields": {"input_ids": [1, 2], "attention_mask": [1, 1]}, "fingerprints": {}}
         with (
             mock.patch.object(vllm_patch, "load_replay", return_value=payload),
@@ -272,67 +272,6 @@ class DeferredPatchTest(unittest.TestCase):
                 "sleep",
             ],
         )
-
-    def test_prepared_prompt_replay_is_injected_without_changing_server_source(self):
-        seen_prompt_ids = []
-        adapter_calls = []
-
-        class Adapter:
-            def prepare_vllm_prompt_ids(self, prompt_ids, tokenizer, image_data):
-                adapter_calls.append((prompt_ids, tokenizer, image_data))
-                return [99]
-
-        class Engine:
-            async def generate(self, **kwargs):
-                yield types.SimpleNamespace(prompt_token_ids=[7, 8])
-
-        class Server:
-            _vllm_adapter = Adapter()
-            model_config = types.SimpleNamespace(processor=object())
-            engine = Engine()
-
-            async def generate(
-                self,
-                prompt_ids,
-                sampling_params,
-                request_id,
-                image_data=None,
-                video_data=None,
-                audio_data=None,
-                mm_processor_kwargs=None,
-                priority=0,
-                kv_transfer_params=None,
-            ):
-                del sampling_params, request_id, video_data, audio_data, mm_processor_kwargs, priority
-                del kv_transfer_params
-                prompt_ids = self._vllm_adapter.prepare_vllm_prompt_ids(prompt_ids, object(), image_data)
-                seen_prompt_ids.append(prompt_ids)
-                async for _ in self.engine.generate(prompt_token_ids=prompt_ids):
-                    pass
-                return types.SimpleNamespace(extra_fields={})
-
-        module = types.SimpleNamespace(
-            vLLMHttpServer=Server,
-            normalize_token_ids=lambda value: list(value),
-            qwen2_5_vl_dedup_image_tokens=lambda value, processor: list(value) + [42],
-        )
-        settings = types.SimpleNamespace(enabled=True)
-        with mock.patch.object(vllm_patch, "_PATCHED", False):
-            self.assertTrue(vllm_patch.install(settings, module))
-
-        server = Server()
-        output = asyncio.run(
-            server.generate(
-                prompt_ids=[1, 2],
-                sampling_params={},
-                request_id="replay",
-                prompt_ids_are_prepared=True,
-            )
-        )
-        self.assertEqual(seen_prompt_ids, [[1, 2]])
-        self.assertEqual(adapter_calls, [])
-        self.assertEqual(output.extra_fields["strict_parity_submitted_prompt_ids"], [1, 2])
-        self.assertEqual(output.extra_fields["strict_parity_processed_prompt_ids"], [7, 8])
 
     def test_replay_client_triggers_rpc_without_arguments(self):
         remote = mock.Mock(return_value="reference")

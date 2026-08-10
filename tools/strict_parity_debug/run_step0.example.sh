@@ -14,6 +14,17 @@ REPLAY_KILL_GRACE_SEC=${STRICT_PARITY_REPLAY_KILL_GRACE_SEC:-1800}
 DIAGNOSTIC_TRAIN_BATCH_SIZE=${STRICT_PARITY_TRAIN_BATCH_SIZE:-}
 DIAGNOSTIC_ROLLOUT_N=${STRICT_PARITY_ROLLOUT_N:-}
 DIAGNOSTIC_MAX_MODEL_LEN=${STRICT_PARITY_MAX_MODEL_LEN:-}
+DIAGNOSTIC_VLLM_GPU_MEMORY_UTILIZATION=${STRICT_PARITY_VLLM_GPU_MEMORY_UTILIZATION:-0.13}
+# The parity capture must use the checkpoint weights.  The base launcher keeps
+# random_init=True for smoke runs, so override it explicitly here; callers can
+# still opt into a random-init diagnostic with STRICT_PARITY_RANDOM_INIT=True.
+DIAGNOSTIC_RANDOM_INIT=${STRICT_PARITY_RANDOM_INIT:-False}
+# By default this remains the original one-step parity profile.  For a NaN
+# investigation, set STRICT_PARITY_PROFILER_STAGES=actor_update and set
+# STRICT_PARITY_CRITIC_WARMUP=0 so the actual optimizer step is profiled.
+DIAGNOSTIC_PROFILER_STAGES=${STRICT_PARITY_PROFILER_STAGES:-actor_compute_log_prob}
+PROFILE_ENABLED=${STRICT_PARITY_PROFILE:-1}
+DIAGNOSTIC_CRITIC_WARMUP=${STRICT_PARITY_CRITIC_WARMUP:-$((TARGET_GLOBAL_STEP + 1))}
 
 TRAIN_MSPROBE_CONFIG=${TRAIN_MSPROBE_CONFIG:-$VERL_ROOT/tools/strict_parity_debug/msprobe_train.json}
 ROLLOUT_MSPROBE_CONFIG=${ROLLOUT_MSPROBE_CONFIG:-$VERL_ROOT/tools/strict_parity_debug/msprobe_rollout.json}
@@ -21,7 +32,7 @@ TRAIN_MSPROBE_DUMP_PATH=${TRAIN_MSPROBE_DUMP_PATH:-$OUT/train/msprobe}
 ROLLOUT_MSPROBE_DUMP_PATH=${ROLLOUT_MSPROBE_DUMP_PATH:-$OUT/rollout/msprobe}
 READY_FILE="$OUT/READY.json"
 CONTINUE_FILE="$OUT/CONTINUE"
-REPLAY_FILE="$OUT/replay.pt"
+REPLAY_FILE="${STRICT_PARITY_REPLAY_PATH:-$OUT/replay.pt}"
 MANIFEST_FILE="$OUT/manifest.json"
 MEDIA_DIR="$OUT/media"
 COMPARE_REPORT="$OUT/msprobe_compare.json"
@@ -31,16 +42,28 @@ log() {
     printf '\n========== [STRICT-PARITY] %s ==========\n' "$*"
 }
 
-for path in "$VERL_ROOT" "$TRAIN_SCRIPT" "$TRAIN_MSPROBE_CONFIG" "$ROLLOUT_MSPROBE_CONFIG"; do
+REQUIRED_PATHS=("$VERL_ROOT" "$TRAIN_SCRIPT")
+if [[ "$PROFILE_ENABLED" == 1 ]]; then
+    REQUIRED_PATHS+=("$TRAIN_MSPROBE_CONFIG" "$ROLLOUT_MSPROBE_CONFIG")
+fi
+for path in "${REQUIRED_PATHS[@]}"; do
     if [[ ! -e "$path" ]]; then
         echo "missing required path: $path" >&2
         exit 1
     fi
 done
 
-for path in \
-    "$READY_FILE" "$CONTINUE_FILE" "$REPLAY_FILE" "$MANIFEST_FILE" "$MEDIA_DIR" \
-    "$TRAIN_MSPROBE_DUMP_PATH" "$ROLLOUT_MSPROBE_DUMP_PATH" "$COMPARE_REPORT" "$REPLAY_RESULT_FILE"; do
+OUTPUT_PATHS=(
+    "$READY_FILE" "$CONTINUE_FILE" "$MANIFEST_FILE" "$MEDIA_DIR"
+    "$REPLAY_RESULT_FILE"
+)
+if [[ "$PROFILE_ENABLED" == 1 ]]; then
+    OUTPUT_PATHS+=("$TRAIN_MSPROBE_DUMP_PATH" "$ROLLOUT_MSPROBE_DUMP_PATH" "$COMPARE_REPORT")
+fi
+if [[ "$REPLAY_FILE" == "$OUT/replay.pt" ]]; then
+    OUTPUT_PATHS+=("$REPLAY_FILE")
+fi
+for path in "${OUTPUT_PATHS[@]}"; do
     if [[ -e "$path" ]]; then
         echo "output path contains a previous run: $path" >&2
         echo "move the old output away, then rerun; stale msprobe files must not be merged." >&2
@@ -54,7 +77,9 @@ export STRICT_PARITY_READY_FILE="$READY_FILE"
 export STRICT_PARITY_CONTINUE_FILE="$CONTINUE_FILE"
 export STRICT_PARITY_REPLAY_PATH="$REPLAY_FILE"
 export STRICT_PARITY_MANIFEST="$MANIFEST_FILE"
-export STRICT_PARITY_INPUT_MODE=dataset
+# Keep dataset capture as the default, but allow a previously captured batch
+# to be replayed in a new diagnostic run without another TQ capture.
+export STRICT_PARITY_INPUT_MODE="${STRICT_PARITY_INPUT_MODE:-dataset}"
 # verl starts its first training iteration at global_steps=1. The model weights
 # are still the initial (step-0) weights before that iteration's actor update.
 export STRICT_PARITY_GLOBAL_STEP="$TARGET_GLOBAL_STEP"
@@ -62,27 +87,41 @@ export STRICT_PARITY_CAPTURE=1
 export STRICT_PARITY_CAPTURE_MEDIA=1
 export STRICT_PARITY_PAUSE_AFTER_CAPTURE=1
 export STRICT_PARITY_STRICT=1
-export STRICT_PARITY_ROLLOUT_MSPROBE_CONFIG="$ROLLOUT_MSPROBE_CONFIG"
-export STRICT_PARITY_ROLLOUT_MSPROBE_DUMP_PATH="$ROLLOUT_MSPROBE_DUMP_PATH"
+if [[ "$PROFILE_ENABLED" == 1 ]]; then
+    export STRICT_PARITY_ROLLOUT_MSPROBE_CONFIG="$ROLLOUT_MSPROBE_CONFIG"
+    export STRICT_PARITY_ROLLOUT_MSPROBE_DUMP_PATH="$ROLLOUT_MSPROBE_DUMP_PATH"
+else
+    unset STRICT_PARITY_ROLLOUT_MSPROBE_CONFIG STRICT_PARITY_ROLLOUT_MSPROBE_DUMP_PATH
+fi
+# The strict replay patch creates a request-scoped PrecisionDebugger after the
+# vLLM worker is ready. Do not let the base launcher eagerly construct the
+# Ascend AclGraphDumper (it is unavailable in this msprobe build).
+export VERL_VLLM_STARTUP_MSPROBE_CONFIG=""
 unset VERL_WEIGHT_SYNC_DEBUG
 
 TRAIN_OVERRIDES=(
     trainer.resume_mode=disable
+    "actor_rollout_ref.model.random_init=$DIAGNOSTIC_RANDOM_INIT"
     "trainer.total_training_steps=$TARGET_GLOBAL_STEP"
-    # This run only needs actor_compute_log_prob.  Skipping actor_update makes
-    # msprobe finalize the target stage and avoids spending another full
-    # backward/update on a diagnostic input after both forwards are complete.
-    "trainer.critic_warmup=$((TARGET_GLOBAL_STEP + 1))"
-    "global_profiler.steps=[$TARGET_GLOBAL_STEP]"
+    # The default skips actor_update; NaN diagnosis can set critic_warmup=0
+    # and profile the real optimizer step instead.
+    "trainer.critic_warmup=$DIAGNOSTIC_CRITIC_WARMUP"
+)
+if [[ "$PROFILE_ENABLED" == 1 ]]; then
+    TRAIN_OVERRIDES+=(
+        "global_profiler.steps=[$TARGET_GLOBAL_STEP]"
     # Enabling actor.profiler alone is insufficient: without selecting the
     # backend DistProfiler silently falls back to a no-op implementation.
-    global_profiler.tool=precision_debugger
-    "global_profiler.save_path=$TRAIN_MSPROBE_DUMP_PATH"
-    "global_profiler.global_tool_config.precision_debugger.config_path=$TRAIN_MSPROBE_CONFIG"
-    'global_profiler.global_tool_config.precision_debugger.stages=[actor_compute_log_prob]'
-    global_profiler.global_tool_config.precision_debugger.strict=True
-    actor_rollout_ref.actor.profiler.enable=True
-)
+        global_profiler.tool=precision_debugger
+        "global_profiler.save_path=$TRAIN_MSPROBE_DUMP_PATH"
+        "global_profiler.global_tool_config.precision_debugger.config_path=$TRAIN_MSPROBE_CONFIG"
+        "global_profiler.global_tool_config.precision_debugger.stages=[$DIAGNOSTIC_PROFILER_STAGES]"
+        global_profiler.global_tool_config.precision_debugger.strict=True
+        actor_rollout_ref.actor.profiler.enable=True
+    )
+else
+    TRAIN_OVERRIDES+=(global_profiler.tool=null 'global_profiler.steps=[]' actor_rollout_ref.actor.profiler.enable=False)
+fi
 if [[ -n "$DIAGNOSTIC_TRAIN_BATCH_SIZE" ]]; then
     TRAIN_OVERRIDES+=("data.train_batch_size=$DIAGNOSTIC_TRAIN_BATCH_SIZE")
 fi
@@ -91,6 +130,12 @@ if [[ -n "$DIAGNOSTIC_ROLLOUT_N" ]]; then
 fi
 if [[ -n "$DIAGNOSTIC_MAX_MODEL_LEN" ]]; then
     TRAIN_OVERRIDES+=("+actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=$DIAGNOSTIC_MAX_MODEL_LEN")
+fi
+if [[ -n "$DIAGNOSTIC_VLLM_GPU_MEMORY_UTILIZATION" ]]; then
+    # Strict replay holds vLLM and FSDP on the same NPUs.  Reserve less vLLM
+    # cache than the production launcher so the post-replay actor profile has
+    # room to allocate its activation/workspace tensors.
+    TRAIN_OVERRIDES+=("actor_rollout_ref.rollout.gpu_memory_utilization=$DIAGNOSTIC_VLLM_GPU_MEMORY_UTILIZATION")
 fi
 
 TRAIN_PID=""
@@ -115,11 +160,11 @@ trap cleanup EXIT INT TERM
 log "starting diagnostic training; waiting for global_steps=$TARGET_GLOBAL_STEP replay capture"
 if command -v setsid >/dev/null 2>&1; then
     setsid bash "$VERL_ROOT/tools/strict_parity_debug/run_capture.sh" -- \
-        bash "$TRAIN_SCRIPT" "${TRAIN_OVERRIDES[@]}" &
+        bash "$TRAIN_SCRIPT" "${TRAIN_OVERRIDES[@]}" "$@" &
     TRAIN_PROCESS_GROUP=1
 else
     bash "$VERL_ROOT/tools/strict_parity_debug/run_capture.sh" -- \
-        bash "$TRAIN_SCRIPT" "${TRAIN_OVERRIDES[@]}" &
+        bash "$TRAIN_SCRIPT" "${TRAIN_OVERRIDES[@]}" "$@" &
 fi
 TRAIN_PID=$!
 
@@ -149,7 +194,7 @@ while [[ ! -f "$READY_FILE" ]]; do
     sleep 1
 done
 
-if [[ -e "$ROLLOUT_MSPROBE_DUMP_PATH" ]]; then
+if [[ "$PROFILE_ENABLED" == 1 && -e "$ROLLOUT_MSPROBE_DUMP_PATH" ]]; then
     echo "the base training script wrote ordinary rollout data into the strict replay output: $ROLLOUT_MSPROBE_DUMP_PATH" >&2
     echo "give its startup dump_config_path a different dump_path; replay output must contain only the fixed request" >&2
     exit 1
@@ -161,9 +206,10 @@ REPLAY_ARGS=(
     --ray-address auto
     --replay "$REPLAY_FILE"
     --sample-index 0
-    --msprobe-config "$ROLLOUT_MSPROBE_CONFIG"
-    --msprobe-dump-path "$ROLLOUT_MSPROBE_DUMP_PATH"
 )
+if [[ "$PROFILE_ENABLED" == 1 ]]; then
+    REPLAY_ARGS+=(--msprobe-config "$ROLLOUT_MSPROBE_CONFIG" --msprobe-dump-path "$ROLLOUT_MSPROBE_DUMP_PATH")
+fi
 if [[ -n "$VLLM_ACTOR_NAMESPACE" ]]; then
     REPLAY_ARGS+=(--actor-namespace "$VLLM_ACTOR_NAMESPACE")
 fi
@@ -202,7 +248,7 @@ if [[ ! -f "$REPLAY_RESULT_FILE" ]]; then
     echo "vLLM actor released training without writing replay identity: $REPLAY_RESULT_FILE" >&2
     exit 1
 fi
-if ! find "$ROLLOUT_MSPROBE_DUMP_PATH" -type f -name dump.json -print -quit 2>/dev/null | grep -q .; then
+if [[ "$PROFILE_ENABLED" == 1 ]] && ! find "$ROLLOUT_MSPROBE_DUMP_PATH" -type f -name dump.json -print -quit 2>/dev/null | grep -q .; then
     echo "vLLM actor returned replay identity but no rollout dump.json was written under: $ROLLOUT_MSPROBE_DUMP_PATH" >&2
     exit 1
 fi
@@ -216,6 +262,11 @@ TRAIN_PID=""
 if [[ "$training_status" != 0 ]]; then
     echo "training failed after replay (status=$training_status)" >&2
     exit "$training_status"
+fi
+if [[ "$PROFILE_ENABLED" != 1 ]]; then
+    trap - EXIT INT TERM
+    log "PASS: strict replay and train/rollout metric comparison completed (msprobe disabled)"
+    exit 0
 fi
 if ! find "$TRAIN_MSPROBE_DUMP_PATH" -type f -name dump.json -print -quit 2>/dev/null | grep -q .; then
     echo "training completed but no train dump.json was written under: $TRAIN_MSPROBE_DUMP_PATH" >&2

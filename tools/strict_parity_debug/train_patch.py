@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import json
 import time
+from pathlib import Path
 from functools import wraps
 from typing import Any
 
 from .config import Settings
-from .media_io import has_media_payload, media_ref_for_key, save_media_for_key
+from .media_io import has_media_payload, load_media_ref, media_ref_for_key, save_media_for_key
 from .replay_io import CORE_FIELDS, load_replay, save_replay, write_manifest
 
 logger = logging.getLogger("strict_parity_debug.train")
@@ -67,7 +68,89 @@ def _sample_value(value: Any, index: int, batch_size: int) -> Any:
     return value
 
 
-def _custom_tensordict(replay_path: Any, expected_batch_size: int) -> Any:
+def _load_strict_rollout_fields(
+    fields: dict[str, Any],
+    result_root: Any,
+    sample_index: int,
+    batch_size: int,
+) -> tuple[Any, Any] | None:
+    """Build fixed-input rollout log-probs for custom replay diagnostics.
+
+    A custom replay replaces the actor input after the ordinary rollout has
+    already populated ``rollout_log_probs`` in TransferQueue.  Keeping that
+    field would compare the fixed actor batch with the old random rollout
+    batch (and, in practice, often with a different response width).  The
+    strict vLLM RPC writes top-1 prompt log-probs for the same captured
+    response suffix; use those values for the selected sample and mask the
+    other diagnostic rows.
+    """
+    import torch
+
+    result_path = Path(result_root) / "replay_result.json" if result_root is not None else None
+    if result_path is None or not result_path.is_file():
+        return None
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        extra = result.get("extra_fields", {})
+        processed_ids = [int(value) for value in extra.get("strict_parity_processed_prompt_ids", [])]
+        prompt_logprobs = extra.get("prompt_logprobs", [])
+        responses = fields.get("responses")
+        response_mask = fields.get("response_mask")
+        if not isinstance(responses, torch.Tensor) or not isinstance(response_mask, torch.Tensor):
+            return None
+        if responses.ndim == 1:
+            responses = responses.unsqueeze(0)
+        if response_mask.ndim == 1:
+            response_mask = response_mask.unsqueeze(0)
+        if not processed_ids or not prompt_logprobs:
+            return None
+        sample_index = int(sample_index)
+        if sample_index < 0 or sample_index >= batch_size:
+            raise ValueError(f"strict parity sample_index={sample_index} outside custom batch size {batch_size}")
+        response_ids = responses[sample_index][response_mask[sample_index].bool()].detach().cpu().tolist()
+        response_ids = [int(value) for value in response_ids]
+        if not response_ids:
+            return None
+        start = next(
+            (offset for offset in range(len(processed_ids) - len(response_ids) + 1)
+             if processed_ids[offset : offset + len(response_ids)] == response_ids),
+            None,
+        )
+        if start is None:
+            raise ValueError(
+                "strict parity replay processed prompt does not end with the captured response; "
+                "refusing to fabricate rollout log-probs"
+            )
+        # verl's extract_prompt_logprobs drops the first prompt position and
+        # appends one dummy element at the end.  Thus processed token i maps to
+        # extracted entry i-1 (for i >= 1).
+        log_values = []
+        for item in prompt_logprobs:
+            if isinstance(item, (list, tuple)):
+                item = item[0] if item else 0.0
+            log_values.append(0.0 if item is None else float(item))
+        offset = max(start - 1, 0)
+        if offset + len(response_ids) > len(log_values):
+            raise ValueError(
+                f"strict parity replay prompt log-probs are too short: offset={offset}, "
+                f"response={len(response_ids)}, available={len(log_values)}"
+            )
+        rollout = torch.zeros(
+            (batch_size, response_mask.shape[-1]), dtype=torch.float32, device=response_mask.device
+        )
+        values = torch.tensor(log_values[offset : offset + len(response_ids)], dtype=rollout.dtype)
+        rollout[sample_index, : values.numel()] = values.to(rollout.device)
+        metric_mask = response_mask.clone()
+        metric_mask[torch.arange(batch_size, device=metric_mask.device) != sample_index] = 0
+        return rollout, metric_mask
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        logger.exception("strict parity: failed to restore fixed-input rollout log-probs")
+        raise
+
+
+def _custom_tensordict(
+    replay_path: Any, expected_batch_size: int, result_root: Any = None, sample_index: int = 0
+) -> Any:
     """Build the same TensorDict shape that agent_loop_tq writes to TQ."""
     import torch
     from verl.utils.tensordict_utils import list_of_dict_to_tensordict
@@ -85,6 +168,29 @@ def _custom_tensordict(replay_path: Any, expected_batch_size: int) -> Any:
             "Set data.train_batch_size/rollout.n to the custom batch size."
         )
 
+    # ``multi_modal_inputs`` is intentionally not embedded in replay.pt: the
+    # capture path stores raw images in per-sample pickle sidecars so the main
+    # artifact stays small and portable.  Restore those sidecars here before
+    # constructing the TensorDict.  Without this step the token ids are
+    # present but Kimi's ``grid_thws`` is missing, so the training-side image
+    # expansion/logit mapping cannot be reconstructed.
+    media_refs = payload.get("media_refs") or []
+    media_values = []
+    if media_refs:
+        if len(media_refs) != replay_batch_size:
+            raise ValueError(
+                "custom replay media_refs length does not match batch size: "
+                f"refs={len(media_refs)}, batch={replay_batch_size}"
+            )
+        for index, ref in enumerate(media_refs):
+            if not ref:
+                media_values.append(None)
+                continue
+            try:
+                media_values.append(load_media_ref(ref))
+            except Exception as exc:
+                raise ValueError(f"failed to restore custom replay media sidecar {ref!r}") from exc
+
     names = (
         "input_ids",
         "attention_mask",
@@ -96,11 +202,24 @@ def _custom_tensordict(replay_path: Any, expected_batch_size: int) -> Any:
         "multi_modal_inputs",
         "mm_processor_kwargs",
     )
+    strict_rollout_fields = _load_strict_rollout_fields(
+        fields, result_root, sample_index=sample_index, batch_size=replay_batch_size
+    )
+
     samples = []
     for index in range(replay_batch_size):
         sample = {}
         for name in names:
-            value = _sample_value(fields.get(name), index, replay_batch_size)
+            if name == "multi_modal_inputs":
+                # Prefer the processor-ready tensors captured from the V1
+                # TransferQueue.  Raw media sidecars are retained for vLLM
+                # replay, but are not valid training ``multi_modal_inputs``:
+                # ``extract_multi_modal_inputs`` expects a dict of tensors.
+                value = _sample_value(fields.get(name), index, replay_batch_size)
+                if (value is None or value == {}) and media_values:
+                    value = media_values[index]
+            else:
+                value = _sample_value(fields.get(name), index, replay_batch_size)
             if value is None:
                 continue
             if name in {"prompts", "responses"} and not isinstance(value, torch.Tensor):
@@ -111,6 +230,13 @@ def _custom_tensordict(replay_path: Any, expected_batch_size: int) -> Any:
             raise ValueError(f"custom replay is missing required fields: {sorted(missing)}")
         if "loss_mask" not in sample:
             sample["loss_mask"] = sample["response_mask"]
+        if strict_rollout_fields is not None:
+            rollout_log_probs, metric_mask = strict_rollout_fields
+            sample["rollout_log_probs"] = rollout_log_probs[index]
+            # Do not let the ordinary rollout rows contaminate a custom
+            # fixed-input metric.  The selected row is compared against the
+            # prompt log-probs returned by the strict vLLM replay.
+            sample["response_mask"] = metric_mask[index]
         samples.append(sample)
     return list_of_dict_to_tensordict(samples)
 
@@ -118,7 +244,7 @@ def _custom_tensordict(replay_path: Any, expected_batch_size: int) -> Any:
 def _inject_custom_batch(batch: Any, settings: Settings) -> None:
     import transfer_queue as tq
 
-    fields = _custom_tensordict(settings.replay_path, len(batch))
+    fields = _custom_tensordict(settings.replay_path, len(batch), settings.root, settings.sample_index)
     tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=fields)
     logger.warning(
         "[strict-parity] replaced dataset batch with custom replay: path=%s batch_size=%d",
@@ -139,7 +265,25 @@ def _capture_fields(fields: Any, settings: Settings, metadata: dict[str, Any]) -
     media_refs = None
     if media_keys:
         media_refs = [media_ref_for_key(settings.root, str(key)) for key in media_keys]
-    manifest = save_replay(settings.replay_path, normalized, metadata, media_refs=media_refs)
+    # In custom mode the replay artifact is the input, not an output.  Do not
+    # overwrite it after injecting the fixed batch: doing so replaced the
+    # original vLLM media references with the custom run's random sample.
+    if settings.input_mode == "custom" and Path(settings.replay_path).is_file():
+        payload = load_replay(settings.replay_path)
+        manifest = {
+            "format_version": payload.get("format_version", 1),
+            "replay_path": str(settings.replay_path),
+            "metadata": payload.get("metadata", {}),
+            "fingerprints": payload.get("fingerprints", {}),
+            "media_refs": payload.get("media_refs"),
+            "fields": {name: {"type": type(value).__name__,
+                              "shape": list(value.shape) if hasattr(value, "shape") else None,
+                              "dtype": str(value.dtype) if hasattr(value, "dtype") else None}
+                       for name, value in payload.get("fields", {}).items()},
+        }
+        logger.warning("[strict-parity] custom replay input is immutable: %s", settings.replay_path)
+    else:
+        manifest = save_replay(settings.replay_path, normalized, metadata, media_refs=media_refs)
     write_manifest(settings.manifest_path, manifest)
     _CAPTURED = True
     settings.ready_path.parent.mkdir(parents=True, exist_ok=True)
@@ -242,7 +386,7 @@ def _patch_v1(settings: Settings, trainer_base: Any = None) -> bool:
                         partition_id=batch.partition_id,
                         select_fields=["input_ids", "attention_mask", "position_ids", "response_mask", "prompts", "responses"],
                     )
-                _capture_fields(
+                captured = _capture_fields(
                     data,
                     settings,
                     {
@@ -253,6 +397,13 @@ def _patch_v1(settings: Settings, trainer_base: Any = None) -> bool:
                         "keys": list(getattr(batch, "keys", [])),
                     },
                 )
+                # The first injection necessarily happens before the replay
+                # RPC, because capture pauses the training worker.  Once the
+                # RPC has written replay_result.json and released the pause,
+                # inject the fixed-input rollout log-probs as well; otherwise
+                # the old random rollout field remains in TransferQueue.
+                if settings.input_mode == "custom" and captured:
+                    _inject_custom_batch(batch, settings)
             except Exception:
                 logger.exception("strict parity: failed to capture V1 TransferQueue batch")
                 if settings.strict:
@@ -384,7 +535,7 @@ def _patch_legacy(settings: Settings, ray_trainer: Any = None) -> bool:
         if _step_matches(settings, step):
             try:
                 if settings.input_mode == "custom":
-                    custom_data = _custom_tensordict(settings.replay_path, len(batch))
+                    custom_data = _custom_tensordict(settings.replay_path, len(batch), settings.root, settings.sample_index)
                     batch.batch.update(custom_data)
                     logger.warning(
                         "[strict-parity] replaced legacy dataset batch with custom replay: path=%s batch_size=%d",
@@ -404,7 +555,9 @@ def _patch_legacy(settings: Settings, ray_trainer: Any = None) -> bool:
                 )
                 if media_keys is not None:
                     metadata["media_keys"] = media_keys
-                _capture_fields(fields, settings, metadata)
+                captured = _capture_fields(fields, settings, metadata)
+                if settings.input_mode == "custom" and captured:
+                    _inject_custom_batch(batch, settings)
             except Exception:
                 logger.exception("strict parity: failed to capture legacy DataProto batch")
                 if settings.strict:

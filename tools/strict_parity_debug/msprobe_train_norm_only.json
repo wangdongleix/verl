@@ -1,0 +1,4 @@
+{
+  "task": "tensor", "rank": [0], "step": [0], "level": "L0", "async_dump": false,
+  "tensor": {"scope": [], "list": ["language_model.model.norm"], "data_mode": ["all"]}
+}

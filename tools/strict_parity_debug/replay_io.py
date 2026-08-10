@@ -40,6 +40,17 @@ def to_cpu(value: Any, *, padding: int = 0) -> Any:
             except TypeError:
                 value = value.to_padded_tensor(padding=padding)
         return value.detach().cpu().clone()
+    # V1 TransferQueue stores each sample's processed multimodal dictionary in
+    # a tensordict NonTensorStack.  It is not a Mapping of fields: iterating it
+    # as a Mapping silently produces an empty dict, which drops pixel_values
+    # from replay.pt and leaves custom replay with only raw PIL objects.
+    try:
+        from tensordict import NonTensorData, NonTensorStack
+
+        if isinstance(value, (NonTensorData, NonTensorStack)):
+            return to_cpu(value.tolist(), padding=padding)
+    except ImportError:
+        pass
     if isinstance(value, Mapping):
         return {str(k): to_cpu(v, padding=padding) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
