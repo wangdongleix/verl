@@ -118,4 +118,26 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # Ray actors do not inherit arbitrary driver environment variables.  Gloo
+    # otherwise falls back to hostname resolution; on these containers that
+    # resolves some ranks to 127.0.0.1 and breaks a multi-node full mesh.
+    for key in ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME"):
+        value = os.environ.get(key)
+        if value:
+            runtime_env["env_vars"][key] = value
+    # Multi-node Ray actors are launched from the node-local Ray runtime and do
+    # not inherit the driver's module search path.  Forward the shared source
+    # roots so every node imports the same training/FSDP/vLLM code.
+    for key in (
+        "PYTHONPATH",
+        "FSDP_TURBO_ROOT",
+        "VERL_ASCEND_RECIPE",
+        "VLLM_PATH",
+        "VLLM_ASCEND_PATH",
+        "HF_MODULES_CACHE",
+        "KIMI_MODELING_PATH",
+    ):
+        value = os.environ.get(key)
+        if value:
+            runtime_env["env_vars"][key] = value
     return runtime_env

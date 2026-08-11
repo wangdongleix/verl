@@ -16,9 +16,11 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import importlib
 import json
 import logging
 import os
+import weakref
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -80,6 +82,151 @@ from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _patch_hf_external_fqn_alias(auto_class, model_config=None) -> None:
+    """Make Kimi's packed-expert FQN proxy traversable by Transformers.
+
+    Kimi stores routed experts in packed 3-D parameters but accepts the
+    checkpoint ABI ``experts.<id>.w{1,2,3}.weight``.  Transformers 4.56 calls
+    ``get_submodule`` while initializing missing keys; the original proxy is a
+    plain object, so traversing the numeric expert component raises
+    ``AttributeError: `0` is not an nn.Module``.  Patch only the dynamic
+    training-side module and keep the packed parameters unchanged.
+    """
+    config_cls = getattr(getattr(model_config, "hf_config", None), "__class__", None)
+    module_name = getattr(config_cls, "__module__", "").rsplit(".", 1)[0]
+    if not module_name or not module_name.startswith("transformers_modules."):
+        module_name = getattr(auto_class, "__module__", "").rsplit(".", 1)[0]
+    if not module_name:
+        return
+    try:
+        moe_module = importlib.import_module(f"{module_name}.kimi_moe_patch")
+    except (ImportError, AttributeError):
+        return
+    try:
+        linear_module = importlib.import_module(f"{module_name}.modeling_kimi_linear")
+    except (ImportError, AttributeError):
+        linear_module = None
+
+    # FSDP's EP unpermute can promote a routed-expert activation to FP32,
+    # while Kimi's checkpoint keeps RMSNorm gamma in BF16.  Ascend's
+    # aclnnRmsNorm does not implement the mixed pair (FP32, BF16); vLLM's
+    # path keeps both operands in the model compute dtype.  Patch only the
+    # dynamic training-side class so the training forward has the same
+    # dtype contract without changing the vLLM implementation or checkpoint.
+    rms_cls = getattr(linear_module, "KimiRMSNorm", None) if linear_module is not None else None
+    if rms_cls is not None and not getattr(rms_cls, "_verl_kimi_npu_dtype_compat", False):
+        original_rms_forward = rms_cls.forward
+
+        def _forward_with_npu_dtype_compat(self, hidden_states):
+            if hidden_states.device.type != "npu":
+                return original_rms_forward(self, hidden_states)
+            compute_dtype = self.weight.dtype
+            if hidden_states.dtype != compute_dtype:
+                hidden_states = hidden_states.to(dtype=compute_dtype)
+            return original_rms_forward(self, hidden_states)
+
+        rms_cls.forward = _forward_with_npu_dtype_compat
+        rms_cls._verl_kimi_npu_dtype_compat = True
+        logger.info("Patched Kimi RMSNorm training activation dtype for Ascend")
+    # The checkpoint loader may leave FSDP/EP expert shards on CPU after
+    # resharding or CPU offload.  The dynamic HF copy of kimi_moe_patch.py
+    # calls this module-level helper directly, before any model-side wrapper
+    # can stage those shards.  Keep the fix in the training engine: convert a
+    # DTensor to its local shard and stage the shard on the activation device
+    # immediately before Ascend grouped GEMM.  This is the same layout and
+    # operation used by the FSDP-Turbo source implementation, but applies to
+    # the model's immutable HF dynamic-module cache without editing it.
+    grouped_matmul = getattr(moe_module, "grouped_matmul", None)
+    if grouped_matmul is not None and not getattr(moe_module, "_verl_kimi_grouped_matmul_device_compat", False):
+        original_grouped_matmul = grouped_matmul
+
+        def _grouped_matmul_with_device_compat(x, weight, group_list, *args, **kwargs):
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            if isinstance(weight, torch.Tensor) and weight.device != x.device:
+                weight = weight.to(device=x.device, non_blocking=True)
+            if (
+                isinstance(weight, torch.Tensor)
+                and weight.is_floating_point()
+                and weight.dtype != x.dtype
+            ):
+                weight = weight.to(dtype=x.dtype)
+            return original_grouped_matmul(x, weight, group_list, *args, **kwargs)
+
+        moe_module.grouped_matmul = _grouped_matmul_with_device_compat
+        moe_module._verl_kimi_grouped_matmul_device_compat = True
+        logger.info("Patched Kimi grouped matmul training weight device staging for Ascend")
+    delta_cls = getattr(linear_module, "KimiDeltaAttention", None)
+    if delta_cls is not None and not getattr(delta_cls, "_verl_kimi_a_log_compat", False):
+        original_load_from_state_dict = delta_cls._load_from_state_dict
+
+        def _load_with_padded_a_log(self, state_dict, prefix, local_metadata, strict,
+                                    missing_keys, unexpected_keys, error_msgs):
+            key = f"{prefix}A_log"
+            loaded = state_dict.get(key)
+            expected = getattr(self, "A_log", None)
+            if (loaded is not None and expected is not None and loaded.ndim == expected.ndim == 1
+                    and loaded.shape[0] > expected.shape[0]):
+                # The Kimi checkpoint ABI stores A_log at the padded head
+                # dimension (128), while the config has 96 logical heads.
+                state_dict = state_dict.copy()
+                state_dict[key] = loaded[: expected.shape[0]]
+            return original_load_from_state_dict(
+                self, state_dict, prefix, local_metadata, strict,
+                missing_keys, unexpected_keys, error_msgs
+            )
+
+        delta_cls._load_from_state_dict = _load_with_padded_a_log
+        delta_cls._verl_kimi_a_log_compat = True
+        logger.info("Patched Kimi A_log checkpoint padding for training load")
+    gate_cls = getattr(linear_module, "KimiMoEGate", None)
+    if gate_cls is not None and not getattr(gate_cls, "_verl_kimi_expert_count_compat", False):
+        original_gate_load_from_state_dict = gate_cls._load_from_state_dict
+
+        def _load_with_pruned_expert_count(self, state_dict, prefix, local_metadata, strict,
+                                          missing_keys, unexpected_keys, error_msgs):
+            # The top32 checkpoint has 32 routed experts while the debug
+            # config intentionally instantiates 16.  Keep the first 16
+            # experts, matching the model shape; keys for layers beyond the
+            # configured four layers remain ordinary unexpected checkpoint keys.
+            state_dict = state_dict.copy()
+            for suffix in ("weight", "e_score_correction_bias"):
+                key = f"{prefix}{suffix}"
+                loaded = state_dict.get(key)
+                expected = getattr(self, suffix, None)
+                if (loaded is not None and expected is not None and loaded.ndim >= 1
+                        and expected.ndim >= 1 and loaded.shape[0] > expected.shape[0]):
+                    state_dict[key] = loaded[: expected.shape[0]]
+            return original_gate_load_from_state_dict(
+                self, state_dict, prefix, local_metadata, strict,
+                missing_keys, unexpected_keys, error_msgs
+            )
+
+        gate_cls._load_from_state_dict = _load_with_pruned_expert_count
+        gate_cls._verl_kimi_expert_count_compat = True
+        logger.info("Patched Kimi gate checkpoint expert-count slicing for training load")
+    alias = getattr(moe_module, "_KimiExpertStateDictAlias", None)
+    if alias is None or issubclass(alias, torch.nn.Module):
+        return
+
+    class _TraversableExpertStateDictAlias(torch.nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            # Do not register the parent as a child; this object is only a
+            # temporary FQN traversal proxy.
+            object.__setattr__(self, "_experts_ref", weakref.ref(experts))
+
+        def __getattr__(self, name: str):
+            if name in {"w1", "w2", "w3"}:
+                return self
+            if name == "weight":
+                return self._experts_ref().gate_up_proj
+            raise AttributeError(name)
+
+    moe_module._KimiExpertStateDictAlias = _TraversableExpertStateDictAlias
+    logger.info("Patched Kimi packed-expert FQN proxy for Transformers traversal")
 
 device_name = get_device_name()
 
@@ -160,7 +307,116 @@ def _missing_checkpoint_shards(local_path: str) -> list[str]:
     return [name for name in shard_names if not os.path.isfile(os.path.join(local_path, name))]
 
 
+def _load_kimi_partial_checkpoint_state_dict(local_path: str, model_config):
+    """Pack the raw top32 ABI for a smaller debug config before HF loading.
+
+    The top32 directory contains the original 93-layer/32-expert per-expert
+    keys, while this debug run intentionally uses the copied 4-layer/16-expert
+    config.  Transformers filters those virtual expert keys as unexpected
+    before PatchKimiMoeExperts._load_from_state_dict can pack them.  Read only
+    the configured layers/experts, assemble the packed tensors in memory, and
+    pass a normal HF state dict so no weight directory is modified.
+    """
+    index_path = os.path.join(local_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
+    except (OSError, ValueError):
+        return None
+    weight_map = index.get("weight_map", {})
+    if not any(".block_sparse_moe.experts." in key and ".w1.weight" in key for key in weight_map):
+        return None
+    hf_config = getattr(model_config, "hf_config", model_config)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    num_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
+    num_experts = int(getattr(text_config, "num_experts", 0) or 0)
+    if num_layers <= 0 or num_experts <= 0:
+        return None
+    linear_config = getattr(text_config, "linear_attn_config", {}) or {}
+    expected_a_log = int(linear_config.get("num_heads", 96))
+    state_dict = {}
+    packed_gate = {}
+    packed_down = {}
+    shard_names = sorted(set(weight_map.values()))
+    try:
+        from safetensors import safe_open
+        for shard_name in shard_names:
+            shard_path = os.path.join(local_path, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for key in shard.keys():
+                    layer_marker = "language_model.model.layers."
+                    if layer_marker in key:
+                        suffix = key.split(layer_marker, 1)[1]
+                        try:
+                            layer_idx = int(suffix.split(".", 1)[0])
+                        except (TypeError, ValueError):
+                            layer_idx = -1
+                        if layer_idx >= num_layers:
+                            continue
+                    value = shard.get_tensor(key)
+                    expert_marker = ".block_sparse_moe.experts."
+                    if expert_marker in key and ".w" in key and key.endswith(".weight"):
+                        expert_suffix = key.split(expert_marker, 1)[1]
+                        expert_id_text, projection_text = expert_suffix.split(".", 1)
+                        try:
+                            expert_id = int(expert_id_text)
+                        except ValueError:
+                            expert_id = num_experts
+                        if expert_id >= num_experts:
+                            continue
+                        layer_prefix = key.split(expert_marker, 1)[0] + ".block_sparse_moe"
+                        if projection_text == "w1.weight" or projection_text == "w3.weight":
+                            intermediate_size, hidden_size = value.shape
+                            target = packed_gate.get(layer_prefix)
+                            if target is None:
+                                target = torch.empty(
+                                    (num_experts, hidden_size, intermediate_size * 2),
+                                    dtype=value.dtype,
+                                    device="cpu",
+                                )
+                                packed_gate[layer_prefix] = target
+                            start = 0 if projection_text == "w1.weight" else intermediate_size
+                            target[expert_id, :, start : start + intermediate_size].copy_(value.transpose(0, 1))
+                        elif projection_text == "w2.weight":
+                            hidden_size, intermediate_size = value.shape
+                            target = packed_down.get(layer_prefix)
+                            if target is None:
+                                target = torch.empty(
+                                    (num_experts, intermediate_size, hidden_size),
+                                    dtype=value.dtype,
+                                    device="cpu",
+                                )
+                                packed_down[layer_prefix] = target
+                            target[expert_id].copy_(value.transpose(0, 1))
+                        continue
+                    if key.endswith(".gate.weight") and value.ndim >= 1 and value.shape[0] > num_experts:
+                        value = value[:num_experts]
+                    elif key.endswith(".gate.e_score_correction_bias") and value.ndim >= 1 and value.shape[0] > num_experts:
+                        value = value[:num_experts]
+                    elif key.endswith(".self_attn.A_log") and value.ndim == 1 and value.shape[0] > expected_a_log:
+                        value = value[:expected_a_log]
+                    state_dict[key] = value
+    except (OSError, KeyError, ValueError):
+        logger.exception("Failed to assemble the partial Kimi checkpoint state dict")
+        raise
+    for layer_prefix, value in packed_gate.items():
+        state_dict[f"{layer_prefix}.experts.gate_up_proj"] = value
+    for layer_prefix, value in packed_down.items():
+        state_dict[f"{layer_prefix}.experts.down_proj"] = value
+    logger.info(
+        "Assembled partial Kimi checkpoint: %d tensors, %d packed MoE layers, %d layers, %d experts",
+        len(state_dict),
+        len(packed_gate),
+        num_layers,
+        num_experts,
+    )
+    return state_dict
+
+
 def _load_hf_language_model(auto_class, model_config, torch_dtype, seed, load_pretrained=True):
+    _patch_hf_external_fqn_alias(auto_class, model_config)
     if model_config.random_init:
         logger.info("Initializing the language model from config with random weights")
         with torch.random.fork_rng(devices=[]):
@@ -191,6 +447,21 @@ def _load_hf_language_model(auto_class, model_config, torch_dtype, seed, load_pr
             "model.safetensors.index.json, or keep random_init=True for a config-only run."
         )
 
+    partial_state_dict = _load_kimi_partial_checkpoint_state_dict(model_config.local_path, model_config)
+    if partial_state_dict is not None:
+        model = auto_class.from_config(
+            model_config.hf_config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=model_config.trust_remote_code,
+        )
+        missing_keys, unexpected_keys = model.load_state_dict(
+            partial_state_dict, strict=False, assign=True
+        )
+        if missing_keys:
+            logger.warning("Partial Kimi checkpoint missing %d model keys", len(missing_keys))
+        if unexpected_keys:
+            logger.warning("Partial Kimi checkpoint has %d unexpected keys", len(unexpected_keys))
+        return model
     return auto_class.from_pretrained(
         pretrained_model_name_or_path=model_config.local_path,
         torch_dtype=torch_dtype,
@@ -776,7 +1047,11 @@ class FSDPEngine(BaseEngine):
 
         output_lst = []
 
-        ctx = torch.no_grad() if forward_only else nullcontext()
+        # Kimi’s remote vision forward enters inference_mode whenever grad is disabled.
+        # FSDP2 reuses its all-gather buffers for the next train step; inference
+        # tensors then fail on the in-place split/copy. Keep forward-only replay
+        # in grad mode and detach outputs below, so buffers remain trainable tensors.
+        ctx = torch.enable_grad() if forward_only else nullcontext()
 
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
         # and _build_fsdp_module, so self.scaler may not be set.
