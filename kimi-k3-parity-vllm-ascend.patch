@@ -1,0 +1,2244 @@
+diff --git a/tests/patch/test_kimi_full_r3_schema.py b/tests/patch/test_kimi_full_r3_schema.py
+new file mode 100644
+index 00000000..6ca0a159
+--- /dev/null
++++ b/tests/patch/test_kimi_full_r3_schema.py
+@@ -0,0 +1,85 @@
++from __future__ import annotations
++
++import types
++
++import numpy as np
++import pytest
++
++from vllm.model_executor.layers.fused_moe import routed_experts_capturer
++from vllm_ascend.patch.kimi_full_r3_schema import (
++    install_kimi_full_r3_schema_patch,
++)
++
++
++def _kimi_config():
++    return types.SimpleNamespace(
++        model_type="kimi_k3",
++        num_experts_per_token=8,
++        num_experts=16,
++        num_hidden_layers=2,
++    )
++
++
++def _construct_real_manager(monkeypatch):
++    """Run the patched wrapper and the real upstream manager initializer."""
++
++    class FakeFullAttentionSpec:
++        block_size = 2
++
++    monkeypatch.setattr(
++        routed_experts_capturer,
++        "FullAttentionSpec",
++        FakeFullAttentionSpec,
++    )
++    hf_config = _kimi_config()
++    vllm_config = types.SimpleNamespace(
++        model_config=types.SimpleNamespace(hf_text_config=hf_config)
++    )
++    kv_cache_config = types.SimpleNamespace(
++        kv_cache_groups=[
++            types.SimpleNamespace(kv_cache_spec=FakeFullAttentionSpec())
++        ],
++        num_blocks=2,
++    )
++    manager = routed_experts_capturer.RoutedExpertsManager(
++        vllm_config,
++        kv_cache_config,
++    )
++    return manager, hf_config
++
++
++def test_all_process_schema_reserves_ids_and_bf16_weight_bytes():
++    install_kimi_full_r3_schema_patch()
++    assert routed_experts_capturer._get_num_experts_per_tok(_kimi_config()) == 24
++    assert (
++        routed_experts_capturer.RoutedExpertsManager.__init__.__module__
++        == "vllm_ascend.patch.kimi_full_r3_schema"
++    )
++
++
++def test_scheduler_real_init_handles_kimi_spelling_and_uses_packed_width(
++    monkeypatch,
++):
++    install_kimi_full_r3_schema_patch()
++    manager, hf_config = _construct_real_manager(monkeypatch)
++
++    assert manager.routed_experts_by_slot.shape == (4, 2, 24)
++    assert manager._kimi_full_r3_schema_active is True
++    assert manager._kimi_full_r3_logical_topk == 8
++    assert not hasattr(hf_config, "num_experts_per_tok")
++
++
++def test_scheduler_store_and_retrieve_are_fail_closed(monkeypatch):
++    install_kimi_full_r3_schema_patch()
++    manager, _ = _construct_real_manager(monkeypatch)
++
++    data = np.arange(2 * 2 * 24, dtype=np.int32).reshape(2, 2, 24)
++    manager.store_batch(data, np.array([0, 1], dtype=np.int32))
++    restored = manager.get([0], num_tokens=2)
++    np.testing.assert_array_equal(
++        restored,
++        data.astype(manager.routed_experts_by_slot.dtype),
++    )
++
++    with pytest.raises(RuntimeError, match="scheduler store schema mismatch"):
++        manager.store_batch(data[..., :8], np.array([0, 1], dtype=np.int32))
+diff --git a/tests/ut/models/test_kimi_k3.py b/tests/ut/models/test_kimi_k3.py
+index 1581c2bb..a552bf85 100644
+--- a/tests/ut/models/test_kimi_k3.py
++++ b/tests/ut/models/test_kimi_k3.py
+@@ -416,6 +416,61 @@ def test_kimi_k3_text_loader_maps_real_checkpoint_names_to_shards():
+     ]
+ 
+ 
++def test_kimi_k3_text_loader_maps_packed_local_rows_to_global_experts():
++    calls = []
++
++    def make_parameter(target_name):
++        parameter = nn.Parameter(torch.zeros(1))
++
++        def weight_loader(param, loaded_weight, weight_name, **kwargs):
++            assert param is parameter
++            calls.append((target_name, loaded_weight.clone(), weight_name, kwargs))
++            return True
++
++        parameter.weight_loader = weight_loader
++        return parameter
++
++    prefix = "model.layers.1.block_sparse_moe.experts"
++    params = {
++        f"{prefix}.w13_weight": make_parameter(f"{prefix}.w13_weight"),
++        f"{prefix}.w2_weight": make_parameter(f"{prefix}.w2_weight"),
++    }
++    model = KimiK3TextModel.__new__(KimiK3TextModel)
++    nn.Module.__init__(model)
++    model.config = SimpleNamespace(
++        num_experts=8,
++        num_hidden_layers=2,
++        num_nextn_predict_layers=0,
++    )
++    model.named_parameters = lambda: iter(params.items())
++
++    gate_up = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
++    down = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
++    loaded = model.load_weights(
++        iter(
++            [
++                (f"{prefix}.gate_up_proj.__verl_packed_local__.4", gate_up),
++                (f"{prefix}.down_proj.__verl_packed_local__.4", down),
++            ]
++        )
++    )
++
++    assert loaded == {f"{prefix}.gate_up_proj", f"{prefix}.down_proj"}
++    assert [(call[0], call[3]["expert_id"], call[3]["shard_id"]) for call in calls] == [
++        (f"{prefix}.w13_weight", 4, "w1"),
++        (f"{prefix}.w13_weight", 4, "w3"),
++        (f"{prefix}.w13_weight", 5, "w1"),
++        (f"{prefix}.w13_weight", 5, "w3"),
++        (f"{prefix}.w2_weight", 4, "w2"),
++        (f"{prefix}.w2_weight", 5, "w2"),
++    ]
++    assert all(call[3]["return_success"] for call in calls)
++    assert all(call[2].endswith(".weight") for call in calls)
++    torch.testing.assert_close(calls[0][1], gate_up[0, :, :2].t().contiguous())
++    torch.testing.assert_close(calls[1][1], gate_up[0, :, 2:].t().contiguous())
++    torch.testing.assert_close(calls[4][1], down[0].t().contiguous())
++
++
+ def test_attention_residual_matches_reference_math(monkeypatch: pytest.MonkeyPatch):
+     monkeypatch.setattr(
+         kimi_k3_text,
+diff --git a/vllm_ascend/__init__.py b/vllm_ascend/__init__.py
+index 8fc31c87..831230ae 100644
+--- a/vllm_ascend/__init__.py
++++ b/vllm_ascend/__init__.py
+@@ -30,8 +30,15 @@ def _ensure_global_patch():
+         return
+ 
+     from vllm_ascend.utils import adapt_patch
++    from vllm_ascend.patch.kimi_full_r3_schema import (
++        install_kimi_full_r3_schema_patch,
++    )
+ 
+     adapt_patch(is_global_patch=True)
++    # EngineCore owns the scheduler-side routed-experts slot buffer and does
++    # not import ``vllm_ascend.patch.worker``.  Install Kimi's complete-R3
++    # wire schema from this all-process plugin path before Scheduler creation.
++    install_kimi_full_r3_schema_patch()
+     _GLOBAL_PATCH_APPLIED = True
+ 
+ 
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 3066b114..18c23eed 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -1668,7 +1668,8 @@ class AscendMLAImpl(MLAAttentionImpl):
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
+         prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
+-        prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
++        prefill_q_flat = self.q_proj(prefill_q_c)[0]
++        prefill_q = prefill_q_flat.view(-1, self.num_heads, self.qk_head_dim)
+         prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+         prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
+         cos = attn_metadata.prefill.cos
+@@ -1676,11 +1677,10 @@ class AscendMLAImpl(MLAAttentionImpl):
+         prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+         prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
+         prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
+-        prefill_k_nope, prefill_value = (
+-            self.kv_b_proj(prefill_k_c_normed)[0]
+-            .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+-            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+-        )
++        prefill_kv_b = self.kv_b_proj(prefill_k_c_normed)[0]
++        prefill_k_nope, prefill_value = prefill_kv_b.view(
++            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
++        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+         prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
+         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
+diff --git a/vllm_ascend/models/kimi_k3.py b/vllm_ascend/models/kimi_k3.py
+index f0adb0f2..ec933f3b 100644
+--- a/vllm_ascend/models/kimi_k3.py
++++ b/vllm_ascend/models/kimi_k3.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Native multimodal Kimi K3 model for vLLM-Ascend."""
+ 
++import json
++import os
+ from collections.abc import Iterable, Mapping, Sequence
+ from dataclasses import dataclass
+ from typing import Annotated, Any, Literal
+@@ -50,6 +52,20 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3Config
+ from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
+ 
+ 
++def _checkpoint_has_rot_proj(model_path: str | None) -> bool:
++    if not model_path:
++        return False
++    index_path = os.path.join(model_path, "model.safetensors.index.json")
++    if not os.path.isfile(index_path):
++        return False
++    try:
++        with open(index_path, encoding="utf-8") as index_file:
++            weight_map = json.load(index_file).get("weight_map", {})
++    except (OSError, ValueError):
++        return False
++    return "mm_projector.rot_proj.weight" in weight_map
++
++
+ def _move_module_to_device(
+     module: nn.Module,
+     *,
+@@ -245,6 +261,9 @@ class AscendKimiK3ForConditionalGeneration(
+         super().__init__()
+         model_config = vllm_config.model_config
+         config: KimiK3Config = model_config.hf_config
++        if _checkpoint_has_rot_proj(model_config.model):
++            config.vision_config.use_rot_proj = True
++            config.use_rot_proj = True
+         self.config = config
+         self.quant_config = vllm_config.quant_config
+         self.hidden_size = config.text_config.hidden_size
+diff --git a/vllm_ascend/models/kimi_k3_text.py b/vllm_ascend/models/kimi_k3_text.py
+index d834eb9c..08e499a7 100644
+--- a/vllm_ascend/models/kimi_k3_text.py
++++ b/vllm_ascend/models/kimi_k3_text.py
+@@ -2,16 +2,26 @@
+ """vLLM text model implementation for Kimi K3."""
+ 
+ from collections.abc import Iterable
++from functools import partial
++import os
+ from typing import Any
+ 
+ import torch
+ import torch_npu
+ from torch import nn
++from torch.nn import functional as F
++from triton_ascend_kernels.attention.fla.kda.gate import (
++    fused_kda_gate as _fsdp_fused_kda_gate,
++)
++from triton_ascend_kernels.attention.fla.kda.chunk import (
++    chunk_kda as _fsdp_chunk_kda,
++)
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, VllmConfig
+ from vllm.distributed import (
+     get_pp_group,
+     get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_reduce,
+ )
+ from vllm.model_executor.layers.activation import SiluAndMul
+ from vllm.model_executor.layers.fused_moe import FusedMoE, fused_moe_make_expert_params_mapping
+@@ -23,6 +33,7 @@ from vllm.model_executor.layers.linear import (
+     RowParallelLinear,
+ )
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn as _kimi_gdn_linear_attn
+ from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import KimiGatedDeltaNetAttention
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+@@ -51,6 +62,167 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3TextConfig
+ from vllm_ascend.utils import uses_global_inputs_embeds
+ 
+ 
++_VERL_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
++_KIMI_SAFE_GATE_LOWER_BOUND = -5.0
++_KDA_OPROJ_FP32_REDUCE = os.getenv("KIMI_KDA_OPROJ_FP32_REDUCE", "0") == "1"
++
++
++def _register_npu_format_cast_fake() -> None:
++    """Teach Dynamo/FakeTensor the shape contract of npu_format_cast.
++
++    Graph-mode vLLM traces the model with FakeTensors while estimating KV
++    cache capacity.  torch-npu exposes the real NPU kernel but no Meta kernel,
++    so the parity-preserving FP32 KDA o_proj below otherwise aborts before ACL
++    graph capture.  The cast is shape/stride/dtype preserving; registering its
++    abstract contract keeps the real npu_format_cast node in the compiled
++    graph instead of bypassing it only during tracing.
++    """
++    qualified_name = "npu::npu_format_cast"
++    if torch._C._dispatch_has_kernel_for_dispatch_key(qualified_name, "Meta"):
++        return
++
++    @torch.library.register_fake(qualified_name)
++    def _fake_npu_format_cast(
++        input_: torch.Tensor,
++        acl_format: int,
++        *,
++        customize_dtype: int | None = None,
++        input_dtype: int | None = None,
++    ) -> torch.Tensor:
++        del acl_format, customize_dtype, input_dtype
++        return torch.empty_strided(
++            input_.shape,
++            input_.stride(),
++            dtype=input_.dtype,
++            device=input_.device,
++        )
++
++
++_register_npu_format_cast_fake()
++
++
++def _kimi_safe_kda_gate(
++    raw_gate: torch.Tensor,
++    a_log: torch.Tensor,
++    dt_bias: torch.Tensor | None,
++    *,
++    head_dim: int | None = None,
++) -> torch.Tensor:
++    """Match the bounded KDA gate used by the FSDP training model.
++
++    Kimi K3 sets ``gate_lower_bound=-5``.  The training implementation uses
++    ``-5 * sigmoid(exp(A_log) * (gate + dt_bias))`` while upstream vLLM's Kimi
++    helper otherwise uses the unbounded ``-exp(A_log) * softplus(...)`` gate.
++    The latter is a different model and its error changes as the gate weights
++    are updated, so use the checkpoint's bounded gate for prefill and decode.
++    """
++    return _fsdp_fused_kda_gate(
++        raw_gate,
++        a_log,
++        head_k_dim=-1 if head_dim is None else head_dim,
++        dt_bias=dt_bias,
++        lower_bound=_KIMI_SAFE_GATE_LOWER_BOUND,
++        output_dtype=torch.float32,
++    )
++
++
++def _kimi_chunk_kda_with_safe_gate(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    raw_g: torch.Tensor,
++    beta: torch.Tensor,
++    A_log: torch.Tensor,
++    g_bias: torch.Tensor | None,
++    scale: float | None = None,
++    initial_state: torch.Tensor | None = None,
++    output_final_state: bool = False,
++    use_qk_l2norm_in_kernel: bool = False,
++    cu_seqlens: torch.Tensor | None = None,
++    **kwargs,
++):
++    # Use the same fused chunk kernel and flags as the FSDP training model.
++    # Keeping vLLM's separate chunk implementation here leaves a second
++    # update-sensitive numerical path even after the gate formula is aligned.
++    return _fsdp_chunk_kda(
++        q=q,
++        k=k,
++        v=v,
++        g=raw_g,
++        beta=beta,
++        A_log=A_log,
++        dt_bias=g_bias,
++        scale=scale,
++        initial_state=initial_state,
++        output_final_state=output_final_state,
++        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
++        use_gate_in_kernel=True,
++        use_beta_sigmoid_in_kernel=False,
++        safe_gate=True,
++        lower_bound=_KIMI_SAFE_GATE_LOWER_BOUND,
++        transpose_state_layout=True,
++        cu_seqlens=cu_seqlens,
++        **kwargs,
++    )
++
++
++def _kimi_fused_safe_kda_gate(
++    gate: torch.Tensor,
++    a_log: torch.Tensor,
++    head_k_dim: int,
++    g_bias: torch.Tensor | None = None,
++    **_: Any,
++) -> torch.Tensor:
++    return _kimi_safe_kda_gate(gate, a_log, g_bias, head_dim=head_k_dim)
++
++
++# KimiGatedDeltaNetAttention resolves these helpers from its defining module at
++# runtime.  Patch both paths so full-prefill parity and token-by-token rollout
++# use the same bounded gate semantics as training.
++_kimi_gdn_linear_attn.chunk_kda_with_fused_gate = _kimi_chunk_kda_with_safe_gate
++_kimi_gdn_linear_attn.fused_kda_gate = _kimi_fused_safe_kda_gate
++
++
++def _kimi_kda_fp32_o_proj_forward(
++    projection: nn.Module, input_: torch.Tensor
++) -> torch.Tensor | tuple[torch.Tensor, nn.Parameter | None]:
++    """Delay KDA row-parallel o_proj rounding until after TP reduction.
++
++    The BF16 row-parallel path rounds each TP rank's local GEMM before the
++    all-reduce. The FSDP actor evaluates one full-width GEMM, so cancellation
++    makes the two paths differ materially. Compute local GEMMs and the TP sum
++    in FP32, then cast once to the model dtype.
++    """
++    if not projection.input_is_parallel:
++        raise RuntimeError("KDA FP32 o_proj parity path requires parallel input")
++    if projection.bias is not None:
++        raise RuntimeError("KDA FP32 o_proj parity path expects bias=False")
++    if not projection.reduce_results:
++        raise RuntimeError("KDA FP32 o_proj parity path requires TP reduction")
++
++    input_base = torch_npu.npu_format_cast(input_, 2)
++    weight_base = torch_npu.npu_format_cast(projection.weight, 2)
++    output_parallel = F.linear(input_base.float(), weight_base.float())
++    if projection.tp_size > 1:
++        output_fp32 = tensor_model_parallel_all_reduce(output_parallel)
++    else:
++        output_fp32 = output_parallel
++    output = output_fp32.to(input_.dtype)
++    if not projection.return_bias:
++        return output
++    return output, None
++
++
++def _parse_verl_packed_local_name(name: str) -> tuple[str, int | None]:
++    """Return the physical packed parameter name and global expert offset."""
++    if _VERL_PACKED_LOCAL_MARKER not in name:
++        return name, None
++    base_name, start_text = name.rsplit(_VERL_PACKED_LOCAL_MARKER, 1)
++    if not start_text.isdecimal():
++        raise ValueError(f"Invalid Kimi packed-local expert offset in weight name: {name}")
++    return base_name, int(start_text)
++
++
+ def _situ_params(config: KimiK3TextConfig) -> tuple[float, float | None]:
+     return config.activation_situ_beta or 1.0, config.activation_situ_linear_beta
+ 
+@@ -64,6 +236,33 @@ def _routed_latent_quant_config(
+     return None
+ 
+ 
++def _kimi_hf_sigmoid_topk(
++    *,
++    hidden_states: torch.Tensor,
++    gating_output: torch.Tensor,
++    topk: int,
++    renormalize: bool,
++    e_score_correction_bias: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Match ``KimiMoEGate`` routing instead of Ascend's fused top-k kernel.
++
++    The HF/FSDP implementation computes the gate in FP32, adds the correction
++    bias only for expert selection, calls ``torch.topk(..., sorted=False)``,
++    then gathers the *unbiased* sigmoid scores and optionally renormalizes.
++    Ascend's ``_moe_C.topk_sigmoid`` is numerically different around close
++    expert scores, which changes expert IDs even when the gate logits are
++    otherwise aligned.
++    """
++    del hidden_states
++    scores = gating_output.float().sigmoid()
++    scores_for_choice = scores + e_score_correction_bias.float().unsqueeze(0)
++    topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False).indices
++    topk_weights = scores.gather(1, topk_ids)
++    if renormalize:
++        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
++    return topk_weights.float(), topk_ids
++
++
+ class KimiK3MLP(nn.Module):
+     def __init__(
+         self,
+@@ -144,6 +343,10 @@ class KimiK3MoE(nn.Module):
+             raise ValueError("Kimi K3 requires routed_expert_hidden_size")
+ 
+         self.config = config
++        try:
++            self.layer_idx = int(prefix.split(".layers.", 1)[1].split(".", 1)[0])
++        except (IndexError, ValueError):
++            self.layer_idx = -1
+         self.hidden_size = config.hidden_size
+         self.moe_hidden_size = config.routed_expert_hidden_size
+         self.num_shared_experts = config.num_shared_experts
+@@ -158,7 +361,6 @@ class KimiK3MoE(nn.Module):
+             prefix=f"{prefix}.gate",
+         )
+         self.gate.e_score_correction_bias = nn.Parameter(torch.empty(config.num_experts))
+-
+         self.routed_expert_down_proj = ReplicatedLinear(
+             self.hidden_size,
+             self.moe_hidden_size,
+@@ -178,11 +380,6 @@ class KimiK3MoE(nn.Module):
+             quant_config=latent_quant_config,
+             prefix=f"{prefix}.routed_expert_up_proj",
+         )
+-        routed_output_transform = _KimiRoutedOutputTransform(
+-            self.routed_expert_norm,
+-            self.routed_expert_up_proj,
+-        )
+-
+         self.shared_experts: KimiK3MLP | None
+         if self.num_shared_experts:
+             self.shared_experts = KimiK3MLP(
+@@ -190,7 +387,10 @@ class KimiK3MoE(nn.Module):
+                 hidden_size=self.hidden_size,
+                 intermediate_size=config.moe_intermediate_size * self.num_shared_experts,
+                 quant_config=quant_config,
+-                reduce_results=False,
++                # The routed latent is reduced before its nonlinear RMSNorm.
++                # Reduce the independent shared branch here as well instead of
++                # asking MoERunner to reduce both branches after they are added.
++                reduce_results=True,
+                 prefix=f"{prefix}.shared_experts",
+             )
+         else:
+@@ -198,23 +398,28 @@ class KimiK3MoE(nn.Module):
+ 
+         beta, linear_beta = _situ_params(config)
+         self.experts = FusedMoE(
+-            shared_experts=self.shared_experts,
+             num_experts=config.num_experts,
+             top_k=config.num_experts_per_token,
+             hidden_size=self.moe_hidden_size,
+             intermediate_size=config.moe_intermediate_size,
+             renormalize=config.moe_renormalize,
+             quant_config=quant_config,
+-            use_grouped_topk=config.use_grouped_topk,
+-            num_expert_group=config.num_expert_group,
+-            topk_group=config.topk_group,
++            # Kimi K3's released configuration describes one expert group.
++            # vLLM's grouped router cannot be combined with a custom routing
++            # function, while one-group grouped top-k is exactly ordinary
++            # top-k.  Force the ordinary path so the custom function below
++            # can reproduce the HF/FSDP FP32 sigmoid+bias+topk arithmetic.
++            use_grouped_topk=False,
++            num_expert_group=None,
++            topk_group=None,
+             prefix=f"{prefix}.experts",
+             scoring_func=config.moe_router_activation_func,
+             e_score_correction_bias=self.gate.e_score_correction_bias,
++            custom_routing_function=partial(
++                _kimi_hf_sigmoid_topk,
++                e_score_correction_bias=self.gate.e_score_correction_bias,
++            ),
+             routed_scaling_factor=config.routed_scaling_factor,
+-            n_shared_experts=self.num_shared_experts,
+-            routed_input_transform=self.routed_expert_down_proj,
+-            routed_output_transform=routed_output_transform,
+             activation="situ",
+             situ_beta=beta,
+             situ_linear_beta=linear_beta,
+@@ -223,9 +428,36 @@ class KimiK3MoE(nn.Module):
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_size = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_size)
+-        router_logits, _ = self.gate(hidden_states)
++        # The HF/FSDP implementation computes the router in FP32:
++        #
++        #   F.linear(hidden_states.float(), weight.float())
++        #
++        # ReplicatedLinear follows the model BF16 path on Ascend, so its
++        # BF16 accumulation changes logits near the top-k boundary and can
++        # send a token to a different expert.  Keep the ReplicatedLinear
++        # module for checkpoint/weight-loader compatibility, but reproduce
++        # the training router arithmetic explicitly here.
++        router_logits = F.linear(
++            hidden_states.float(), self.gate.weight.float(), bias=None
++        )
++        identity = hidden_states
++
++        # FusedMoE tensor-parallelizes the expert intermediate dimension and
++        # reduces its return value.  K3's latent RMSNorm is nonlinear, so it
++        # must run *after* that reduction.  Passing these operations as
++        # MoERunner routed transforms applies RMSNorm to each TP partial and
++        # only then sums the projected results, which is not equivalent and
++        # inflated the routed branch by approximately sqrt(TP).
++        hidden_states = self.routed_expert_down_proj(hidden_states)[0]
+         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+-        return output.view(num_tokens, hidden_size)
++        if self.routed_expert_norm is not None:
++            output = self.routed_expert_norm(output)
++        output = self.routed_expert_up_proj(output)[0]
++        if self.shared_experts is not None:
++            shared_output = self.shared_experts(identity)
++            output = output + shared_output
++        output = output.view(num_tokens, hidden_size)
++        return output
+ 
+ 
+ class KimiK3MLAAttention(nn.Module):
+@@ -385,6 +617,12 @@ class KimiK3DecoderLayer(nn.Module):
+         quant_config = vllm_config.quant_config
+ 
+         if config.is_kda_layer(self.layer_idx):
++            gate_lower_bound = config.linear_attn_config.get("gate_lower_bound")
++            if gate_lower_bound != _KIMI_SAFE_GATE_LOWER_BOUND:
++                raise ValueError(
++                    "Kimi K3 vLLM safe-gate patch expects gate_lower_bound="
++                    f"{_KIMI_SAFE_GATE_LOWER_BOUND}, got {gate_lower_bound!r}"
++                )
+             # Instantiate by the upstream registered class name so vLLM's
+             # PluggableLayer mechanism selects the Ascend OOT implementation.
+             self.self_attn = KimiGatedDeltaNetAttention(
+@@ -392,6 +630,10 @@ class KimiK3DecoderLayer(nn.Module):
+                 vllm_config,
+                 prefix=f"{prefix}.self_attn",
+             )
++            if _KDA_OPROJ_FP32_REDUCE:
++                self.self_attn.o_proj.forward = _kimi_kda_fp32_o_proj_forward.__get__(
++                    self.self_attn.o_proj, type(self.self_attn.o_proj)
++                )
+         else:
+             self.self_attn = KimiK3MLAAttention(
+                 config=config,
+@@ -609,6 +851,82 @@ class KimiK3TextModel(nn.Module):
+         for args in weights:
+             name, loaded_weight = args[:2]
+             loader_kwargs: dict[str, Any] = args[2] if len(args) == 3 else {}
++            name, packed_local_expert_start = _parse_verl_packed_local_name(name)
++
++            # FSDP-Turbo stores routed Kimi experts as two packed, ordinary
++            # Linear tensors ([expert, in, out]): gate/up are concatenated
++            # on the output dimension and down is stored transposed. vLLM's
++            # FusedMoE parameters use the per-TP layout w13_weight /
++            # w2_weight and normally receive one expert at a time. Feed
++            # the packed checkpoint through the same FusedMoE weight loader so
++            # EP/TP placement and any quantization hooks remain authoritative.
++            if name.endswith(".experts.gate_up_proj") or name.endswith(".experts.down_proj"):
++                moe_prefix = name.rsplit(".experts.", 1)[0] + ".experts"
++                if loaded_weight.ndim != 3:
++                    raise ValueError(f"Packed Kimi expert weight must be 3-D: {name}")
++                num_experts, input_dim, output_dim = loaded_weight.shape
++                expert_start = packed_local_expert_start or 0
++                if expert_start + num_experts > self.config.num_experts:
++                    raise ValueError(
++                        f"Packed Kimi expert range [{expert_start}, {expert_start + num_experts}) "
++                        f"exceeds configured num_experts={self.config.num_experts}: {name}"
++                    )
++                require_local = packed_local_expert_start is not None
++                # FusedMoE.weight_loader dispatches model tensors by checking
++                # for the conventional ``weight`` component in weight_name.
++                # Packed FSDP parameters are registered directly as
++                # gate_up_proj/down_proj and therefore do not carry that
++                # component in their physical state-dict names.
++                logical_weight_name = f"{name}.weight"
++                if name.endswith(".gate_up_proj"):
++                    param_name = f"{moe_prefix}.w13_weight"
++                    param = params_dict[param_name]
++                    if output_dim % 2:
++                        raise ValueError(f"Packed gate_up_proj output is not even: {name}")
++                    intermediate_dim = output_dim // 2
++                    for local_expert_id in range(num_experts):
++                        expert_id = expert_start + local_expert_id
++                        expert_weight = loaded_weight[local_expert_id]
++                        for shard_id, start in (("w1", 0), ("w3", intermediate_dim)):
++                            shard = expert_weight[:, start : start + intermediate_dim].t().contiguous()
++                            loaded = param.weight_loader(
++                                param,
++                                shard,
++                                logical_weight_name,
++                                expert_id=expert_id,
++                                shard_id=shard_id,
++                                return_success=require_local,
++                            )
++                            if require_local and not loaded:
++                                raise RuntimeError(
++                                    f"vLLM rejected trainer packed-local expert {expert_id}: {name}"
++                                )
++                else:
++                    param_name = f"{moe_prefix}.w2_weight"
++                    param = params_dict[param_name]
++                    for local_expert_id in range(num_experts):
++                        expert_id = expert_start + local_expert_id
++                        shard = loaded_weight[local_expert_id].t().contiguous()
++                        loaded = param.weight_loader(
++                            param,
++                            shard,
++                            logical_weight_name,
++                            expert_id=expert_id,
++                            shard_id="w2",
++                            return_success=require_local,
++                        )
++                        if require_local and not loaded:
++                            raise RuntimeError(
++                                f"vLLM rejected trainer packed-local expert {expert_id}: {name}"
++                            )
++                # load_weights() returns live model parameter names.  Returning
++                # the trainer-side packed alias here made post-load audits look
++                # up a parameter that does not exist in vLLM, so expert weight
++                # synchronization could only prove that the loader was called,
++                # not that the destination parameter changed.  Report the
++                # actual FusedMoE target (w13_weight/w2_weight).
++                loaded_params.add(param_name)
++                continue
+             if "rotary_emb" in name:
+                 continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+diff --git a/vllm_ascend/models/kimi_k3_vit.py b/vllm_ascend/models/kimi_k3_vit.py
+index 7504ca72..35898f47 100644
+--- a/vllm_ascend/models/kimi_k3_vit.py
++++ b/vllm_ascend/models/kimi_k3_vit.py
+@@ -6,7 +6,9 @@ from copy import deepcopy
+ 
+ import numpy as np
+ import torch
++import torch_npu
+ from torch import nn
++from torch.nn import functional as F
+ from vllm.distributed import divide, get_tensor_model_parallel_world_size
+ from vllm.model_executor.layers.activation import get_act_fn
+ from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+@@ -21,7 +23,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.models.kimi_k25_vit import (
+     Learnable2DInterpPosEmbDivided_fixed,
+     Rope2DPosEmbRepeated,
+-    apply_rope,
+     tpool_patch_merger,
+ )
+ from vllm.model_executor.models.utils import maybe_prefix
+@@ -31,6 +32,54 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3VisionConfig
+ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+ 
+ 
++class _NpuCanonicalND(torch.autograd.Function):
++    """Canonicalize an NPU tensor's storage format without dropping gradients."""
++
++    @staticmethod
++    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
++        ctx.original_format = torch_npu.get_npu_format(tensor)
++        return torch_npu.npu_format_cast(tensor, 2)
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
++        return (torch_npu.npu_format_cast(grad_output, ctx.original_format),)
++
++
++def _canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
++    if tensor.device.type != "npu":
++        return tensor
++    if torch.is_grad_enabled() and tensor.requires_grad:
++        return _NpuCanonicalND.apply(tensor)
++    return torch_npu.npu_format_cast(tensor, 2)
++
++
++def _apply_training_rope(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    freqs_cis: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Match the MoonViT NPU RoPE used by the actor/reference model."""
++    cos = (
++        freqs_cis.unsqueeze(-2)
++        .real.to(torch.float32)
++        .repeat_interleave(2, dim=-1)
++        .contiguous()
++    )
++    sin = (
++        freqs_cis.unsqueeze(-2)
++        .imag.to(torch.float32)
++        .repeat_interleave(2, dim=-1)
++        .contiguous()
++    )
++    query = torch_npu.npu_rotary_mul(
++        query.float(), cos, sin, rotary_mode="interleave"
++    ).type_as(query)
++    key = torch_npu.npu_rotary_mul(
++        key.float(), cos, sin, rotary_mode="interleave"
++    ).type_as(key)
++    return query, key
++
++
+ class KimiK3VisionPatchEmbed(nn.Module):
+     def __init__(self, config: KimiK3VisionConfig) -> None:
+         super().__init__()
+@@ -61,8 +110,23 @@ class KimiK3VisionPatchEmbed(nn.Module):
+         )
+ 
+     def forward(self, pixels: torch.Tensor, grid_thws: torch.Tensor | list[list[int]]) -> torch.Tensor:
+-        hidden_states = self.proj(pixels).view(pixels.shape[0], -1)
+-        return self.pos_emb(hidden_states, grid_thws)
++        # FSDP materialization and vLLM weight loading can keep identical BF16
++        # values in different private Ascend formats.  The patch-sized Conv2d
++        # has one output location, so canonicalize both operands to ND and use
++        # the mathematically equivalent FP32 linear on both sides.
++        with torch.autocast(device_type=pixels.device.type, enabled=False):
++            flat_pixels = pixels.flatten(1).float()
++            flat_weight = self.proj.weight.flatten(1).float()
++            bias = None if self.proj.bias is None else self.proj.bias.float()
++            if pixels.device.type == "npu":
++                flat_pixels = _canonical_nd(flat_pixels)
++                flat_weight = _canonical_nd(flat_weight)
++                if bias is not None:
++                    bias = _canonical_nd(bias)
++            hidden_states = F.linear(flat_pixels, flat_weight, bias)
++        hidden_states = hidden_states.to(self.proj.weight.dtype)
++        hidden_states = self.pos_emb(hidden_states, grid_thws)
++        return hidden_states
+ 
+ 
+ class KimiK3VisionMLP(nn.Module):
+@@ -77,27 +141,40 @@ class KimiK3VisionMLP(nn.Module):
+         bias: bool,
+     ) -> None:
+         super().__init__()
+-        self.fc0 = ColumnParallelLinear(
+-            hidden_size,
+-            intermediate_size,
+-            bias=bias,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.fc0",
+-            disable_tp=use_data_parallel,
+-        )
+-        self.fc1 = RowParallelLinear(
+-            intermediate_size,
+-            hidden_size,
+-            bias=bias,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.fc1",
+-            disable_tp=use_data_parallel,
+-        )
++        self.use_native_linear = use_data_parallel and quant_config is None
++        if self.use_native_linear:
++            # In data-parallel BF16 mode the training model also uses plain
++            # nn.Linear.  Keeping the same operator and weight layout avoids
++            # per-layer rounding drift through the 27-layer vision encoder.
++            self.fc0 = nn.Linear(hidden_size, intermediate_size, bias=bias)
++            self.fc1 = nn.Linear(intermediate_size, hidden_size, bias=bias)
++        else:
++            self.fc0 = ColumnParallelLinear(
++                hidden_size,
++                intermediate_size,
++                bias=bias,
++                quant_config=quant_config,
++                prefix=f"{prefix}.fc0",
++                disable_tp=use_data_parallel,
++            )
++            self.fc1 = RowParallelLinear(
++                intermediate_size,
++                hidden_size,
++                bias=bias,
++                quant_config=quant_config,
++                prefix=f"{prefix}.fc1",
++                disable_tp=use_data_parallel,
++            )
+         self.activation = activation
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        hidden_states, _ = self.fc0(hidden_states)
++        if self.use_native_linear:
++            hidden_states = self.fc0(hidden_states)
++        else:
++            hidden_states = self.fc0(hidden_states)[0]
+         hidden_states = self.activation(hidden_states)
++        if self.use_native_linear:
++            return self.fc1(hidden_states)
+         return self.fc1(hidden_states)[0]
+ 
+ 
+@@ -160,6 +237,19 @@ class KimiK3VisionEncoderLayer(nn.Module):
+             prefix=f"{prefix}.attn",
+         )
+ 
++        self.use_native_linear = self.use_data_parallel and quant_config is None
++        if self.use_native_linear:
++            self.wqkv = nn.Linear(
++                self.hidden_dim,
++                self.qkv_hidden_size * 3,
++                bias=config.attn_bias,
++            )
++            self.wo = nn.Linear(
++                self.qkv_hidden_size,
++                self.hidden_dim,
++                bias=config.attn_bias,
++            )
++
+     def attention(
+         self,
+         hidden_states: torch.Tensor,
+@@ -169,7 +259,10 @@ class KimiK3VisionEncoderLayer(nn.Module):
+         sequence_lengths: torch.Tensor | None,
+     ) -> torch.Tensor:
+         num_tokens = hidden_states.shape[0]
+-        qkv = self.wqkv(hidden_states)[0].view(
++        qkv_out = self.wqkv(hidden_states)
++        if not self.use_native_linear:
++            qkv_out = qkv_out[0]
++        qkv = qkv_out.view(
+             num_tokens,
+             3,
+             self.num_local_heads,
+@@ -178,7 +271,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
+         query, key, value = qkv.unbind(dim=1)
+         # QKVParallelLinear shards heads, while the shared RoPE table is head
+         # independent and therefore needs no TP slicing.
+-        query, key = apply_rope(query, key, rope_freqs_cis)
++        query, key = _apply_training_rope(query, key, rope_freqs_cis)
+         output = self.attn(
+             query.unsqueeze(0),
+             key.unsqueeze(0),
+@@ -188,7 +281,10 @@ class KimiK3VisionEncoderLayer(nn.Module):
+             sequence_lengths=sequence_lengths,
+         )
+         output = output.reshape(num_tokens, self.num_local_heads * self.head_dim)
+-        return self.wo(output)[0]
++        wo_out = self.wo(output)
++        if not self.use_native_linear:
++            wo_out = wo_out[0]
++        return wo_out
+ 
+     def forward(
+         self,
+@@ -330,43 +426,74 @@ class KimiK3MultiModalProjector(nn.Module):
+         self.input_size = config.mm_hidden_size * merge_size
+         if config.mm_projector_type != "patchmergerv2":
+             raise ValueError(f"Unsupported Kimi K3 projector: {config.mm_projector_type}")
+-        self.linear_1 = ReplicatedLinear(
+-            self.input_size,
+-            self.input_size,
+-            bias=False,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.linear_1",
+-        )
+-        self.linear_2 = ReplicatedLinear(
+-            self.input_size,
+-            config.text_hidden_size,
+-            bias=False,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.linear_2",
+-        )
+-        self.act = get_act_fn(config.projector_hidden_act)
+-        self.post_norm = RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+-        # ModelSlim rotates K3's FP4 activations before INT4 inference. Text
+-        # embeddings fold this matrix into their input projection, but the
+-        # vision path ends in RMSNorm, so the rotation must remain explicit.
+-        self.rot_proj: ReplicatedLinear | None = None
+-        if get_ascend_device_type() == AscendDeviceType.A3:
+-            self.rot_proj = ReplicatedLinear(
+-                config.text_hidden_size,
++        self.use_native_linear = is_vit_use_data_parallel() and quant_config is None
++        if self.use_native_linear:
++            self.linear_1 = nn.Linear(self.input_size, self.input_size, bias=False)
++            self.linear_2 = nn.Linear(
++                self.input_size, config.text_hidden_size, bias=False
++            )
++        else:
++            self.linear_1 = ReplicatedLinear(
++                self.input_size,
++                self.input_size,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.linear_1",
++            )
++            self.linear_2 = ReplicatedLinear(
++                self.input_size,
+                 config.text_hidden_size,
+                 bias=False,
+-                quant_config=None,
+-                prefix=f"{prefix}.rot_proj",
++                quant_config=quant_config,
++                prefix=f"{prefix}.linear_2",
+             )
++        self.act = get_act_fn(config.projector_hidden_act)
++        if self.use_native_linear:
++            self.post_norm = nn.RMSNorm(
++                config.text_hidden_size, eps=config.projector_ln_eps
++            )
++        else:
++            self.post_norm = RMSNorm(
++                config.text_hidden_size, eps=config.projector_ln_eps
++            )
++        # Some BF16 checkpoints contain an explicit projector rotation. It is
++        # part of the model architecture and must run in both training and
++        # inference. Keep the original A3 ModelSlim fallback for old configs.
++        self.rot_proj: ReplicatedLinear | None = None
++        has_checkpoint_rot_proj = bool(getattr(config, "use_rot_proj", False))
++        is_modelslim = quant_config is not None and quant_config.get_name() == "ascend"
++        if has_checkpoint_rot_proj or (
++            get_ascend_device_type() == AscendDeviceType.A3 and is_modelslim
++        ):
++            if self.use_native_linear:
++                self.rot_proj = nn.Linear(
++                    config.text_hidden_size,
++                    config.text_hidden_size,
++                    bias=False,
++                )
++            else:
++                self.rot_proj = ReplicatedLinear(
++                    config.text_hidden_size,
++                    config.text_hidden_size,
++                    bias=False,
++                    quant_config=None,
++                    prefix=f"{prefix}.rot_proj",
++                )
+ 
+     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+         hidden_states = image_features.reshape(-1, self.input_size)
+-        hidden_states = self.linear_1(hidden_states)[0]
++        hidden_states = self.linear_1(hidden_states)
++        if not self.use_native_linear:
++            hidden_states = hidden_states[0]
+         hidden_states = self.act(hidden_states)
+-        hidden_states = self.linear_2(hidden_states)[0]
++        hidden_states = self.linear_2(hidden_states)
++        if not self.use_native_linear:
++            hidden_states = hidden_states[0]
+         hidden_states = self.post_norm(hidden_states)
+         if self.rot_proj is not None:
+-            hidden_states = self.rot_proj(hidden_states)[0]
++            hidden_states = self.rot_proj(hidden_states)
++            if not self.use_native_linear:
++                hidden_states = hidden_states[0]
+         return hidden_states
+ 
+ 
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index 671160d8..c5847807 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -112,14 +112,49 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         # Do not let upstream modular-kernel initialization replace it.
+         return None
+ 
++    @torch.no_grad()
++    def prepare_weights_for_loading(self, layer):
++        """Put Ascend MoE weights in the canonical loader layout.
++
++        Online actor reloads call this before ``model.load_weights`` so every
++        packed expert shard is loaded into one stable canonical layout. The
++        marker keeps the legacy loader wrapper from applying a second
++        shape-based transpose to these Kimi parameters.
++        """
++        hidden_size = int(getattr(layer, "hidden_size", getattr(self.moe, "hidden_dim", -1)))
++        if hidden_size <= 0:
++            return 0
++
++        prepared = 0
++        for name, hidden_axis in (("w13_weight", 1), ("w2_weight", 2)):
++            param = getattr(layer, name, None)
++            if param is None or not hasattr(param, "data") or param.data.ndim != 3:
++                continue
++
++            # Runtime layout has hidden_size on the axis used by the legacy
++            # wrapper. Convert it back exactly once; canonical layout is
++            # already ready for the checkpoint loader.
++            if int(param.shape[hidden_axis]) == hidden_size:
++                param.data = param.data.transpose(1, 2).contiguous()
++            param._verl_explicit_reload_layout = True
++            prepared += 1
++        return prepared
++
+     def process_weights_after_loading(self, layer):
+         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
+ 
+-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
++        hidden_size = int(getattr(layer, "hidden_size", getattr(self.moe, "hidden_dim", -1)))
++        w13_data = self._maybe_pad_weight(layer.w13_weight.data)
++        if hidden_size <= 0 or w13_data.shape[1] != hidden_size:
++            w13_data = w13_data.transpose(1, 2).contiguous()
++        # Preserve the Parameter object: its weight_loader and graph/runtime
++        # references must survive an online reload.
++        layer.w13_weight.data = w13_data
+ 
+-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
++        w2_data = self._maybe_pad_weight(layer.w2_weight.data)
++        if hidden_size <= 0 or w2_data.shape[2] != hidden_size:
++            w2_data = w2_data.transpose(1, 2).contiguous()
++        layer.w2_weight.data = w2_data
+ 
+         # TODO: Current dispatch_ffn_combine fusion operator ONLY supports NZ format.
+         # Therefore, we must cast weights to NZ when fusion is enabled.
+@@ -193,19 +228,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+             tid2eid=self.tid2eid,
+             input_ids=input_ids,
+         )
+-        if vllm_version_is("0.23.0"):
+-            model_config = layer.vllm_config.model_config
+-        else:
+-            try:
+-                _vllm_config = get_current_vllm_config()
+-            except AssertionError:
+-                _vllm_config = None
+-            model_config = None if _vllm_config is None else _vllm_config.model_config
+-        if model_config is not None and model_config.enable_return_routed_experts:
+-            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+-            if capturer is not None:
+-                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
+-
+         if zero_expert_num > 0 and zero_expert_type is not None:
+             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
+                 expert_indices=topk_ids,
+@@ -223,6 +245,27 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+ 
++        # Capture only after every routing mutation and after the exact dtype
++        # cast used by FusedMoE.  Full R3 must replay the expert/weight pairs
++        # that actually produced the rollout output, not an earlier router
++        # intermediate.
++        if vllm_version_is("0.23.0"):
++            model_config = layer.vllm_config.model_config
++        else:
++            try:
++                _vllm_config = get_current_vllm_config()
++            except AssertionError:
++                _vllm_config = None
++            model_config = None if _vllm_config is None else _vllm_config.model_config
++        if model_config is not None and model_config.enable_return_routed_experts:
++            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
++            if capturer is not None:
++                capturer.capture(
++                    layer_id=layer.layer_id,
++                    topk_ids=topk_ids,
++                    topk_weights=topk_weights,
++                )
++
+         moe_comm_method = _EXTRA_CTX.moe_comm_method
+         # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
+         # and provide dummy scales (w1_scale, w2_scale). This is required because:
+diff --git a/vllm_ascend/ops/kimi_kda.py b/vllm_ascend/ops/kimi_kda.py
+index 266cfb5b..f1204c7e 100644
+--- a/vllm_ascend/ops/kimi_kda.py
++++ b/vllm_ascend/ops/kimi_kda.py
+@@ -3,19 +3,36 @@
+ """Ascend implementation of Kimi's gated delta attention.
+ 
+ The vLLM implementation provides the projections, cache specification, and
+-opaque ``kda_attention`` custom op.  This OOT replacement keeps that public
+-surface while routing prefill through the Kimi AscendC kernels and decode
+-through the recurrent KDA AscendC kernel.
++opaque ``kda_attention`` custom op. This OOT replacement keeps that public
++surface while defaulting Kimi K3 prefill and decode to the same Triton
++short-convolution and chunk-KDA kernels used by the FSDP actor.
+ """
+ 
+ from functools import partial
++import os
+ 
+ import torch
+ from einops import rearrange
++from fsdp_turbo.models.kimi_k3.qwen3_5.causal_conv1d import (
++    causal_conv1d as training_causal_conv1d,
++)
++from fsdp_turbo.models.kimi_k3.ops.gdn.triton.convolution import (
++    causal_conv1d_fwd_impl as training_causal_conv1d_fwd_impl,
++)
++from triton_ascend_kernels.attention.fla.kda.chunk import (
++    chunk_kda as training_chunk_kda,
++)
++from triton_ascend_kernels.attention.fla.kda.gate import (
++    fused_kda_gate as training_fused_kda_gate,
++)
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
++from vllm.model_executor.layers.fla.ops.kda import (
++    fused_recurrent_kda as core_fused_recurrent_kda,
++)
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+     KimiGatedDeltaNetAttention,
+@@ -31,8 +48,25 @@ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+ from vllm_ascend.ops.triton.kda.kda import fused_kda_gate
+ from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3TextConfig
+ from vllm_ascend.utils import parse_layer_idx, uses_global_inputs_embeds
+-
+ _KDA_CHUNK_SIZE = 64
++_USE_TRAINING_CHUNK_KDA_PREFILL = (
++    os.getenv("KIMI_VLLM_USE_TRAINING_CHUNK_KDA_PREFILL", "1") == "1"
++)
++_USE_TRAINING_CHUNK_KDA_DECODE = (
++    os.getenv("KIMI_VLLM_USE_TRAINING_CHUNK_KDA_DECODE", "1") == "1"
++)
++_USE_PARTITION_INVARIANT_KDA = (
++    os.getenv("KIMI_VLLM_USE_PARTITION_INVARIANT_KDA", "0") == "1"
++)
++_USE_TRAINING_CAUSAL_CONV1D = (
++    os.getenv("KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D", "1") == "1"
++)
++_TRAINING_CONV_LOGGED: set[str] = set()
++_TRAINING_KDA_PREFILL_LOGGED = False
++_TRAINING_KDA_DECODE_LOGGED = False
++_PARTITION_INVARIANT_KDA_PREFILL_LOGGED = False
++_PARTITION_INVARIANT_KDA_DECODE_LOGGED = False
++logger = init_logger(__name__)
+ 
+ 
+ def _load_kimi_k3_a_log(
+@@ -220,6 +254,145 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+                 "Ascend Kimi KDA requires the convolution cache layout [num_cache_lines, state_len, qkv_dim]."
+             )
+ 
++        if _USE_TRAINING_CAUSAL_CONV1D:
++            if num_accepted_tokens is not None:
++                raise RuntimeError(
++                    "training-identical Kimi causal_conv1d does not support "
++                    "speculative decode; disable speculation or explicitly set "
++                    "KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D=0"
++                )
++            if mixed_qkv.shape[-1] % 3 != 0:
++                raise RuntimeError(
++                    "training-identical Kimi causal_conv1d requires equal q/k/v "
++                    f"widths, got mixed width {mixed_qkv.shape[-1]}"
++                )
++            num_sequences = metadata.query_start_loc.numel() - 1
++            cache_indices = metadata.cache_indices.reshape(-1)
++            if cache_indices.numel() != num_sequences:
++                raise RuntimeError(
++                    "training-identical Kimi causal_conv1d metadata mismatch: "
++                    f"cache_indices={cache_indices.numel()}, "
++                    f"sequences={num_sequences}"
++                )
++
++            # ``cache_indices`` comes from a block table and can be [N, 1].
++            # Flatten it before advanced indexing; otherwise PyTorch preserves
++            # that extra index dimension and produces [N, 1, W-1, 3D].
++            #
++            # vLLM stores [row, W-1, 3D], while the actor Triton kernel accepts
++            # and returns [row, D, W].  Its first state position is deliberately
++            # unused by a width-W causal convolution, so prepend one zero slot
++            # on input and retain only the final W-1 positions on cache write.
++            active_state = conv_state[cache_indices].transpose(1, 2).contiguous()
++            kernel_width = conv_weights_t.shape[0]
++            cached_state_len = active_state.shape[-1]
++            if cached_state_len != kernel_width - 1:
++                raise RuntimeError(
++                    "training-identical Kimi causal_conv1d state-width mismatch: "
++                    f"cache={cached_state_len}, kernel={kernel_width}"
++                )
++            initial_state_mode = metadata.initial_state_mode
++            if initial_state_mode is not None:
++                initial_state_mode = initial_state_mode.reshape(-1).bool()
++                if initial_state_mode.numel() != num_sequences:
++                    raise RuntimeError(
++                        "training-identical Kimi causal_conv1d initial-state "
++                        f"metadata mismatch: modes={initial_state_mode.numel()}, "
++                        f"sequences={num_sequences}"
++                    )
++                active_state = torch.where(
++                    initial_state_mode[:, None, None],
++                    active_state,
++                    torch.zeros_like(active_state),
++                )
++                # Eager prefill retains the old no-initial-state fast path.
++                # Decode must not call .item() while an ACL graph is captured;
++                # a zero initial state is mathematically identical to None.
++                use_initial_state = (
++                    bool(initial_state_mode.any().item())
++                    if run_mode == 0
++                    else True
++                )
++            else:
++                use_initial_state = True
++
++            actor_state = torch.cat(
++                (active_state.new_zeros((*active_state.shape[:-1], 1)), active_state),
++                dim=-1,
++            )
++
++            width = mixed_qkv.shape[-1] // 3
++            outputs: list[torch.Tensor] = []
++            final_states: list[torch.Tensor] = []
++            cu_seqlens = metadata.query_start_loc.to(
++                device=mixed_qkv.device, dtype=torch.int32
++            )
++            decode_chunk_indices = None
++            if run_mode == 1:
++                if mixed_qkv.shape[0] != num_sequences:
++                    raise RuntimeError(
++                        "training-identical Kimi causal_conv1d decode requires "
++                        "exactly one token per sequence: "
++                        f"tokens={mixed_qkv.shape[0]}, sequences={num_sequences}"
++                    )
++                sequence_ids = torch.arange(
++                    num_sequences,
++                    device=mixed_qkv.device,
++                    dtype=torch.int32,
++                )
++                decode_chunk_indices = torch.stack(
++                    (sequence_ids, torch.zeros_like(sequence_ids)), dim=1
++                )
++            for part in range(3):
++                start = part * width
++                end = start + width
++                conv_kwargs = {
++                    "x": mixed_qkv[:, start:end].unsqueeze(0),
++                    "weight": conv_weights_t[:, start:end].contiguous(),
++                    "bias": None,
++                    "residual": None,
++                    "initial_state": (
++                        actor_state[:, start:end].contiguous()
++                        if use_initial_state
++                        else None
++                    ),
++                    "activation": "silu",
++                    "cu_seqlens": cu_seqlens,
++                    "output_final_state": True,
++                }
++                if decode_chunk_indices is None:
++                    output, final_state = training_causal_conv1d(**conv_kwargs)
++                else:
++                    # Use the exact actor Triton kernel while bypassing only
++                    # prepare_chunk_indices(), whose .tolist() host sync cannot
++                    # run inside an ACL decode graph.
++                    output, final_state = training_causal_conv1d_fwd_impl(
++                        **conv_kwargs,
++                        precomputed_chunk_indices=decode_chunk_indices,
++                    )
++                if final_state is None:
++                    raise RuntimeError(
++                        "training-identical Kimi causal_conv1d did not return final state"
++                    )
++                outputs.append(output)
++                final_states.append(final_state)
++
++            updated_state = torch.cat(final_states, dim=1)[
++                ..., -cached_state_len:
++            ].transpose(1, 2).contiguous().to(conv_state.dtype)
++            conv_state[cache_indices] = updated_state
++            mode_name = "prefill" if run_mode == 0 else "decode"
++            if mode_name not in _TRAINING_CONV_LOGGED:
++                _TRAINING_CONV_LOGGED.add(mode_name)
++                logger.warning(
++                    "Kimi vLLM TRAINING-IDENTICAL CAUSAL-CONV ACTIVE: "
++                    "mode=%s kernel=FSDPTurbo.causal_conv1d separate_qkv=True "
++                    "cache_gather_scatter=True graph_safe_decode_chunks=%s",
++                    mode_name,
++                    run_mode == 1,
++                )
++            return torch.cat(outputs, dim=-1).squeeze(0)
++
+         out = torch.empty_like(mixed_qkv)
+         torch.ops._C_ascend.npu_causal_conv1d_custom(
+             out,
+@@ -259,6 +432,56 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+         )
+         return gate.unsqueeze(0)
+ 
++    def _run_partition_invariant_recurrent(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        raw_gate: torch.Tensor,
++        beta: torch.Tensor,
++        recurrent_state: torch.Tensor,
++        cu_seqlens: torch.Tensor | tuple[int, ...] | list[int],
++        state_indices: torch.Tensor,
++    ) -> torch.Tensor:
++        """Use the actor's gate and one recurrent kernel for every phase."""
++
++        effective_gate = training_fused_kda_gate(
++            raw_gate,
++            self.A_log,
++            head_k_dim=self.head_dim,
++            dt_bias=self.dt_bias,
++            lower_bound=self.gate_lower_bound,
++            output_dtype=torch.float32,
++        )
++        if isinstance(cu_seqlens, torch.Tensor):
++            cu_seqlens_tensor = cu_seqlens.to(
++                device=q.device, dtype=torch.int32
++            ).contiguous()
++        else:
++            # Ascend's prefill metadata deliberately keeps compact sequence
++            # boundaries on the host as a tuple.  Decode supplies a device
++            # tensor.  Normalize both representations at the recurrent-kernel
++            # boundary so prefill and decode execute the same implementation.
++            cu_seqlens_tensor = torch.tensor(
++                cu_seqlens, device=q.device, dtype=torch.int32
++            )
++
++        output, _ = core_fused_recurrent_kda(
++            q=q,
++            k=k,
++            v=v,
++            g=effective_gate,
++            beta=beta,
++            initial_state=recurrent_state,
++            inplace_final_state=True,
++            use_qk_l2norm_in_kernel=True,
++            cu_seqlens=cu_seqlens_tensor,
++            ssm_state_indices=state_indices.to(
++                device=q.device, dtype=torch.int64
++            ).contiguous(),
++        )
++        return output
++
+     def _run_recurrent(
+         self,
+         q: torch.Tensor,
+@@ -272,6 +495,87 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+         *,
+         num_accepted_tokens: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        global _PARTITION_INVARIANT_KDA_DECODE_LOGGED
++        global _TRAINING_KDA_DECODE_LOGGED
++        if _USE_PARTITION_INVARIANT_KDA:
++            if num_accepted_tokens is not None:
++                raise RuntimeError(
++                    "partition-invariant Kimi recurrent decode does not support "
++                    "speculative decode"
++                )
++            output = self._run_partition_invariant_recurrent(
++                q,
++                k,
++                v,
++                raw_gate,
++                beta,
++                recurrent_state,
++                cu_seqlens,
++                state_indices,
++            )
++            if not _PARTITION_INVARIANT_KDA_DECODE_LOGGED:
++                _PARTITION_INVARIANT_KDA_DECODE_LOGGED = True
++                logger.warning(
++                    "Kimi vLLM PARTITION-INVARIANT KDA DECODE ACTIVE: "
++                    "kernel=core_fused_recurrent_kda "
++                    "gate=training_fused_kda_gate state_indices=per_token"
++                )
++            return output
++
++        if _USE_TRAINING_CHUNK_KDA_DECODE:
++            if num_accepted_tokens is not None:
++                raise RuntimeError(
++                    "training-identical Kimi chunk_kda decode does not support "
++                    "speculative decode; disable speculation or explicitly set "
++                    "KIMI_VLLM_USE_TRAINING_CHUNK_KDA_DECODE=0"
++                )
++            num_sequences = cu_seqlens.numel() - 1
++            if state_indices.numel() != num_sequences or q.shape[1] != num_sequences:
++                raise RuntimeError(
++                    "training-identical Kimi chunk_kda decode requires one token "
++                    "per active sequence: "
++                    f"tokens={q.shape[1]}, states={state_indices.numel()}, "
++                    f"sequences={num_sequences}"
++                )
++            initial_state = recurrent_state[state_indices].contiguous()
++            output, final_state = training_chunk_kda(
++                q=q,
++                k=k,
++                v=v,
++                g=raw_gate,
++                beta=beta,
++                A_log=self.A_log,
++                dt_bias=self.dt_bias,
++                initial_state=initial_state,
++                output_final_state=True,
++                use_qk_l2norm_in_kernel=True,
++                use_gate_in_kernel=True,
++                use_beta_sigmoid_in_kernel=False,
++                safe_gate=self.gate_lower_bound is not None,
++                lower_bound=(
++                    self.gate_lower_bound
++                    if self.gate_lower_bound is not None
++                    else -5.0
++                ),
++                transpose_state_layout=True,
++                cu_seqlens=cu_seqlens.to(device=q.device, dtype=torch.int32),
++            )
++            if final_state is None or final_state.shape != initial_state.shape:
++                raise RuntimeError(
++                    "training-identical Kimi chunk_kda returned an invalid decode "
++                    f"state: initial={tuple(initial_state.shape)}, "
++                    f"final={None if final_state is None else tuple(final_state.shape)}"
++                )
++            recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
++            if not _TRAINING_KDA_DECODE_LOGGED:
++                _TRAINING_KDA_DECODE_LOGGED = True
++                logger.warning(
++                    "Kimi vLLM TRAINING-IDENTICAL KDA DECODE ACTIVE: "
++                    "kernel=training_chunk_kda one_token_per_sequence=True "
++                    "cache_gather_scatter=True ids_and_weights_r3_independent=True"
++                )
++            return output
++
+         out = torch.ops._C_ascend.recurrent_kda(
+             q.contiguous(),
+             k.contiguous(),
+@@ -306,9 +610,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+         has_initial_state: torch.Tensor,
+         prebuilt_metadata,
+     ) -> torch.Tensor:
++        global _PARTITION_INVARIANT_KDA_PREFILL_LOGGED
++        global _TRAINING_KDA_PREFILL_LOGGED
+         if get_pcp_group().world_size > 1:
+             raise NotImplementedError("Kimi KDA prefill does not yet support PCP.")
+-        _require_ascendc_prefill_ops()
+ 
+         cu_seqlens_kern = prebuilt_metadata.cu_seqlens_kern
+         cu_seqlens = prebuilt_metadata.cu_seqlens_host if cu_seqlens_kern is None else cu_seqlens_kern
+@@ -334,6 +639,100 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+         initial_state_vk = recurrent_state[state_indices].contiguous()
+         clear_ssm_states(initial_state_vk, has_initial_state)
+ 
++        if _USE_PARTITION_INVARIANT_KDA:
++            # Clear/copy through the gathered view before the recurrent kernel
++            # operates directly on the persistent vLLM state cache.
++            recurrent_state[state_indices] = initial_state_vk
++            # The kernel consumes one cache index per token.  Each row
++            # corresponds to one packed sequence and repeats that sequence's
++            # persistent cache slot; unused columns are never read.
++            recurrent_state_indices = state_indices[:, None].expand(
++                state_indices.shape[0], q.shape[1]
++            ).contiguous()
++            output = self._run_partition_invariant_recurrent(
++                q,
++                k,
++                v,
++                raw_gate,
++                beta,
++                recurrent_state,
++                cu_seqlens,
++                recurrent_state_indices,
++            )
++            final_state = recurrent_state[state_indices].contiguous()
++            if not _PARTITION_INVARIANT_KDA_PREFILL_LOGGED:
++                _PARTITION_INVARIANT_KDA_PREFILL_LOGGED = True
++                logger.warning(
++                    "Kimi vLLM PARTITION-INVARIANT KDA PREFILL ACTIVE: "
++                    "kernel=core_fused_recurrent_kda "
++                    "gate=training_fused_kda_gate "
++                    "packed_state_indices=per_token cache_inplace=True"
++                )
++            return output
++
++        if _USE_TRAINING_CHUNK_KDA_PREFILL:
++            # Match the FSDP actor's actual KDA prefill path.  The default
++            # Ascend implementation below decomposes the operation into
++            # kda_gate_cumsum + chunk_kda_fwd, which is numerically different
++            # even though it implements the same mathematical recurrence.
++            # Those small KDA differences alter later MoE routing and become
++            # update-sensitive, so use the actor's fused Triton kernel and
++            # flags on vLLM prefill as well.
++            if isinstance(cu_seqlens, torch.Tensor):
++                cu_seqlens_training = cu_seqlens.to(
++                    device=q.device, dtype=torch.int32
++                )
++            else:
++                cu_seqlens_training = torch.tensor(
++                    cu_seqlens, device=q.device, dtype=torch.int32
++                )
++
++            # A fresh vLLM request has no recurrent prefix, just like actor
++            # log-prob evaluation.  Passing None selects the identical kernel
++            # path; cached-prefix requests retain their cleared cache rows.
++            has_any_initial_state = bool(has_initial_state.any().item())
++            kernel_initial_state = (
++                initial_state_vk if has_any_initial_state else None
++            )
++            output, final_state = training_chunk_kda(
++                q=q,
++                k=k,
++                v=v,
++                g=raw_gate,
++                beta=beta,
++                A_log=self.A_log,
++                dt_bias=self.dt_bias,
++                initial_state=kernel_initial_state,
++                output_final_state=True,
++                use_qk_l2norm_in_kernel=True,
++                use_gate_in_kernel=True,
++                use_beta_sigmoid_in_kernel=False,
++                safe_gate=self.gate_lower_bound is not None,
++                lower_bound=(
++                    self.gate_lower_bound
++                    if self.gate_lower_bound is not None
++                    else -5.0
++                ),
++                transpose_state_layout=True,
++                cu_seqlens=cu_seqlens_training,
++            )
++            if final_state is None:
++                raise RuntimeError(
++                    "training-identical Kimi chunk_kda prefill did not return final state"
++                )
++            recurrent_state[state_indices] = final_state.to(
++                recurrent_state.dtype
++            )
++            if not _TRAINING_KDA_PREFILL_LOGGED:
++                _TRAINING_KDA_PREFILL_LOGGED = True
++                logger.warning(
++                    "Kimi vLLM TRAINING-IDENTICAL KDA PREFILL ACTIVE: "
++                    "kernel=training_chunk_kda flags=qk_l2norm,raw_gate,"
++                    "beta_pre_sigmoid,transpose_state_layout cache_gather_scatter=True"
++                )
++            return output
++
++        _require_ascendc_prefill_ops()
+         initial_state_kv = initial_state_vk.transpose(-1, -2).contiguous()
+         cu_seqlens_ascendc = (
+             tuple(cu_seqlens.detach().cpu().tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+diff --git a/vllm_ascend/patch/kimi_full_r3_schema.py b/vllm_ascend/patch/kimi_full_r3_schema.py
+new file mode 100644
+index 00000000..ead51fe4
+--- /dev/null
++++ b/vllm_ascend/patch/kimi_full_r3_schema.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Process-wide wire schema for Kimi K3 full routing replay.
++
++vLLM's routed-experts protocol is shared by two different process types:
++the model worker captures routing on device, while the EngineCore scheduler
++stores that routing in a CPU slot buffer.  Worker-only monkeypatches therefore
++cannot change the wire width safely.  This module is intentionally independent
++of the Ascend worker package so the vLLM general-plugin entry point can install
++the schema in process0, EngineCore, and worker processes alike.
++"""
++
++from __future__ import annotations
++
++import functools
++import logging
++from typing import Any
++
++from vllm.model_executor.layers.fused_moe import (
++    routed_experts_capturer as _upstream_routed_experts_capturer,
++)
++
++logger = logging.getLogger(__name__)
++
++KIMI_FULL_R3_PACK_FACTOR = 3
++_KIMI_MODEL_TYPES = frozenset({"kimi_k3", "kimi_linear"})
++_ORIGINAL_GET_NUM_EXPERTS_PER_TOK = (
++    _upstream_routed_experts_capturer._get_num_experts_per_tok
++)
++_SCHEMA_PATCH_INSTALLED = False
++
++
++def _config_candidates(hf_config: Any):
++    yield hf_config
++    for name in ("text_config", "language_config", "llm_config"):
++        nested = getattr(hf_config, name, None)
++        if nested is not None:
++            yield nested
++
++
++def is_kimi_full_r3_config(hf_config: Any) -> bool:
++    return any(
++        str(getattr(candidate, "model_type", "")).lower()
++        in _KIMI_MODEL_TYPES
++        for candidate in _config_candidates(hf_config)
++    )
++
++
++def get_logical_num_experts_per_tok(hf_config: Any) -> int:
++    """Return the model's real top-k, before full-R3 wire packing."""
++    for candidate in _config_candidates(hf_config):
++        for name in (
++            "num_experts_per_token",
++            "num_experts_per_tok",
++            "top_k_experts",
++        ):
++            value = getattr(candidate, name, None)
++            if value is not None:
++                value = int(value)
++                if value <= 0:
++                    raise ValueError(f"invalid routed top-k width: {value}")
++                return value
++
++    value = int(_ORIGINAL_GET_NUM_EXPERTS_PER_TOK(hf_config))
++    if value <= 0:
++        raise ValueError(f"invalid routed top-k width: {value}")
++    return value
++
++
++def get_kimi_full_r3_wire_width(hf_config: Any) -> int:
++    """Size both routed-expert buffers to IDs + two BF16 byte lanes."""
++    logical_topk = get_logical_num_experts_per_tok(hf_config)
++    if is_kimi_full_r3_config(hf_config):
++        return logical_topk * KIMI_FULL_R3_PACK_FACTOR
++    return logical_topk
++
++
++def _patch_scheduler_manager() -> None:
++    manager_cls = _upstream_routed_experts_capturer.RoutedExpertsManager
++    if getattr(manager_cls, "_kimi_full_r3_schema_patch", False):
++        return
++
++    original_init = manager_cls.__init__
++    original_store_batch = manager_cls.store_batch
++    original_get = manager_cls.get
++
++    @functools.wraps(original_init)
++    def full_r3_init(self, vllm_config, kv_cache_config) -> None:
++        hf_config = vllm_config.model_config.hf_text_config
++        kimi_full_r3 = is_kimi_full_r3_config(hf_config)
++        logical_topk = (
++            get_logical_num_experts_per_tok(hf_config)
++            if kimi_full_r3
++            else None
++        )
++
++        # vLLM 0.23 sizes the buffer through the patched helper above, but its
++        # informational log still evaluates ``hf_config.num_experts_per_tok``
++        # directly.  Kimi spells that field ``num_experts_per_token``.  Supply
++        # the logical-width alias only for the duration of upstream init and
++        # remove it again so the config is not left with two sources of truth.
++        temporary_topk_alias = False
++        if kimi_full_r3 and not hasattr(hf_config, "num_experts_per_tok"):
++            try:
++                setattr(hf_config, "num_experts_per_tok", logical_topk)
++                temporary_topk_alias = True
++            except Exception as exc:
++                raise RuntimeError(
++                    "Kimi full R3 could not install the temporary "
++                    "num_experts_per_tok alias required by vLLM scheduler init"
++                ) from exc
++        try:
++            original_init(self, vllm_config, kv_cache_config)
++        finally:
++            if temporary_topk_alias:
++                try:
++                    delattr(hf_config, "num_experts_per_tok")
++                except AttributeError:
++                    pass
++
++        if not kimi_full_r3:
++            self._kimi_full_r3_schema_active = False
++            return
++
++        expected_width = logical_topk * KIMI_FULL_R3_PACK_FACTOR
++        buffer = self.routed_experts_by_slot
++        actual_width = int(buffer.shape[-1])
++        if actual_width != expected_width:
++            raise RuntimeError(
++                "Kimi full R3 scheduler schema mismatch during init: "
++                f"logical_topk={logical_topk}, expected_payload_width="
++                f"{expected_width}, actual_payload_width={actual_width}, "
++                f"buffer_shape={buffer.shape}"
++            )
++
++        self._kimi_full_r3_schema_active = True
++        self._kimi_full_r3_logical_topk = logical_topk
++        self._kimi_full_r3_store_logged = False
++        self._kimi_full_r3_get_logged = False
++        marker = (
++            "Kimi vLLM full R3 SCHEDULER ACTIVE: "
++            f"slots={buffer.shape[0]} layers={buffer.shape[1]} "
++            f"logical_topk={logical_topk} payload_width={actual_width} "
++            f"dtype={buffer.dtype.name} ids_and_bf16_weights=True"
++        )
++        logger.warning(marker)
++        print(marker, flush=True)
++
++    @functools.wraps(original_store_batch)
++    def full_r3_store_batch(self, data, slot_mapping) -> None:
++        if getattr(self, "_kimi_full_r3_schema_active", False):
++            buffer = self.routed_experts_by_slot
++            expected_tail = tuple(buffer.shape[1:])
++            actual_tail = tuple(data.shape[1:])
++            if data.ndim != 3 or actual_tail != expected_tail:
++                raise RuntimeError(
++                    "Kimi full R3 scheduler store schema mismatch: "
++                    f"data_shape={data.shape}, expected_tail={expected_tail}, "
++                    f"slot_mapping_shape={slot_mapping.shape}"
++                )
++
++        original_store_batch(self, data, slot_mapping)
++
++        if (
++            getattr(self, "_kimi_full_r3_schema_active", False)
++            and not self._kimi_full_r3_store_logged
++        ):
++            self._kimi_full_r3_store_logged = True
++            marker = (
++                "Kimi vLLM full R3 SCHEDULER STORE ACTIVE: "
++                f"rows={data.shape[0]} layers={data.shape[1]} "
++                f"payload_width={data.shape[2]} ids_and_bf16_weights=True"
++            )
++            logger.warning(marker)
++            print(marker, flush=True)
++
++    @functools.wraps(original_get)
++    def full_r3_get(self, block_ids, num_tokens, token_start=0):
++        result = original_get(self, block_ids, num_tokens, token_start)
++        if getattr(self, "_kimi_full_r3_schema_active", False):
++            expected_width = (
++                self._kimi_full_r3_logical_topk * KIMI_FULL_R3_PACK_FACTOR
++            )
++            if result.ndim != 3 or int(result.shape[-1]) != expected_width:
++                raise RuntimeError(
++                    "Kimi full R3 scheduler retrieve schema mismatch: "
++                    f"result_shape={result.shape}, expected_payload_width="
++                    f"{expected_width}, num_tokens={num_tokens}, "
++                    f"token_start={token_start}"
++                )
++            if not self._kimi_full_r3_get_logged:
++                self._kimi_full_r3_get_logged = True
++                marker = (
++                    "Kimi vLLM full R3 SCHEDULER RETRIEVE ACTIVE: "
++                    f"rows={result.shape[0]} layers={result.shape[1]} "
++                    f"payload_width={result.shape[2]} "
++                    "ids_and_bf16_weights=True"
++                )
++                logger.warning(marker)
++                print(marker, flush=True)
++        return result
++
++    # ``functools.wraps`` preserves callable signatures for vLLM but also
++    # copies the upstream ``__module__``.  Reset it so startup preflight can
++    # prove that the scheduler methods came from this all-process patch.
++    full_r3_init.__module__ = __name__
++    full_r3_store_batch.__module__ = __name__
++    full_r3_get.__module__ = __name__
++    manager_cls.__init__ = full_r3_init
++    manager_cls.store_batch = full_r3_store_batch
++    manager_cls.get = full_r3_get
++    manager_cls._kimi_full_r3_schema_patch = True
++
++
++def install_kimi_full_r3_schema_patch() -> None:
++    """Install the shared helper and scheduler guards exactly once."""
++    global _SCHEMA_PATCH_INSTALLED
++    if _SCHEMA_PATCH_INSTALLED:
++        return
++
++    _upstream_routed_experts_capturer._get_num_experts_per_tok = (
++        get_kimi_full_r3_wire_width
++    )
++    _patch_scheduler_manager()
++    _SCHEMA_PATCH_INSTALLED = True
+diff --git a/vllm_ascend/patch/platform/patch_balance_schedule.py b/vllm_ascend/patch/platform/patch_balance_schedule.py
+index e259b4ff..259a0365 100644
+--- a/vllm_ascend/patch/platform/patch_balance_schedule.py
++++ b/vllm_ascend/patch/platform/patch_balance_schedule.py
+@@ -10,6 +10,9 @@ from vllm.config import ParallelConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+ from vllm.logger import logger
++from vllm.model_executor.layers.fused_moe import (
++    routed_experts_capturer as _routed_experts_capturer,
++)
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+ from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+ from vllm.utils.system_utils import decorate_logs, set_process_title
+@@ -27,6 +30,37 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ from vllm_ascend.utils import vllm_version_is
+ 
++_ORIGINAL_GET_NUM_EXPERTS_PER_TOK = (
++    _routed_experts_capturer._get_num_experts_per_tok
++)
++
++
++def _get_num_experts_per_tok(hf_config) -> int:
++    """Resolve Kimi's router top-k inside the EngineCore process.
++
++    EngineCore imports the platform scheduler patches but not the worker patch
++    package, so the worker-side Kimi alias adapter is otherwise absent when
++    ``RoutedExpertsManager`` is constructed.
++    """
++
++    text_config = getattr(hf_config, "text_config", hf_config)
++    value = getattr(text_config, "num_experts_per_token", None)
++    if value is not None:
++        value = int(value)
++        # Upstream resolves through a helper first, but later logs the legacy
++        # attribute directly.  Materialize the alias on the exact object the
++        # manager received so both accesses agree.
++        setattr(hf_config, "num_experts_per_tok", value)
++        if text_config is not hf_config:
++            setattr(text_config, "num_experts_per_tok", value)
++        return value
++    return int(_ORIGINAL_GET_NUM_EXPERTS_PER_TOK(hf_config))
++
++
++_routed_experts_capturer._get_num_experts_per_tok = (
++    _get_num_experts_per_tok
++)
++
+ _ORIGINAL_RUN_ENGINE_CORE = EngineCoreProc.run_engine_core
+ _ORIGINAL_SCHEDULER = Scheduler
+ 
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index cbc13870..94782c14 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -23,8 +23,8 @@ from vllm_ascend.utils import is_310p, vllm_version_is
+ # release. vLLM v0.23.0 and the verified main commit are diverged, and the v2
+ # worker patches target main-only APIs; rather than maintain a separate v0.23.0
+ # compatibility path we keep v2 main-only. With v0.23.0 installed this flag is
+-# False, so none of the patch_v2.* / routed-experts-capture patches below are
+-# imported and the v2 worker stays dormant (the release uses the v1 runner).
++# False, so patch_v2.* stays dormant (the release uses the V1 runner).  The
++# V1-compatible routed-expert capture patch is imported separately below.
+ if vllm_version_is("0.23.0"):
+     _V2_MODEL_RUNNER_SUPPORTED = False
+ else:
+@@ -84,6 +84,8 @@ if _V2_MODEL_RUNNER_SUPPORTED:
+     import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
+     import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+ 
+-# only patch routed experts capture in main2main.
+-if _V2_MODEL_RUNNER_SUPPORTED:
+-    import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
++# Routed-expert capture is also used by the v0.23 V1 model runner and by the
++# Ascend FusedMoE path directly.  Keep the V2 worker patches gated above, but
++# always install this class-level capture fix; otherwise TP-sharded routes on
++# v0.23 leave all but one TP shard as zero placeholders.
++import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
+diff --git a/vllm_ascend/patch/worker/patch_routed_experts_capture.py b/vllm_ascend/patch/worker/patch_routed_experts_capture.py
+index 0b2958bb..62e7db72 100644
+--- a/vllm_ascend/patch/worker/patch_routed_experts_capture.py
++++ b/vllm_ascend/patch/worker/patch_routed_experts_capture.py
+@@ -25,15 +25,131 @@ import torch
+ import torch.distributed as dist
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.forward_context import get_forward_context
+-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
++from vllm.model_executor.layers.fused_moe import (
++    routed_experts_capturer as _upstream_routed_experts_capturer,
++)
+ 
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
++from vllm_ascend.patch.kimi_full_r3_schema import (
++    KIMI_FULL_R3_PACK_FACTOR,
++    install_kimi_full_r3_schema_patch,
++)
+ 
+ logger = logging.getLogger(__name__)
++RoutedExpertsCapturer = _upstream_routed_experts_capturer.RoutedExpertsCapturer
+ 
++# Keep the worker transit buffer on exactly the same schema as EngineCore.
++# The all-process plugin installs this before scheduler construction; the
++# explicit call here also keeps direct worker-module imports fail-safe.
++install_kimi_full_r3_schema_patch()
+ 
+-def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+-    """Capture expert routing decisions for a specific layer.
++
++def _tp_shard_layout(
++    *,
++    token_num_per_dp: int,
++    max_tokens: int,
++    local_rows: int,
++    tp_size: int,
++    moe_comm_type: MoECommType,
++) -> int | None:
++    """Return the gathered row count when ``topk_ids`` is TP-sharded.
++
++    Ascend's ALLTOALL and MC2 prepare paths split the token dimension before
++    expert selection even when data-parallel size is one.  Upstream's routed
++    expert capturer historically used ``dp_metadata is None`` as a proxy for
++    "not sharded", which leaves seven eighths of the capture buffer unwritten
++    for TP=8.  The unwritten zero rows later look like expert-0 replay data.
++
++    ``None`` means that ``local_rows`` is not a valid shard size for the active
++    communication method.  Returning the full row count rather than a boolean
++    also centralizes the slightly different ALLTOALL and MC2 padding rules.
++    """
++
++    if tp_size <= 1:
++        return None
++
++    if moe_comm_type == MoECommType.ALLTOALL:
++        # PrepareAndFinalizeWithAll2All pads only batches smaller than TP;
++        # otherwise torch.tensor_split produces floor/ceil-sized shards.
++        gathered_rows = max(token_num_per_dp, tp_size)
++        base, remainder = divmod(gathered_rows, tp_size)
++        expected_local_rows = {base}
++        if remainder:
++            expected_local_rows.add(base + 1)
++        return gathered_rows if local_rows in expected_local_rows else None
++
++    if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
++        # MC2 pads every DP rank to ceil(max_tokens / TP) * TP before the
++        # tensor split, so all TP ranks have the same number of rows.
++        rows_per_rank = (max_tokens + tp_size - 1) // tp_size
++        return rows_per_rank * tp_size if local_rows == rows_per_rank else None
++
++    # ALLGATHER reconstructs the token dimension before expert selection and
++    # therefore must arrive in capture as an unsharded tensor.
++    return None
++
++
++def _gather_tp_shards(
++    topk_ids: torch.Tensor,
++    *,
++    gathered_rows: int,
++    tp_size: int,
++) -> torch.Tensor:
++    gathered = torch.empty(
++        (gathered_rows, topk_ids.shape[1]),
++        dtype=topk_ids.dtype,
++        device=topk_ids.device,
++    )
++    shards = torch.tensor_split(gathered, tp_size, dim=0)
++    dist.all_gather(list(shards), topk_ids, get_tp_group().device_group)
++    return gathered
++
++
++def _pack_kimi_full_r3(
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++) -> torch.Tensor:
++    """Pack executed IDs and BF16 weights into integer protocol lanes."""
++    if topk_weights.shape != topk_ids.shape:
++        raise AssertionError(
++            "Kimi full R3 requires identical id/weight shapes, got "
++            f"ids={tuple(topk_ids.shape)}, weights={tuple(topk_weights.shape)}"
++        )
++    if not topk_weights.is_floating_point():
++        raise TypeError(
++            "Kimi full R3 router weights must be floating point, got "
++            f"{topk_weights.dtype}"
++        )
++    if topk_weights.dtype != torch.bfloat16:
++        raise TypeError(
++            "Kimi full R3 wire schema is bit-exact only for executed BF16 "
++            f"router weights, got {topk_weights.dtype}"
++        )
++
++    # FusedMoE consumes weights after casting them to the routed hidden-state
++    # dtype (BF16 for this run). Preserve exactly those executed bits.  The
++    # Ascend hosts are little-endian; ``view(uint8)`` therefore yields the low
++    # then high byte for every BF16 element, matching verl's decoder.
++    weight_bytes = (
++        topk_weights.contiguous()
++        .view(torch.uint8)
++        .reshape(*topk_weights.shape, 2)
++    )
++    weight_low_bytes = weight_bytes[..., 0].to(torch.int32)
++    weight_high_bytes = weight_bytes[..., 1].to(torch.int32)
++    return torch.cat(
++        (topk_ids.to(torch.int32), weight_low_bytes, weight_high_bytes),
++        dim=-1,
++    )
++
++
++def capture(
++    self,
++    layer_id: int,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor | None = None,
++) -> None:
++    """Capture executed expert IDs and, for Kimi, executed gate weights.
+ 
+     Under data parallelism, ``topk_ids`` may have four different batch
+     layouts depending on where the DP combine happens and whether
+@@ -64,18 +180,65 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+     Args:
+         layer_id: The layer index.
+         topk_ids: Tensor of shape (batch_size, num_routed_experts).
++        topk_weights: The weights paired with ``topk_ids`` and actually passed
++            into FusedMoE. Required by Kimi's packed full-R3 buffer.
+     """
+ 
++    actual_topk = int(topk_ids.shape[-1])
++    capture_width = int(self.device_buffer.shape[-1])
++    if capture_width == actual_topk * KIMI_FULL_R3_PACK_FACTOR:
++        if topk_weights is None:
++            raise RuntimeError(
++                "Kimi full R3 capture buffer is active but FusedMoE did not "
++                "provide executed router weights"
++            )
++        routing_payload = _pack_kimi_full_r3(topk_ids, topk_weights)
++        kimi_full_r3 = True
++    elif capture_width == actual_topk:
++        routing_payload = topk_ids
++        kimi_full_r3 = False
++    else:
++        raise AssertionError(
++            "RoutedExpertsCapturer buffer width is incompatible with the "
++            f"router output: buffer={capture_width}, topk={actual_topk}"
++        )
++
+     ctx = get_forward_context()
+     if ctx.dp_metadata is None:  # single dp
++        # ``ctx.num_tokens`` is the padded model-input length used by Ascend's
++        # MoE prepare path.  It is deliberately not inferred from topk_ids:
++        # ALLTOALL/MC2 may already have split topk_ids across TP ranks here.
++        token_num_per_dp = int(ctx.num_tokens)
++        max_tokens = token_num_per_dp
++        n = routing_payload.shape[0]
+         start_loc = 0
+-        end_loc = topk_ids.shape[0]
+-        token_num_per_dp = topk_ids.shape[0]
++        end_loc = token_num_per_dp
++
++        if n != token_num_per_dp:
++            gathered_rows = _tp_shard_layout(
++                token_num_per_dp=token_num_per_dp,
++                max_tokens=max_tokens,
++                local_rows=n,
++                tp_size=self.tp_size,
++                moe_comm_type=_EXTRA_CTX.moe_comm_type,
++            )
++            if gathered_rows is None:
++                raise AssertionError(
++                    "RoutedExpertsCapturer: unexpected single-DP topk_ids "
++                    f"batch dim {n} (full={token_num_per_dp}, "
++                    f"tp_size={self.tp_size}, "
++                    f"moe_comm_type={_EXTRA_CTX.moe_comm_type})"
++                )
++            routing_payload = _gather_tp_shards(
++                routing_payload,
++                gathered_rows=gathered_rows,
++                tp_size=self.tp_size,
++            )
+     else:  # multi dp
+         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
+         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
+         total = int(num_tokens_dp.sum().item())
+-        n = topk_ids.shape[0]
++        n = routing_payload.shape[0]
+ 
+         # Calculate total with padding for all-gather scenario.
+         # When tokens are padded to max_tokens before all-gather across DP group,
+@@ -115,18 +278,15 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+ 
+             start_loc = self.dp_rank * max_tokens
+             end_loc = start_loc + token_num_per_dp
+-        elif (
+-            self.tp_size > 1
+-            and n != token_num_per_dp
+-            and (
+-                # all2all scenario use tensor split, different tp rank have different
+-                # size of tokens.
+-                n == (token_num_per_dp + self.tp_size - 1) // self.tp_size
+-                or n == token_num_per_dp // self.tp_size
+-                # mc2 scenario will pad dp tokens to max_tokens and then ceil-div.
+-                or n == (max_tokens + self.tp_size - 1) // self.tp_size
++        elif n != token_num_per_dp and (
++            gathered_rows := _tp_shard_layout(
++                token_num_per_dp=token_num_per_dp,
++                max_tokens=max_tokens,
++                local_rows=n,
++                tp_size=self.tp_size,
++                moe_comm_type=_EXTRA_CTX.moe_comm_type,
+             )
+-        ):
++        ) is not None:
+             # SP + modular-kernel path. All-gather across the TP
+             # group along dim=0 to reconstruct the full per-DP-rank
+             # tensor; keep only the first ``token_num_per_dp`` rows
+@@ -143,29 +303,11 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+             # downstream ``device_buffer[...] = topk_ids[...]``
+             # setitem narrows into int32 automatically.
+ 
+-            # NOTE(Ronald1995): if total_num_per_dp == max_tokens,
+-            # it will be both all2all and mc2 scenario.
+-            # but we fires all2all scenario first.
+-            # the result will be the same.
+-            # all2all scenario in vllm-ascend.
+-            if _EXTRA_CTX.moe_comm_type == MoECommType.ALLTOALL:
+-                gather_topk_ids_shape = (
+-                    (token_num_per_dp, topk_ids.shape[1])
+-                    if token_num_per_dp >= self.tp_size
+-                    else (self.tp_size, topk_ids.shape[1])
+-                )
+-            # mc2 scenario in vllm-ascend
+-            else:
+-                gather_topk_ids_shape = (n * self.tp_size, topk_ids.shape[1])
+-
+-            gather_topk_ids = torch.empty(
+-                gather_topk_ids_shape,
+-                dtype=topk_ids.dtype,
+-                device=topk_ids.device,
++            routing_payload = _gather_tp_shards(
++                routing_payload,
++                gathered_rows=gathered_rows,
++                tp_size=self.tp_size,
+             )
+-            split_topk_ids = torch.tensor_split(gather_topk_ids, self.tp_size, dim=0)
+-            dist.all_gather(list(split_topk_ids), topk_ids, get_tp_group().device_group)
+-            topk_ids = gather_topk_ids
+             start_loc = 0
+             end_loc = token_num_per_dp
+         else:
+@@ -177,12 +319,25 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+                 f"dp_rank={self.dp_rank}, tp_size={self.tp_size})"
+             )
+ 
+-    # Defensive: model may expose more layers than the capture buffer
+-    # was sized for (unusual, but guards against miss-config).
+-    if layer_id >= self.device_buffer.shape[1]:
+-        return
++    # A layer-axis mismatch means the capture is incomplete.  Never leave a
++    # zero row behind and let it masquerade as a valid expert-0 route.
++    if layer_id < 0 or layer_id >= self.device_buffer.shape[1]:
++        raise IndexError(
++            "RoutedExpertsCapturer layer_id is outside the capture buffer: "
++            f"layer_id={layer_id}, layers={self.device_buffer.shape[1]}"
++        )
+ 
+-    self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[start_loc:end_loc, :]
++    self.device_buffer[:token_num_per_dp, layer_id, :] = routing_payload[start_loc:end_loc, :]
++    if kimi_full_r3 and not getattr(self, "_kimi_full_r3_capture_logged", False):
++        marker = (
++            "Kimi vLLM full R3 CAPTURE COMPLETE: "
++            f"layer={layer_id} stored_rows={token_num_per_dp} "
++            f"topk={actual_topk} payload_width={capture_width} "
++            "ids_and_bf16_weights=True"
++        )
++        logger.warning(marker)
++        print(marker, flush=True)
++        self._kimi_full_r3_capture_logged = True
+ 
+ 
+ RoutedExpertsCapturer.capture = capture
+diff --git a/vllm_ascend/transformers_utils/configs/kimi_k3.py b/vllm_ascend/transformers_utils/configs/kimi_k3.py
+index a2e23289..b325774b 100644
+--- a/vllm_ascend/transformers_utils/configs/kimi_k3.py
++++ b/vllm_ascend/transformers_utils/configs/kimi_k3.py
+@@ -78,6 +78,7 @@ class KimiK3VisionConfig(PretrainedConfig):
+         text_hidden_size: int = 7168,
+         projector_hidden_act: str = "gelu",
+         projector_ln_eps: float = 1e-5,
++        use_rot_proj: bool = False,
+         **kwargs: Any,
+     ) -> None:
+         super().__init__(**kwargs)
+@@ -109,6 +110,7 @@ class KimiK3VisionConfig(PretrainedConfig):
+         self.text_hidden_size = text_hidden_size
+         self.projector_hidden_act = projector_hidden_act
+         self.projector_ln_eps = projector_ln_eps
++        self.use_rot_proj = use_rot_proj
+ 
+ 
+ class KimiK3Config(PretrainedConfig):
