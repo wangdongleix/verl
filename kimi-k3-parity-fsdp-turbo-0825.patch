@@ -1,0 +1,2656 @@
+diff --git a/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py b/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
+index 457747a..a89e896 100644
+--- a/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
++++ b/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
+@@ -18,16 +18,137 @@ from fsdp_turbo.utils.torch_patch import apply_hccl_premul_sum_patch
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _validate_efsdp_ep_ownership(
++    model: torch.nn.Module,
++    ep_plan: EPPlanConfig,
++    efsdp_modules: list[torch.nn.Module],
++) -> None:
++    """Reject eFSDP targets that are not owned by an EP target.
++
++    The eFSDP mesh intentionally excludes the EP axis.  That is correct for
++    expert tensors because EP partitions them, but it leaves independent,
++    unsynchronized copies when a replicated router/shared/latent MoE module is
++    placed on the same mesh.  Those copies only start to differ after the first
++    optimizer update, which makes this configuration error look like an online
++    weight-loading or train/inference numerical problem.
++    """
++
++    ep_roots: list[torch.nn.Module] = []
++    for pattern in ep_plan.apply_modules:
++        ep_roots.extend(
++            module
++            for name, module in model.named_modules()
++            if module_name_match(pattern, name)
++        )
++
++    ep_owned = {
++        id(module)
++        for root in ep_roots
++        for module in root.modules()
++    }
++    names_by_id = {id(module): name for name, module in model.named_modules()}
++    invalid = sorted(
++        names_by_id.get(id(module), f"<{type(module).__name__}>")
++        for module in efsdp_modules
++        if id(module) not in ep_owned
++    )
++    if invalid:
++        raise RuntimeError(
++            "[Expert Fully Shard] apply_efsdp_modules contains modules outside "
++            "the expert-parallel ownership domain. The edp x efsdp mesh does "
++            "not synchronize replicated gradients across EP ranks. Put the "
++            "common enclosing MoE module in fsdp_plan.apply_modules (while "
++            "keeping only the EP-owned experts in apply_efsdp_modules); do not "
++            "wrap replicated MoE children individually because their world "
++            "AllGather may overlap the EP AllToAllV. Invalid targets: "
++            f"{invalid}"
++        )
++
++
++def _validate_fsdp_ep_collective_boundaries(
++    model: torch.nn.Module,
++    ep_plan: EPPlanConfig,
++    fsdp_plan: FSDPPlanConfig,
++) -> dict[str, int]:
++    """Reject world-FSDP hooks interleaved inside an EP MoE invocation.
++
++    HCCL's AIV kernels cannot safely execute collectives from multiple process
++    groups at the same time.  A world-FSDP wrapper on a router/shared/latent
++    child can launch AllGather while the sibling EP experts still have an
++    AllToAllV in flight.  Wrapping an enclosing MoE/layer is safe: its gather
++    happens before entering the EP region, and its forward scope does not end
++    until that region and all replicated projections have returned.
++    """
++
++    named_modules = list(model.named_modules())
++    ep_targets = {
++        name
++        for pattern in (ep_plan.apply_modules or [])
++        for name, _ in named_modules
++        if module_name_match(pattern, name)
++    }
++    fsdp_targets = {
++        name
++        for pattern in (fsdp_plan.apply_modules or {})
++        for name, _ in named_modules
++        if module_name_match(pattern, name)
++    }
++
++    interleaved: set[str] = set()
++    enclosed = 0
++    for ep_name in ep_targets:
++        moe_parent, separator, _ = ep_name.rpartition('.')
++        if not separator:
++            continue
++        prefix = f"{moe_parent}."
++        for fsdp_name in fsdp_targets:
++            # The enclosing parent (or a still-higher ancestor such as the
++            # decoder layer) is the desired boundary. Descendant siblings are
++            # hooks executed from inside the EP-containing forward.
++            if ep_name.startswith(f"{fsdp_name}."):
++                enclosed += 1
++            if fsdp_name.startswith(prefix) and not (
++                fsdp_name == ep_name or fsdp_name.startswith(f"{ep_name}.")
++            ):
++                interleaved.add(fsdp_name)
++
++    if interleaved:
++        rendered = sorted(interleaved)
++        preview = rendered[:16]
++        suffix = "" if len(rendered) <= len(preview) else f" (+{len(rendered) - len(preview)} more)"
++        raise RuntimeError(
++            "[FSDP/EP topology] world-FSDP targets are interleaved inside an "
++            "EP-containing MoE forward. Their AllGather may overlap EP "
++            "AllToAllV when HCCL AIV expansion is enabled. Wrap the common "
++            f"enclosing MoE/layer instead: {preview}{suffix}"
++        )
++
++    return {
++        "ep_targets": len(ep_targets),
++        "world_fsdp_targets": len(fsdp_targets),
++        "enclosed_ep_targets": enclosed,
++        "interleaved_targets": 0,
++    }
++
++
+ def expert_fully_shard_modules(
+     model: torch.nn.Module, efsdp_mesh, ep_plan: EPPlanConfig, fsdp_plan: FSDPPlanConfig
+ ) -> torch.nn.Module:
++    topology = _validate_fsdp_ep_collective_boundaries(model, ep_plan, fsdp_plan)
++    print_rank(
++        logger.info,
++        "[FSDP/EP topology] SAFE ACTIVE: "
++        + ", ".join(f"{key}={value}" for key, value in topology.items()),
++    )
+     efsdp_modules = get_efsdp_modules(model, ep_plan)
++    _validate_efsdp_ep_ownership(model, ep_plan, efsdp_modules)
+     efsdp_hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
+     offload_policy = get_offload_policy(fsdp_plan)
+     config = {
+         'mesh': efsdp_mesh,
+         'mp_policy': MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+         'offload_policy': offload_policy,
++        'reshard_after_forward': fsdp_plan.reshard_after_forward,
+         'shard_placement_fn': lambda x: Shard(1) if x.dim() > 1 else Shard(0),
+     }
+ 
+diff --git a/fsdp_turbo/distributed/fine_grained_fully_shard/param_group.py b/fsdp_turbo/distributed/fine_grained_fully_shard/param_group.py
+index 7000420..6c40b2a 100644
+--- a/fsdp_turbo/distributed/fine_grained_fully_shard/param_group.py
++++ b/fsdp_turbo/distributed/fine_grained_fully_shard/param_group.py
+@@ -73,7 +73,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
+                     # Only wait if the previous operation belongs to a DIFFERENT hook_module.
+                     # If it's the same module, dependencies are handled differently or sequentially.
+                     # Note: Logic assumes self.hook_module is available on the param group
+-                    if prev_all_gather_state.hook_module != self.hook_module:
++                    if prev_all_gather_state is not None:
+                         self._wait_all_gather_streams_on_event(prev_all_gather_state.event)
+                         comm_ctx.all_gather_state = None  # free the all-gather result
+ 
+@@ -88,14 +88,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
+         self._to_unsharded()
+         all_gather_copy_out_event = self.device_handle.Event()
+         all_gather_copy_out_event.record()
+-        if not async_op and self._training_state == TrainingState.FORWARD:
+-            # Defer free to allow for overlap of this copy-out with next
+-            # all-gather collective
+-            self.comm_ctx.all_gather_state = AllGatherState(
+-                self._all_gather_result, all_gather_copy_out_event, self.hook_module
+-            )
+-        else:
+-            self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
++        self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
+         self._all_gather_result = None  # free unless saved in `all_gather_state`
+     
+     def post_backward(self, *unused: Any):
+diff --git a/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py b/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
+index 3779291..411485b 100644
+--- a/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
++++ b/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
+@@ -21,11 +21,13 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh,
+     hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
+     mp_policy = get_mixprecision_policy(fsdp_plan)
+     offload_policy = get_offload_policy(fsdp_plan)
++    reshard_after_forward = fsdp_plan.reshard_after_forward
+     config = {
+         'mesh': fsdp_mesh,
+         'ignored_params': ignored_params,
+         'mp_policy': mp_policy,
+         'offload_policy': offload_policy,
++        'reshard_after_forward': reshard_after_forward,
+     }
+ 
+     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
+diff --git a/fsdp_turbo/fsdp_turbo_config.py b/fsdp_turbo/fsdp_turbo_config.py
+index 88dc7b1..33ebe65 100644
+--- a/fsdp_turbo/fsdp_turbo_config.py
++++ b/fsdp_turbo/fsdp_turbo_config.py
+@@ -18,6 +18,7 @@ class ModelConfig:
+     model_name_or_path: str = ""
+     tokenizer_name_or_path: str = ""
+     torch_dtype: torch.dtype = torch.bfloat16
++    attn_implementation: str = "eager"
+ 
+ 
+ @dataclass
+@@ -101,6 +102,9 @@ class FSDPPlanConfig:
+     cpu_offload: bool = False
+     pin_memory: bool = True
+ 
++    # parameter lifecycle after forward
++    reshard_after_forward: Optional[Union[bool, int]] = True
++
+     # prefetch settings
+     num_to_forward_prefetch: Optional[int] = 0
+     num_to_backward_prefetch: Optional[int] = 0
+diff --git a/fsdp_turbo/memory/recompute/recompute.py b/fsdp_turbo/memory/recompute/recompute.py
+index cc02911..0ad6158 100644
+--- a/fsdp_turbo/memory/recompute/recompute.py
++++ b/fsdp_turbo/memory/recompute/recompute.py
+@@ -13,20 +13,39 @@ def recompute_modules(model, plan):
+     modules = get_recompute_modules(model, plan)
+ 
+     for name, module in modules:
+-        print_rank(logger.info, f'Applying recompute to module: {name}')
+         module.forward = recompute_wrapper(module.forward)
++        module._fsdp_turbo_recompute_active = True
++
++    plan_counts = {
++        plan_name: sum(module_name_match(plan_name, name) for name, _ in modules)
++        for plan_name in plan
++    }
++    print_rank(
++        logger.info,
++        "FSDP-Turbo recompute ACTIVE: "
++        f"modules={len(modules)}, plan_counts={plan_counts}",
++    )
+ 
+     return model
+ 
+ 
+ def get_recompute_modules(modules, plan):
++    if not plan:
++        raise RuntimeError('[Recompute] recompute=True requires a non-empty recompute_plan.')
+     matched_modules = []
++    matched_module_ids = set()
+     for plan_name in plan:
++        plan_matches = []
+         for name, module in modules.named_modules():
+             if module_name_match(plan_name, name):
+-                matched_modules.append((name, module))
+-    if len(matched_modules) == 0:
+-        raise RuntimeError(f'[Recompute] No module named {plan}.')
++                plan_matches.append((name, module))
++        if not plan_matches:
++            raise RuntimeError(f'[Recompute] No module matched plan entry {plan_name!r}.')
++        for name, module in plan_matches:
++            if id(module) in matched_module_ids:
++                continue
++            matched_module_ids.add(id(module))
++            matched_modules.append((name, module))
+     return matched_modules
+ 
+ 
+@@ -37,4 +56,5 @@ def recompute_wrapper(function):
+             kwargs['past_key_values'] = None
+         return checkpoint(function, *args, use_reentrant=False, **kwargs)
+ 
++    wrapper._fsdp_turbo_recompute_wrapper = True
+     return wrapper
+diff --git a/fsdp_turbo/models/kimi_k3/modeling/config.json b/fsdp_turbo/models/kimi_k3/modeling/config.json
+deleted file mode 100644
+index 69da43c..0000000
+--- a/fsdp_turbo/models/kimi_k3/modeling/config.json
++++ /dev/null
+@@ -1,172 +0,0 @@
+-{
+-  "architectures": [
+-    "KimiK3ForConditionalGeneration"
+-  ],
+-  "auto_map": {
+-    "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+-    "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+-    "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+-  },
+-  "bos_token_id": 163584,
+-  "dtype": "bfloat16",
+-  "eos_token_id": 163586,
+-  "ignore_index": -100,
+-  "image_placeholder": "<|kimi_image_placeholder|>",
+-  "media_placeholder_token_id": 163605,
+-  "model_type": "kimi_k3",
+-  "pad_token_id": 163839,
+-  "text_config": {
+-    "_name_or_path": "",
+-    "activation_situ_beta": 4.0,
+-    "activation_situ_linear_beta": 25.0,
+-    "add_cross_attention": false,
+-    "architectures": [
+-      "KimiLinearForCausalLM"
+-    ],
+-    "attn_res_block_size": 4,
+-    "auto_map": {
+-      "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+-      "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+-      "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+-    },
+-    "bad_words_ids": null,
+-    "begin_suppress_tokens": null,
+-    "bos_token_id": 163584,
+-    "chunk_size_feed_forward": 0,
+-    "cross_attention_hidden_size": null,
+-    "decoder_start_token_id": null,
+-    "diversity_penalty": 0.0,
+-    "do_sample": false,
+-    "dtype": "bfloat16",
+-    "early_stopping": false,
+-    "encoder_no_repeat_ngram_size": 0,
+-    "eos_token_id": 163586,
+-    "exponential_decay_length_penalty": null,
+-    "finetuning_task": null,
+-    "first_k_dense_replace": 1,
+-    "forced_bos_token_id": null,
+-    "forced_eos_token_id": null,
+-    "hidden_act": "situ",
+-    "hidden_size": 7168,
+-    "id2label": {
+-      "0": "LABEL_0",
+-      "1": "LABEL_1"
+-    },
+-    "initializer_range": 0.02,
+-    "intermediate_size": 33792,
+-    "is_decoder": false,
+-    "is_encoder_decoder": false,
+-    "kv_lora_rank": 512,
+-    "label2id": {
+-      "LABEL_0": 0,
+-      "LABEL_1": 1
+-    },
+-    "latent_moe_use_norm": true,
+-    "length_penalty": 1.0,
+-    "linear_attn_config": {
+-      "full_attn_layers": [
+-        4
+-      ],
+-      "gate_lower_bound": -5.0,
+-      "head_dim": 128,
+-      "kda_layers": [
+-        1,
+-        2,
+-        3
+-      ],
+-      "num_heads": 96,
+-      "short_conv_kernel_size": 4,
+-      "use_full_rank_gate": true
+-    },
+-    "max_length": 20,
+-    "max_position_embeddings": 1048576,
+-    "min_length": 0,
+-    "mla_use_nope": true,
+-    "mla_use_output_gate": true,
+-    "model_type": "kimi_linear",
+-    "moe_intermediate_size": 3072,
+-    "moe_layer_freq": 1,
+-    "moe_renormalize": true,
+-    "moe_router_activation_func": "sigmoid",
+-    "no_repeat_ngram_size": 0,
+-    "num_attention_heads": 96,
+-    "num_beam_groups": 1,
+-    "num_beams": 1,
+-    "num_expert_group": 1,
+-    "num_experts": 16,
+-    "num_experts_per_token": 2,
+-    "num_hidden_layers": 4,
+-    "num_key_value_heads": 96,
+-    "num_nextn_predict_layers": 0,
+-    "num_return_sequences": 1,
+-    "num_shared_experts": 2,
+-    "output_attentions": false,
+-    "output_hidden_states": false,
+-    "output_scores": false,
+-    "pad_token_id": 163839,
+-    "prefix": null,
+-    "problem_type": null,
+-    "pruned_heads": {},
+-    "q_lora_rank": 1536,
+-    "qk_nope_head_dim": 128,
+-    "qk_rope_head_dim": 64,
+-    "remove_invalid_values": false,
+-    "repetition_penalty": 1.0,
+-    "return_dict": true,
+-    "return_dict_in_generate": false,
+-    "rms_norm_eps": 1e-05,
+-    "routed_expert_hidden_size": 3584,
+-    "routed_scaling_factor": 1.0,
+-    "sep_token_id": null,
+-    "suppress_tokens": null,
+-    "task_specific_params": null,
+-    "temperature": 1.0,
+-    "tf_legacy_loss": false,
+-    "tie_encoder_decoder": false,
+-    "tie_word_embeddings": false,
+-    "tokenizer_class": null,
+-    "top_k": 50,
+-    "top_p": 1.0,
+-    "topk_group": 1,
+-    "topk_method": "noaux_tc",
+-    "torchscript": false,
+-    "transformers_version": "4.56.2",
+-    "typical_p": 1.0,
+-    "use_bfloat16": false,
+-    "use_cache": true,
+-    "use_grouped_topk": true,
+-    "v_head_dim": 128,
+-    "vocab_size": 163840
+-  },
+-  "tie_word_embeddings": false,
+-  "vision_config": {
+-    "_attn_implementation": "flash_attention_2",
+-    "activation_func": "gelu_pytorch_tanh",
+-    "attn_bias": false,
+-    "init_pos_emb_height": 64,
+-    "init_pos_emb_time": 4,
+-    "init_pos_emb_width": 64,
+-    "linear_bias": false,
+-    "merge_kernel_size": [
+-      2,
+-      2
+-    ],
+-    "merge_type": "sd2_tpool",
+-    "mlp_type": "mlp2",
+-    "mm_hidden_size": 1024,
+-    "mm_projector_type": "patchmergerv2",
+-    "norm_type": "rmsnorm",
+-    "patch_embed_proj_bias": false,
+-    "patch_size": 14,
+-    "pos_emb_interpolation_mode": "bilinear",
+-    "pos_emb_type": "divided_fixed",
+-    "projector_hidden_act": "gelu",
+-    "projector_ln_eps": 1e-05,
+-    "qkv_hidden_size": 1536,
+-    "text_hidden_size": 7168,
+-    "vt_hidden_size": 1024,
+-    "vt_intermediate_size": 4096,
+-    "vt_num_attention_heads": 12,
+-    "vt_num_hidden_layers": 27
+-  }
+-}
+\ No newline at end of file
+diff --git a/fsdp_turbo/models/kimi_k3/modeling/config.json.backup b/fsdp_turbo/models/kimi_k3/modeling/config.json.backup
+deleted file mode 100644
+index d7f26ea..0000000
+--- a/fsdp_turbo/models/kimi_k3/modeling/config.json.backup
++++ /dev/null
+@@ -1,300 +0,0 @@
+-{
+-  "architectures": [
+-    "KimiK3ForConditionalGeneration"
+-  ],
+-  "auto_map": {
+-    "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+-    "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+-    "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+-  },
+-  "bos_token_id": 163584,
+-  "dtype": "bfloat16",
+-  "eos_token_id": 163586,
+-  "ignore_index": -100,
+-  "image_placeholder": "<|kimi_image_placeholder|>",
+-  "media_placeholder_token_id": 163605,
+-  "model_type": "kimi_k3",
+-  "pad_token_id": 163839,
+-  "text_config": {
+-    "_name_or_path": "",
+-    "activation_situ_beta": 4.0,
+-    "activation_situ_linear_beta": 25.0,
+-    "add_cross_attention": false,
+-    "architectures": [
+-      "KimiLinearForCausalLM"
+-    ],
+-    "attn_res_block_size": 12,
+-    "auto_map": {
+-      "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+-      "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+-      "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+-    },
+-    "bad_words_ids": null,
+-    "begin_suppress_tokens": null,
+-    "bos_token_id": 163584,
+-    "chunk_size_feed_forward": 0,
+-    "cross_attention_hidden_size": null,
+-    "decoder_start_token_id": null,
+-    "diversity_penalty": 0.0,
+-    "do_sample": false,
+-    "dtype": "bfloat16",
+-    "early_stopping": false,
+-    "encoder_no_repeat_ngram_size": 0,
+-    "eos_token_id": 163586,
+-    "exponential_decay_length_penalty": null,
+-    "finetuning_task": null,
+-    "first_k_dense_replace": 1,
+-    "forced_bos_token_id": null,
+-    "forced_eos_token_id": null,
+-    "hidden_act": "situ",
+-    "hidden_size": 7168,
+-    "id2label": {
+-      "0": "LABEL_0",
+-      "1": "LABEL_1"
+-    },
+-    "initializer_range": 0.02,
+-    "intermediate_size": 33792,
+-    "is_decoder": false,
+-    "is_encoder_decoder": false,
+-    "kv_lora_rank": 512,
+-    "label2id": {
+-      "LABEL_0": 0,
+-      "LABEL_1": 1
+-    },
+-    "latent_moe_use_norm": true,
+-    "length_penalty": 1.0,
+-    "linear_attn_config": {
+-      "full_attn_layers": [
+-        4,
+-        8,
+-        12,
+-        16,
+-        20,
+-        24,
+-        28,
+-        32,
+-        36,
+-        40,
+-        44,
+-        48,
+-        52,
+-        56,
+-        60,
+-        64,
+-        68,
+-        72,
+-        76,
+-        80,
+-        84,
+-        88,
+-        92,
+-        93
+-      ],
+-      "gate_lower_bound": -5.0,
+-      "head_dim": 128,
+-      "kda_layers": [
+-        1,
+-        2,
+-        3,
+-        5,
+-        6,
+-        7,
+-        9,
+-        10,
+-        11,
+-        13,
+-        14,
+-        15,
+-        17,
+-        18,
+-        19,
+-        21,
+-        22,
+-        23,
+-        25,
+-        26,
+-        27,
+-        29,
+-        30,
+-        31,
+-        33,
+-        34,
+-        35,
+-        37,
+-        38,
+-        39,
+-        41,
+-        42,
+-        43,
+-        45,
+-        46,
+-        47,
+-        49,
+-        50,
+-        51,
+-        53,
+-        54,
+-        55,
+-        57,
+-        58,
+-        59,
+-        61,
+-        62,
+-        63,
+-        65,
+-        66,
+-        67,
+-        69,
+-        70,
+-        71,
+-        73,
+-        74,
+-        75,
+-        77,
+-        78,
+-        79,
+-        81,
+-        82,
+-        83,
+-        85,
+-        86,
+-        87,
+-        89,
+-        90,
+-        91
+-      ],
+-      "num_heads": 96,
+-      "short_conv_kernel_size": 4,
+-      "use_full_rank_gate": true
+-    },
+-    "max_length": 20,
+-    "max_position_embeddings": 1048576,
+-    "min_length": 0,
+-    "mla_use_nope": true,
+-    "mla_use_output_gate": true,
+-    "model_type": "kimi_linear",
+-    "moe_intermediate_size": 3072,
+-    "moe_layer_freq": 1,
+-    "moe_renormalize": true,
+-    "moe_router_activation_func": "sigmoid",
+-    "no_repeat_ngram_size": 0,
+-    "num_attention_heads": 96,
+-    "num_beam_groups": 1,
+-    "num_beams": 1,
+-    "num_expert_group": 1,
+-    "num_experts": 896,
+-    "num_experts_per_token": 16,
+-    "num_hidden_layers": 93,
+-    "num_key_value_heads": 96,
+-    "num_nextn_predict_layers": 0,
+-    "num_return_sequences": 1,
+-    "num_shared_experts": 2,
+-    "output_attentions": false,
+-    "output_hidden_states": false,
+-    "output_scores": false,
+-    "pad_token_id": 163839,
+-    "prefix": null,
+-    "problem_type": null,
+-    "pruned_heads": {},
+-    "q_lora_rank": 1536,
+-    "qk_nope_head_dim": 128,
+-    "qk_rope_head_dim": 64,
+-    "quantization_config": {
+-      "config_groups": {
+-        "group_0": {
+-          "format": "mxfp4-pack-quantized",
+-          "input_activations": null,
+-          "output_activations": null,
+-          "targets": [
+-            "Linear"
+-          ],
+-          "weights": {
+-            "actorder": null,
+-            "block_structure": null,
+-            "dynamic": false,
+-            "group_size": 32,
+-            "num_bits": 4,
+-            "observer": "minmax",
+-            "observer_kwargs": {},
+-            "scale_dtype": "torch.uint8",
+-            "strategy": "group",
+-            "symmetric": true,
+-            "type": "float",
+-            "zp_dtype": null
+-          }
+-        }
+-      },
+-      "format": "mxfp4-pack-quantized",
+-      "global_compression_ratio": null,
+-      "ignore": [
+-        "re:.*self_attn.*",
+-        "re:.*shared_experts.*",
+-        "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+-        "re:.*lm_head.*",
+-        "re:.*vision_tower.*",
+-        "re:.*mm_projector.*"
+-      ],
+-      "kv_cache_scheme": null,
+-      "quant_method": "compressed-tensors",
+-      "quantization_status": "compressed"
+-    },
+-    "remove_invalid_values": false,
+-    "repetition_penalty": 1.0,
+-    "return_dict": true,
+-    "return_dict_in_generate": false,
+-    "rms_norm_eps": 1e-05,
+-    "routed_expert_hidden_size": 3584,
+-    "routed_scaling_factor": 1.0,
+-    "sep_token_id": null,
+-    "suppress_tokens": null,
+-    "task_specific_params": null,
+-    "temperature": 1.0,
+-    "tf_legacy_loss": false,
+-    "tie_encoder_decoder": false,
+-    "tie_word_embeddings": false,
+-    "tokenizer_class": null,
+-    "top_k": 50,
+-    "top_p": 1.0,
+-    "topk_group": 1,
+-    "topk_method": "noaux_tc",
+-    "torchscript": false,
+-    "transformers_version": "4.56.2",
+-    "typical_p": 1.0,
+-    "use_bfloat16": false,
+-    "use_cache": true,
+-    "use_grouped_topk": true,
+-    "v_head_dim": 128,
+-    "vocab_size": 163840
+-  },
+-  "tie_word_embeddings": false,
+-  "vision_config": {
+-    "_attn_implementation": "flash_attention_2",
+-    "activation_func": "gelu_pytorch_tanh",
+-    "attn_bias": false,
+-    "init_pos_emb_height": 64,
+-    "init_pos_emb_time": 4,
+-    "init_pos_emb_width": 64,
+-    "linear_bias": false,
+-    "merge_kernel_size": [
+-      2,
+-      2
+-    ],
+-    "merge_type": "sd2_tpool",
+-    "mlp_type": "mlp2",
+-    "mm_hidden_size": 1024,
+-    "mm_projector_type": "patchmergerv2",
+-    "norm_type": "rmsnorm",
+-    "patch_embed_proj_bias": false,
+-    "patch_size": 14,
+-    "pos_emb_interpolation_mode": "bilinear",
+-    "pos_emb_type": "divided_fixed",
+-    "projector_hidden_act": "gelu",
+-    "projector_ln_eps": 1e-05,
+-    "qkv_hidden_size": 1536,
+-    "text_hidden_size": 7168,
+-    "vt_hidden_size": 1024,
+-    "vt_intermediate_size": 4096,
+-    "vt_num_attention_heads": 12,
+-    "vt_num_hidden_layers": 27
+-  }
+-}
+\ No newline at end of file
+diff --git a/fsdp_turbo/models/kimi_k3/modeling/kimi_moe_patch.py b/fsdp_turbo/models/kimi_k3/modeling/kimi_moe_patch.py
+index 9818121..7e17ee1 100644
+--- a/fsdp_turbo/models/kimi_k3/modeling/kimi_moe_patch.py
++++ b/fsdp_turbo/models/kimi_k3/modeling/kimi_moe_patch.py
+@@ -17,7 +17,6 @@ untouched.
+ from __future__ import annotations
+ 
+ from typing import Any
+-import weakref
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -40,29 +39,10 @@ from .modeling_kimi_linear import (
+     _get_situ_activation_params,
+ )
+ 
+-
+ def _is_situ(config: KimiLinearConfig) -> bool:
+     return config.hidden_act == "situ"
+ 
+ 
+-class _KimiExpertStateDictAlias(nn.Module):
+-    """Virtual ``experts.<id>`` object for FSDP's state-dict FQN validation."""
+-
+-    def __init__(self, experts: "PatchKimiMoeExperts"):
+-        # Keep this traversal proxy out of the parent module tree.  The live
+-        # parameters stay packed; this only makes the external experts.<id>
+-        # FQNs traversable by Transformers and FSDP.
+-        super().__init__()
+-        object.__setattr__(self, "_experts_ref", weakref.ref(experts))
+-
+-    def __getattr__(self, name: str):
+-        if name in {"w1", "w2", "w3"}:
+-            return self
+-        if name == "weight":
+-            return self._experts_ref().gate_up_proj
+-        raise AttributeError(name)
+-
+-
+ class PatchKimiMoeExperts(nn.Module):
+     """Routed experts stored as 3-D tensors, compatible with GMM/permute/unpermute and EP.
+ 
+@@ -79,10 +59,6 @@ class PatchKimiMoeExperts(nn.Module):
+         self.config = config
+         self.num_experts = config.num_experts
+         self.hidden_size = hidden_size if hidden_size is not None else config.hidden_size
+-        # Keep the physical packed names until EP replaces these parameters
+-        # with DTensors.  That replacement is after verl's pre-FSDP snapshot;
+-        # once observed, every later export must use Kimi's w1/w2/w3 ABI.
+-        self._export_external_state_dict = False
+         # FSDP-Turbo's eager/fused EP dispatcher reads ``hidden_dim``.
+         # Keep the original Kimi name as the source of truth and expose the
+         # dispatcher alias without changing the packed-weight layout.
+@@ -107,12 +83,6 @@ class PatchKimiMoeExperts(nn.Module):
+ 
+         self.reset_parameters()
+ 
+-    def register_parameter(self, name: str, param: nn.Parameter | None) -> None:
+-        """Record the model-owned EP transition to DTensor expert weights."""
+-        super().register_parameter(name, param)
+-        if name in {"gate_up_proj", "down_proj"} and isinstance(param, DTensor):
+-            self._export_external_state_dict = True
+-
+     def reset_parameters(self) -> None:
+         """Initialize expert weights like the original Kimi linear layers."""
+         import torch.nn.init as init
+@@ -122,26 +92,6 @@ class PatchKimiMoeExperts(nn.Module):
+         init.normal_(self.gate_up_proj, mean=0.0, std=std)
+         init.normal_(self.down_proj, mean=0.0, std=std)
+ 
+-    def __getattr__(self, name: str):
+-        """Resolve exported ``experts.<id>.w[123].weight`` keys for FSDP2.
+-
+-        ``get_model_state_dict`` validates every state-dict key by traversing
+-        module attributes.  The exported per-expert keys do not physically
+-        exist in the packed module, so expose non-registered aliases only for
+-        that traversal.  They never appear in ``named_parameters()`` and do
+-        not alter the 3-D parameter layout used for compute.
+-        """
+-        if name.isdecimal():
+-            try:
+-                expert_id = int(name)
+-                num_experts = object.__getattribute__(self, "num_experts")
+-            except AttributeError:
+-                pass
+-            else:
+-                if expert_id < num_experts:
+-                    return _KimiExpertStateDictAlias(self)
+-        return super().__getattr__(name)
+-
+     def _load_from_state_dict(
+         self,
+         state_dict,
+@@ -160,10 +110,6 @@ class PatchKimiMoeExperts(nn.Module):
+         """
+         gate_key = f"{prefix}gate_up_proj"
+         down_key = f"{prefix}down_proj"
+-        # A packed source is the FSDP-Turbo pre-wrap snapshot being restored
+-        # into the already parallelized model.  Capture that lifecycle event
+-        # here as well so non-EP FSDP runs use the external Kimi ABI too.
+-        loaded_packed_parameters = gate_key in state_dict or down_key in state_dict
+         old_keys = [
+             f"{prefix}{expert_id}.{projection}.weight"
+             for expert_id in range(self.num_experts)
+@@ -216,60 +162,28 @@ class PatchKimiMoeExperts(nn.Module):
+         super()._load_from_state_dict(
+             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+         )
+-        if loaded_packed_parameters:
+-            self._export_external_state_dict = True
+-
+-    def _save_to_state_dict(self, destination, prefix, keep_vars):
+-        """Expose standard Kimi checkpoint keys from packed live parameters.
+-
+-        Generic FSDP/verl code iterates this state dict tensor by tensor, so
+-        vLLM receives the original expert keys and never sees 3-D names.
+-        """
+-        # The pre-FSDP snapshot must keep physical 3-D names so
+-        # ``set_model_state_dict`` can load the wrapped parameters.  EP's
+-        # model-owned ``register_parameter`` transition makes later exports
+-        # stable even when FSDP temporarily exposes ordinary tensors.
+-        if not self._export_external_state_dict:
+-            super()._save_to_state_dict(destination, prefix, keep_vars)
+-            return
+-
+-        gate_up = self.gate_up_proj if keep_vars else self.gate_up_proj.detach()
+-        down = self.down_proj if keep_vars else self.down_proj.detach()
+-        # Exporting each expert by indexing a DTensor triggers one collective
+-        # redistribute per slice. Gather each packed parameter once, then slice
+-        # the ordinary full tensor locally.
+-        if isinstance(gate_up, DTensor):
+-            gate_up = gate_up.full_tensor()
+-        if isinstance(down, DTensor):
+-            down = down.full_tensor()
+-        for expert_id in range(self.num_experts):
+-            destination[f"{prefix}{expert_id}.w1.weight"] = gate_up[
+-                expert_id, :, : self.intermediate_size
+-            ].transpose(0, 1).contiguous()
+-            destination[f"{prefix}{expert_id}.w2.weight"] = down[expert_id].transpose(0, 1).contiguous()
+-            destination[f"{prefix}{expert_id}.w3.weight"] = gate_up[
+-                expert_id, :, self.intermediate_size :
+-            ].transpose(0, 1).contiguous()
+ 
+     def rewrite_packed_state_dict_for_external_export(self, destination, prefix: str) -> None:
+         """Replace this module's packed keys in an already collected state dict.
+ 
+-        FSDP2 can collect physical parameter names without invoking this
+-        submodule's ``_save_to_state_dict``.  The Kimi root model invokes this
+-        post-processing step after collection, before verl streams tensors to
+-        vLLM.
++        FSDP first collects physical parameter names into ordinary full CPU
++        tensors.  The checkpoint manager invokes this post-processing step on
++        rank 0 only when a standard external HF checkpoint was requested.
+         """
+         gate_key = f"{prefix}gate_up_proj"
+         down_key = f"{prefix}down_proj"
+         if gate_key not in destination or down_key not in destination:
+             return
+ 
+-        gate_up = destination.pop(gate_key)
+-        down = destination.pop(down_key)
+-        if isinstance(gate_up, DTensor):
+-            gate_up = gate_up.full_tensor()
+-        if isinstance(down, DTensor):
+-            down = down.full_tensor()
++        gate_up = destination[gate_key]
++        down = destination[down_key]
++        if isinstance(gate_up, DTensor) or isinstance(down, DTensor):
++            raise RuntimeError(
++                "Kimi external state-dict rewrite requires already materialized "
++                "full tensors on rank 0; refusing a per-layer DTensor collective"
++            )
++        destination.pop(gate_key)
++        destination.pop(down_key)
+         for expert_id in range(self.num_experts):
+             destination[f"{prefix}{expert_id}.w1.weight"] = gate_up[
+                 expert_id, :, : self.intermediate_size
+@@ -278,6 +192,7 @@ class PatchKimiMoeExperts(nn.Module):
+             destination[f"{prefix}{expert_id}.w3.weight"] = gate_up[
+                 expert_id, :, self.intermediate_size :
+             ].transpose(0, 1).contiguous()
++
+     def _apply_activation(self, gate_up: torch.Tensor, fused: bool = False) -> torch.Tensor:
+         """Apply the configured activation to the first linear output."""
+         if _is_situ(self.config):
+@@ -446,9 +361,9 @@ class PatchKimiMoeExperts(nn.Module):
+ 
+ 
+ def rewrite_kimi_k3_state_dict_for_external_export(model: nn.Module, destination, prefix: str = ""):
+-    """Convert active packed Kimi experts in a root-model state dict in place."""
++    """Convert packed Kimi experts in a materialized root state dict in place."""
+     for module_name, module in model.named_modules():
+-        if not isinstance(module, PatchKimiMoeExperts) or not module._export_external_state_dict:
++        if not isinstance(module, PatchKimiMoeExperts):
+             continue
+         module_prefix = f"{prefix}{module_name}." if module_name else prefix
+         module.rewrite_packed_state_dict_for_external_export(destination, module_prefix)
+@@ -505,10 +420,21 @@ class PatchKimiSparseMoeBlock(nn.Module):
+                     self.moe_hidden_size, eps=config.rms_norm_eps
+                 )
+ 
+-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        replay_topk_idx: torch.Tensor | None = None,
++        replay_topk_weight: torch.Tensor | None = None,
++        replay_mask: torch.Tensor | None = None,
++    ) -> torch.Tensor:
+         identity = hidden_states
+         orig_shape = hidden_states.shape
+-        topk_idx, topk_weight = self.gate(hidden_states)
++        topk_idx, topk_weight = self.gate(
++            hidden_states,
++            replay_topk_idx=replay_topk_idx,
++            replay_topk_weight=replay_topk_weight,
++            replay_mask=replay_mask,
++        )
+         # vLLM's FusedMoE converts the FP32 router weights to the routed
+         # hidden-state dtype before token unpermute.  FSDP's NPU unpermute
+         # otherwise promotes every expert result to FP32, changing the
+@@ -522,6 +448,15 @@ class PatchKimiSparseMoeBlock(nn.Module):
+         y = self.experts(hidden_states, topk_idx, topk_weight)
+ 
+         if self.use_latent_moe:
++            # The fused EP unpermute can accumulate expert outputs in FP32,
++            # while the latent projections and RMSNorm parameters remain in
++            # the model dtype (BF16 here).  Keep the latent path in the
++            # projection dtype so Ascend RMSNorm receives matching dtypes
++            # and the following up projection does not see a mixed-dtype
++            # activation either.
++            output_dtype = self.routed_expert_up_proj.weight.dtype
++            if y.is_floating_point() and y.dtype != output_dtype:
++                y = y.to(dtype=output_dtype)
+             if self.latent_moe_use_norm:
+                 y = self.routed_expert_norm(y)
+             y = self.routed_expert_up_proj(y)
+@@ -529,7 +464,8 @@ class PatchKimiSparseMoeBlock(nn.Module):
+         y = y.view(*orig_shape)
+ 
+         if self.config.num_shared_experts is not None:
+-            y = y + self.shared_experts(identity)
++            shared_output = self.shared_experts(identity)
++            y = y + shared_output
+         return y
+ 
+ 
+diff --git a/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_k3.py b/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_k3.py
+index 57a3aa4..edae4ba 100644
+--- a/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_k3.py
++++ b/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_k3.py
+@@ -39,6 +39,7 @@
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ # SOFTWARE.
+ import math
++import os
+ from collections.abc import Sequence
+ from copy import deepcopy
+ from typing import Optional
+@@ -78,6 +79,174 @@ if IS_NPU_AVAILABLE:
+ 
+ _SIN = None
+ _COS = None
++_KIMI_FULL_R3_ALIGN_LOGGED = False
++
++
++def _align_kimi_full_model_routes(
++    routed_experts: torch.Tensor,
++    routed_expert_weights: torch.Tensor,
++    router_replay_mask: torch.Tensor,
++    target_attention_mask: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Align natural-rollout routes to Kimi's final model-row axis.
++
++    vLLM returns one route row for every row that actually entered a model
++    forward: the complete image-expanded prompt and each generated-token
++    predecessor. The last sampled response token has not itself been
++    forwarded, so a valid capture must contain exactly one fewer row than the
++    final FSDP input. Mapping is order-preserving over valid attention rows and
++    therefore remains correct under left padding and variable image expansion.
++    """
++    if routed_experts.dim() != 4:
++        raise ValueError(
++            "full-model routed_experts must be [batch, rows, layers, topk], "
++            f"got {tuple(routed_experts.shape)}"
++        )
++    if router_replay_mask.shape != routed_experts.shape[:2]:
++        raise ValueError(
++            "full-model router_replay_mask must match the route row axis, "
++            f"got mask={tuple(router_replay_mask.shape)} and "
++            f"routes={tuple(routed_experts.shape[:2])}"
++        )
++    if routed_expert_weights.shape != routed_experts.shape:
++        raise ValueError(
++            "full-model routed_expert_weights must be elementwise aligned "
++            f"with expert IDs, got ids={tuple(routed_experts.shape)}, "
++            f"weights={tuple(routed_expert_weights.shape)}"
++        )
++    if not routed_expert_weights.is_floating_point():
++        raise TypeError(
++            "full-model routed_expert_weights must be floating point, got "
++            f"{routed_expert_weights.dtype}"
++        )
++    if target_attention_mask.dim() != 2 or target_attention_mask.shape[0] != routed_experts.shape[0]:
++        raise ValueError(
++            "full-model target attention mask must be [batch, expanded_rows], "
++            f"got {tuple(target_attention_mask.shape)}"
++        )
++
++    target_device = target_attention_mask.device
++    source_routes = routed_experts.to(target_device)
++    source_weights = routed_expert_weights.to(target_device)
++    source_mask = router_replay_mask.to(device=target_device, dtype=torch.bool)
++    target_mask = target_attention_mask.to(device=target_device, dtype=torch.bool)
++    aligned_routes = source_routes.new_zeros(
++        source_routes.shape[0],
++        target_mask.shape[1],
++        source_routes.shape[2],
++        source_routes.shape[3],
++    )
++    aligned_weights = source_weights.new_zeros(
++        source_weights.shape[0],
++        target_mask.shape[1],
++        source_weights.shape[2],
++        source_weights.shape[3],
++    )
++    aligned_mask = torch.zeros_like(target_mask, dtype=torch.bool)
++    total_source_rows = 0
++    positive_sum_min = None
++    positive_sum_max = None
++    for batch_idx in range(source_routes.shape[0]):
++        source_rows = torch.where(source_mask[batch_idx])[0]
++        target_rows = torch.where(target_mask[batch_idx])[0]
++        expected_source_rows = max(int(target_rows.numel()) - 1, 0)
++        if int(source_rows.numel()) != expected_source_rows:
++            raise ValueError(
++                "Kimi full-model R3 requires rollout_rows == "
++                "expanded_training_rows - 1: "
++                f"sample={batch_idx}, rollout_rows={source_rows.numel()}, "
++                f"expanded_training_rows={target_rows.numel()}, "
++                f"route_width={source_routes.shape[1]}, "
++                f"expanded_width={target_mask.shape[1]}"
++            )
++        if expected_source_rows:
++            causal_target_rows = target_rows[:-1]
++            aligned_routes[batch_idx, causal_target_rows] = source_routes[
++                batch_idx, source_rows
++            ]
++            aligned_weights[batch_idx, causal_target_rows] = source_weights[
++                batch_idx, source_rows
++            ]
++            aligned_mask[batch_idx, causal_target_rows] = True
++            copied_routes = aligned_routes[batch_idx, causal_target_rows]
++            copied_weights = aligned_weights[batch_idx, causal_target_rows]
++            original_routes = source_routes[batch_idx, source_rows]
++            original_weights = source_weights[batch_idx, source_rows]
++            if not torch.equal(copied_routes, original_routes):
++                raise RuntimeError(
++                    "Kimi full-model R3 alignment changed expert IDs: "
++                    f"sample={batch_idx}, source_rows={int(source_rows.numel())}"
++                )
++            if not torch.equal(copied_weights, original_weights):
++                max_difference = float(
++                    (copied_weights.float() - original_weights.float())
++                    .abs()
++                    .max()
++                    .item()
++                )
++                raise RuntimeError(
++                    "Kimi full-model R3 alignment changed router weights: "
++                    f"sample={batch_idx}, source_rows={int(source_rows.numel())}, "
++                    f"max_abs_diff={max_difference}"
++                )
++            total_source_rows += int(source_rows.numel())
++            sums = original_weights.float().sum(dim=-1)
++            positive_sums = sums[sums > 0]
++            if positive_sums.numel():
++                current_min = positive_sums.min()
++                current_max = positive_sums.max()
++                positive_sum_min = (
++                    current_min
++                    if positive_sum_min is None
++                    else torch.minimum(positive_sum_min, current_min)
++                )
++                positive_sum_max = (
++                    current_max
++                    if positive_sum_max is None
++                    else torch.maximum(positive_sum_max, current_max)
++                )
++
++    global _KIMI_FULL_R3_ALIGN_LOGGED
++    if total_source_rows and not _KIMI_FULL_R3_ALIGN_LOGGED:
++        rank = (
++            torch.distributed.get_rank()
++            if torch.distributed.is_available() and torch.distributed.is_initialized()
++            else 0
++        )
++        marker = (
++            "FSDP Kimi full-model R3 ALIGNMENT ACTIVE: "
++            f"rank={rank} samples={source_routes.shape[0]} "
++            f"source_rows={total_source_rows} ids_copy_exact=True "
++            "weights_copy_exact=True integrity_stage=post_model_row_alignment "
++            f"positive_weight_sum_min="
++            f"{None if positive_sum_min is None else float(positive_sum_min.item())} "
++            f"positive_weight_sum_max="
++            f"{None if positive_sum_max is None else float(positive_sum_max.item())}"
++        )
++        print(marker, flush=True)
++        _KIMI_FULL_R3_ALIGN_LOGGED = True
++    return aligned_routes, aligned_weights, aligned_mask
++
++
++class _NpuCanonicalND(torch.autograd.Function):
++    """Canonicalize NPU storage format while preserving autograd."""
++
++    @staticmethod
++    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
++        ctx.original_format = torch_npu.get_npu_format(tensor)
++        return torch_npu.npu_format_cast(tensor, 2)
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
++        return (torch_npu.npu_format_cast(grad_output, ctx.original_format),)
++
++
++def _canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
++    if tensor.device.type != 'npu':
++        return tensor
++    if torch.is_grad_enabled() and tensor.requires_grad:
++        return _NpuCanonicalND.apply(tensor)
++    return torch_npu.npu_format_cast(tensor, 2)
+ 
+ 
+ def _kimi_npu_fia_attention(
+@@ -480,7 +649,22 @@ class MoonVision3dPatchEmbed(nn.Module):
+         Returns:
+             (L, Cout) tensor
+         """
+-        x = self.proj(x).view(x.size(0), -1)
++        # Match the vLLM vision patch embedding. Equal BF16 tensors can retain
++        # different private Ascend formats after FSDP materialization and vLLM
++        # loading, which makes Conv2d round differently. This patch-sized
++        # Conv2d has one output location, so evaluate the equivalent linear in
++        # FP32 after canonical ND casts and round only once at the output.
++        with torch.autocast(device_type=x.device.type, enabled=False):
++            flat_x = x.flatten(1).float()
++            flat_weight = self.proj.weight.flatten(1).float()
++            bias = None if self.proj.bias is None else self.proj.bias.float()
++            if x.device.type == 'npu':
++                flat_x = _canonical_nd(flat_x)
++                flat_weight = _canonical_nd(flat_weight)
++                if bias is not None:
++                    bias = _canonical_nd(bias)
++            x = F.linear(flat_x, flat_weight, bias)
++        x = x.to(self.proj.weight.dtype)
+         # apply positional embedding
+         x = self.pos_emb(x, grid_thws)
+         return x
+@@ -1125,17 +1309,8 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         return self.language_model.get_decoder()
+ 
+     def state_dict(self, destination=None, prefix="", keep_vars=False):
+-        """Export Kimi packed experts with the original checkpoint/vLLM ABI.
+-
+-        Before FSDP-Turbo parallelizes the model, Kimi experts retain their
+-        physical 3-D keys for the adapter's initialization snapshot.  Once EP
+-        or FSDP restoration has activated external export, rewrite any packed
+-        keys collected by FSDP2 to the standard per-expert Kimi names.
+-        """
+-        state_dict = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+-        from .kimi_moe_patch import rewrite_kimi_k3_state_dict_for_external_export
+-
+-        return rewrite_kimi_k3_state_dict_for_external_export(self, state_dict, prefix)
++        """Return Kimi's packed-or-local state dict without full gathers."""
++        return super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+ 
+     def tie_weights(self):
+         return self.language_model.tie_weights()
+@@ -1157,6 +1332,10 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         input_ids: torch.Tensor,
+         attention_mask: torch.Tensor,
+         labels: torch.Tensor | None = None,
++        routed_experts: torch.Tensor | None = None,
++        routed_expert_weights: torch.Tensor | None = None,
++        router_replay_mask: torch.Tensor | None = None,
++        r3_full_model_rows: bool = False,
+     ):
+         """
+         Args:
+@@ -1271,6 +1450,91 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         final_attention_mask[batch_indices,
+                              text_to_overwrite] = attention_mask[
+                                  batch_indices, non_image_indices]
++        final_routed_experts = None
++        final_routed_expert_weights = None
++        final_router_replay_mask = None
++        full_model_routes = None
++        full_model_route_weights = None
++        full_model_route_mask = None
++        if (
++            routed_experts is not None
++            or routed_expert_weights is not None
++            or router_replay_mask is not None
++        ):
++            if (
++                routed_experts is None
++                or routed_expert_weights is None
++                or router_replay_mask is None
++            ):
++                raise ValueError(
++                    "routed_experts, routed_expert_weights, and "
++                    "router_replay_mask must be provided together"
++                )
++            if routed_experts.dim() != 4 or routed_experts.shape[0] != batch_size:
++                raise ValueError(
++                    "routed_experts must be [batch, rows, layers, topk], "
++                    f"got {tuple(routed_experts.shape)}"
++                )
++            if router_replay_mask.shape != routed_experts.shape[:2]:
++                raise ValueError(
++                    "router_replay_mask must match the route row axis, "
++                    f"got mask={tuple(router_replay_mask.shape)} and "
++                    f"routes={tuple(routed_experts.shape[:2])}"
++                )
++            if routed_expert_weights.shape != routed_experts.shape:
++                raise ValueError(
++                    "routed_expert_weights must be elementwise aligned with "
++                    f"expert IDs, got ids={tuple(routed_experts.shape)}, "
++                    f"weights={tuple(routed_expert_weights.shape)}"
++                )
++            routes = routed_experts.to(target_device)
++            route_weights = routed_expert_weights.to(target_device)
++            route_mask = router_replay_mask.to(
++                device=target_device,
++                dtype=torch.bool,
++            )
++            if r3_full_model_rows:
++                # Defer until image rows have been written into the final
++                # attention mask; that mask is the authoritative expanded
++                # model-row axis shared with vLLM's KV slots.
++                full_model_routes = routes
++                full_model_route_weights = route_weights
++                full_model_route_mask = route_mask
++            else:
++                if routes.shape[:2] != (batch_size, sequence_length):
++                    raise ValueError(
++                        "logical routed_experts must match tokenizer rows when "
++                        "r3_full_model_rows is false: "
++                        f"routes={tuple(routes.shape[:2])}, "
++                        f"logical={(batch_size, sequence_length)}"
++                    )
++                final_routed_experts = routes.new_zeros(
++                    batch_size,
++                    max_embed_dim,
++                    routes.shape[2],
++                    routes.shape[3],
++                )
++                final_routed_expert_weights = route_weights.new_zeros(
++                    batch_size,
++                    max_embed_dim,
++                    route_weights.shape[2],
++                    route_weights.shape[3],
++                )
++                final_router_replay_mask = torch.zeros(
++                    batch_size,
++                    max_embed_dim,
++                    dtype=torch.bool,
++                    device=target_device,
++                )
++                final_routed_experts[batch_indices, text_to_overwrite] = routes[
++                    batch_indices, non_image_indices
++                ]
++                final_routed_expert_weights[
++                    batch_indices, text_to_overwrite
++                ] = route_weights[batch_indices, non_image_indices]
++                final_router_replay_mask[batch_indices, text_to_overwrite] = (
++                    route_mask[batch_indices, non_image_indices]
++                )
+         if labels is not None:
+             final_labels[batch_indices,
+                          text_to_overwrite] = labels[batch_indices,
+@@ -1301,6 +1565,19 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         )
+         final_attention_mask[image_to_overwrite] = image_token_attention.to(
+             final_attention_mask.dtype)
++        if full_model_routes is not None:
++            (
++                final_routed_experts,
++                final_routed_expert_weights,
++                final_router_replay_mask,
++            ) = (
++                _align_kimi_full_model_routes(
++                    full_model_routes,
++                    full_model_route_weights,
++                    full_model_route_mask,
++                    final_attention_mask,
++                )
++            )
+         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_(
+             (final_attention_mask == 0), 1)
+ 
+@@ -1313,7 +1590,15 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         if labels is None:
+             final_labels = None
+ 
+-        return final_embedding, final_attention_mask, final_labels, position_ids
++        return (
++            final_embedding,
++            final_attention_mask,
++            final_labels,
++            position_ids,
++            final_routed_experts,
++            final_routed_expert_weights,
++            final_router_replay_mask,
++        )
+ 
+     def _extract_image_features(self, pixel_values: torch.Tensor,
+                                 grid_thws: torch.Tensor) -> list[torch.Tensor]:
+@@ -1351,6 +1636,10 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         output_attentions: bool | None = None,
+         output_hidden_states: bool | None = None,
+         return_dict: bool | None = None,
++        routed_experts: torch.Tensor | None = None,
++        routed_expert_weights: torch.Tensor | None = None,
++        router_replay_mask: torch.Tensor | None = None,
++        r3_full_model_rows: bool = False,
+     ) -> tuple | LlavaCausalLMOutputWithPast:
+         r"""
+         Args:
+@@ -1373,6 +1662,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+         if enable_chunk_loss:
+             output_hidden_states = True
+ 
++        r3_routes_aligned = False
+         if inputs_embeds is None:
+             # 1. Extra the input embeddings
+             inputs_embeds = self.get_input_embeddings()(input_ids)
+@@ -1387,7 +1677,21 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+                 # autograd dispatch path.  Use the same inference boundary for
+                 # all no-grad log-prob forwards; differentiable updates remain
+                 # on the ordinary training path.
+-                vision_parity_infer = IS_NPU_AVAILABLE and not torch.is_grad_enabled()
++                # FSDP2 reuses all-gather buffers between forward-only replay
++                # and the subsequent actor update.  If those buffers are first
++                # materialized under inference_mode, the training forward cannot
++                # update them in-place.  The verl FSDP engine opts into ordinary
++                # no_grad with this environment variable for exactly that path.
++                ordinary_no_grad = os.getenv("VERL_FSDP_FORWARD_ONLY_NO_GRAD", "0").lower() in {
++                    "1",
++                    "true",
++                    "yes",
++                }
++                vision_parity_infer = (
++                    IS_NPU_AVAILABLE
++                    and not torch.is_grad_enabled()
++                    and not ordinary_no_grad
++                )
+                 if vision_parity_infer:
+                     with torch.inference_mode():
+                         image_features = self._extract_image_features(
+@@ -1402,14 +1706,27 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+ 
+                 inputs_embeds = inputs_embeds.to(
+                     image_features[0].dtype)  # num_tokens, embed_dim
+-                inputs_embeds, attention_mask, labels, position_ids = (
++                (
++                    inputs_embeds,
++                    attention_mask,
++                    labels,
++                    position_ids,
++                    routed_experts,
++                    routed_expert_weights,
++                    router_replay_mask,
++                ) = (
+                     self._merge_input_ids_with_image_features(
+                         image_features,
+                         inputs_embeds,
+                         input_ids,
+                         attention_mask,
+                         labels,
++                        routed_experts,
++                        routed_expert_weights,
++                        router_replay_mask,
++                        r3_full_model_rows,
+                     ))
++                r3_routes_aligned = r3_full_model_rows
+ 
+             # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
+             # generation with cache
+@@ -1452,6 +1769,27 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+                 position_ids = torch.sum(attention_mask,
+                                          dim=1).unsqueeze(-1) - 1
+ 
++        if r3_full_model_rows and routed_experts is not None and not r3_routes_aligned:
++            if (
++                routed_expert_weights is None
++                or router_replay_mask is None
++                or attention_mask is None
++            ):
++                raise ValueError(
++                    "Kimi full-model R3 requires routed_expert_weights, "
++                    "router_replay_mask, and attention_mask"
++                )
++            (
++                routed_experts,
++                routed_expert_weights,
++                router_replay_mask,
++            ) = _align_kimi_full_model_routes(
++                routed_experts,
++                routed_expert_weights,
++                router_replay_mask,
++                attention_mask,
++            )
++
+         outputs = self.language_model(
+             attention_mask=attention_mask,
+             position_ids=position_ids,
+@@ -1461,6 +1799,9 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
+             output_attentions=output_attentions,
+             output_hidden_states=output_hidden_states,
+             return_dict=return_dict,
++            routed_experts=routed_experts,
++            routed_expert_weights=routed_expert_weights,
++            router_replay_mask=router_replay_mask,
+         )
+ 
+         # Modification start: chunk loss adaptation, following Kimi-K2.5 FSDP.
+diff --git a/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_linear.py b/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_linear.py
+index fda97b1..87134a9 100644
+--- a/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_linear.py
++++ b/fsdp_turbo/models/kimi_k3/modeling/modeling_kimi_linear.py
+@@ -41,6 +41,7 @@
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ # SOFTWARE.
+ import math
++import os
+ from collections.abc import Callable
+ from typing import Any
+ 
+@@ -71,19 +72,13 @@ except ImportError:
+     def check_model_inputs(func):
+         return func
+ 
+-# try:
+-#     from fla.modules import FusedRMSNormGated, ShortConvolution
+-#     from fla.ops.kda import chunk_kda, fused_recurrent_kda
+-#     # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
+-#     from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
+-#     from fla.utils import tensor_cache
+-# except ImportError:
+-#     raise ImportError("Plese run `pip install -U fla-core`")
+-
+ from fsdp_turbo.models.kimi_k3.utils.device import IS_NPU_AVAILABLE
+ from fsdp_turbo.models.kimi_k3.ops.gdn.triton.utils import tensor_cache
+ 
+ from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
++from triton_ascend_kernels.attention.fla.kda.gate import (
++    fused_kda_gate as training_fused_kda_gate,
++)
+ 
+ from fsdp_turbo.models.kimi_k3.ops.kda.short_conv import ShortConvolution
+ 
+@@ -93,6 +88,116 @@ assert version.parse(transformers.__version__) >= version.parse("4.56.0"), \
+     "Please upgrade transformers to >= 4.56.0"
+ 
+ logger = logging.get_logger(__name__)
++_KIMI_FULL_R3_GATE_LOGGED = False
++_KIMI_PARTITION_INVARIANT_KDA_LOGGED = False
++
++
++def _kimi_partition_invariant_kda_enabled() -> bool:
++    return os.getenv(
++        "KIMI_TRAIN_USE_PARTITION_INVARIANT_KDA_FORWARD", "0"
++    ).strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _partition_invariant_kda_forward(
++    *,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    raw_g: torch.Tensor,
++    beta: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    initial_state: torch.Tensor | None,
++    cu_seqlens: torch.Tensor | None,
++    lower_bound: float | None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Run KDA's mathematical recurrence without sequence partition drift.
++
++    ``chunk_kda`` is retained as the differentiable path by the caller.  This
++    forward-only value path uses the same recurrent Triton kernel for a packed
++    actor sequence that vLLM uses for both prefill and decode.  Unlike the
++    parallel chunk scan, this kernel is bitwise invariant to splitting a
++    sequence at the prefill/decode boundary.
++
++    The recurrent kernel's continuous-cache ABI consumes one cache index per
++    token.  Use a two-dimensional index table so every token in sequence N
++    reads and writes cache row N+1; row zero remains the reserved null row.
++    """
++
++    # Import lazily so standalone checkpoint/model inspection does not require
++    # vLLM.  Formal VERL parity runs enable this path and ship both packages in
++    # the same image.
++    from vllm.model_executor.layers.fla.ops.kda import fused_recurrent_kda
++
++    if cu_seqlens is not None:
++        if q.shape[0] != 1:
++            raise ValueError(
++                "partition-invariant KDA requires packed batch size 1 when "
++                f"cu_seqlens is provided, got q={tuple(q.shape)}"
++            )
++        recurrent_cu_seqlens = cu_seqlens.to(
++            device=q.device, dtype=torch.int32
++        ).contiguous()
++        num_sequences = recurrent_cu_seqlens.numel() - 1
++        index_width = q.shape[1]
++    else:
++        recurrent_cu_seqlens = None
++        num_sequences = q.shape[0]
++        index_width = q.shape[1]
++    if num_sequences <= 0 or index_width <= 0:
++        raise ValueError(
++            "partition-invariant KDA requires at least one sequence/token: "
++            f"q={tuple(q.shape)}, num_sequences={num_sequences}"
++        )
++
++    state_shape = (
++        num_sequences + 1,
++        v.shape[2],
++        v.shape[-1],
++        k.shape[-1],
++    )
++    state_cache = torch.zeros(state_shape, device=q.device, dtype=torch.float32)
++    if initial_state is not None:
++        expected = state_shape[1:]
++        if initial_state.shape[0] != num_sequences or tuple(initial_state.shape[1:]) != expected:
++            raise ValueError(
++                "partition-invariant KDA initial-state shape mismatch: "
++                f"expected={(num_sequences, *expected)}, got={tuple(initial_state.shape)}"
++            )
++        state_cache[1:].copy_(initial_state.to(dtype=state_cache.dtype))
++
++    sequence_ids = torch.arange(
++        1,
++        num_sequences + 1,
++        device=q.device,
++        dtype=torch.int64,
++    )
++    state_indices = sequence_ids[:, None].expand(
++        num_sequences, index_width
++    ).contiguous()
++
++    with torch.no_grad():
++        effective_gate = training_fused_kda_gate(
++            raw_g,
++            A_log,
++            head_k_dim=k.shape[-1],
++            dt_bias=dt_bias,
++            lower_bound=lower_bound,
++            output_dtype=torch.float32,
++        )
++        output, _ = fused_recurrent_kda(
++            q=q,
++            k=k,
++            v=v,
++            g=effective_gate,
++            beta=beta,
++            initial_state=state_cache,
++            inplace_final_state=True,
++            use_qk_l2norm_in_kernel=True,
++            cu_seqlens=recurrent_cu_seqlens,
++            ssm_state_indices=state_indices,
++        )
++    return output, state_cache[1:]
+ 
+ 
+ class KimiK_3_MoeRMSNormGated(nn.Module):
+@@ -101,23 +206,20 @@ class KimiK_3_MoeRMSNormGated(nn.Module):
+         self.weight = nn.Parameter(torch.ones(hidden_size))
+         self.variance_epsilon = eps
+         if IS_NPU_AVAILABLE:
+-            print(logger.info, "KimiK_3_MoeRMSNormGated use NPU fused ops")
++            logger.info("KimiK_3_MoeRMSNormGated use NPU fused ops")
+ 
+     def forward(self, hidden_states, gate=None):
+         input_dtype = hidden_states.dtype
+-        if IS_NPU_AVAILABLE:
+-            import torch_npu
+-            hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
+-            hidden_states = hidden_states * F.sigmoid(gate)
+-        else:
+-            hidden_states = hidden_states.to(torch.float32)
+-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+-            # Norm before gate
+-            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+-            hidden_states = self.weight * hidden_states.to(input_dtype)
+-            hidden_states = hidden_states * F.sigmoid(gate.to(torch.float32)).to(input_dtype)
+-
+-        return hidden_states
++        # Match vLLM's FusedRMSNormGated: perform the RMS reduction, affine
++        # scale, and sigmoid gate in FP32, then cast only the final result.
++        # The previous NPU branch used npu_rms_norm and evaluated sigmoid on
++        # BF16 input, which introduced a systematic training/inference drift.
++        hidden_states = hidden_states.to(torch.float32)
++        variance = hidden_states.pow(2).mean(-1, keepdim=True)
++        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
++        hidden_states = self.weight.to(torch.float32) * hidden_states
++        hidden_states = hidden_states * F.sigmoid(gate.to(torch.float32))
++        return hidden_states.to(input_dtype)
+ 
+ 
+ @tensor_cache
+@@ -387,15 +489,29 @@ class KimiMLP(nn.Module):
+             )
+         else:
+             self.act_fn = ACT2FN[config.hidden_act]
++        self.training_chunk_tokens = max(0, int(os.getenv("VERL_KIMI_MLP_CHUNK_TOKENS", "0")))
+ 
+-    def forward(self, x):
++    def _forward_impl(self, x):
+         if self.config.hidden_act == "situ":
+             gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+-            down_proj = self.down_proj(self.act_fn(gate_up))
++            return self.down_proj(self.act_fn(gate_up))
+         else:
+-            down_proj = self.down_proj(self.act_fn(
+-                self.gate_proj(x)) * self.up_proj(x))
+-        return down_proj
++            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
++
++    def forward(self, x):
++        # Chunk inside the MLP so the enclosing FSDP module still executes one
++        # pre-forward/all-gather on every rank.
++        chunk_tokens = self.training_chunk_tokens
++        if not self.training or not torch.is_grad_enabled() or chunk_tokens <= 0 or x.numel() == 0:
++            return self._forward_impl(x)
++
++        original_shape = x.shape
++        flat_x = x.reshape(-1, original_shape[-1])
++        if flat_x.shape[0] <= chunk_tokens:
++            return self._forward_impl(x)
++
++        outputs = [self._forward_impl(chunk) for chunk in flat_x.split(chunk_tokens, dim=0)]
++        return torch.cat(outputs, dim=0).reshape(*original_shape[:-1], self.hidden_size)
+ 
+ 
+ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+@@ -513,7 +629,9 @@ class KimiMLAAttention(nn.Module):
+                      self.qk_nope_head_dim + self.v_head_dim)
+ 
+         if self.q_lora_rank is not None:
+-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
++            q_a = self.q_a_proj(hidden_states)
++            q_a_norm = self.q_a_layernorm(q_a)
++            q_states = self.q_b_proj(q_a_norm)
+         else:
+             q_states = self.q_proj(hidden_states)
+         q_states = q_states.view(query_shape).transpose(1, 2)
+@@ -524,8 +642,9 @@ class KimiMLAAttention(nn.Module):
+         k_pass, k_rot = torch.split(
+             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+ 
+-        k_pass = self.kv_b_proj(self.kv_a_layernorm(
+-            k_pass)).view(key_shape).transpose(1, 2)
++        k_pass_norm = self.kv_a_layernorm(k_pass)
++        k_pass = self.kv_b_proj(k_pass_norm)
++        k_pass = k_pass.view(key_shape).transpose(1, 2)
+         k_pass, value_states = torch.split(
+             k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+ 
+@@ -566,7 +685,8 @@ class KimiMLAAttention(nn.Module):
+         attn_output = attn_output.reshape(
+             batch_size, seq_length, -1).contiguous()
+         if self.use_output_gate:
+-            g = self.g_proj(hidden_states).sigmoid()
++            gate_logits = self.g_proj(hidden_states)
++            g = gate_logits.sigmoid()
+             attn_output = attn_output * g
+         attn_output = self.o_proj(attn_output)
+         return attn_output
+@@ -709,7 +829,8 @@ class KimiDeltaAttention(nn.Module):
+         #     if kda_implementation == "fused":
+         # 融合大算子（triton_ascend_kernels）
+         beta = torch.sigmoid(beta)
+-        o, recurrent_state = chunk_kda(
++        initial_recurrent_state = recurrent_state
++        chunk_output, chunk_recurrent_state = chunk_kda(
+             q=q,
+             k=k,
+             v=v,
+@@ -728,52 +849,65 @@ class KimiDeltaAttention(nn.Module):
+             cu_seqlens=cu_seqlens,
+             skip_recompute=getattr(self.config, "skip_kda_recompute", False),
+         )
+-        #     elif kda_implementation == "naive":
+-        #         # 小算子版本
+-        #         from fsdp_turbo.models.kimi_k3.ops.kda.chunk_kda_naive import chunk_kda_naive
+-        #         o, recurrent_state = chunk_kda_naive(
+-        #             q=q,
+-        #             k=k,
+-        #             v=v,
+-        #             g=g,
+-        #             beta=beta,
+-        #             A_log=self.A_log,
+-        #             dt_bias=self.dt_bias,
+-        #             initial_state=recurrent_state,
+-        #             output_final_state=True,
+-        #             use_qk_l2norm_in_kernel=True,
+-        #             use_gate_in_kernel=True,
+-        #             use_beta_sigmoid_in_kernel=True,
+-        #             safe_gate=self.gate_lower_bound is not None,
+-        #             lower_bound=self.gate_lower_bound,
+-        #             transpose_state_layout=True,
+-        #             cu_seqlens=cu_seqlens,
+-        #             chunk_size=64
+-        #         )
+-        #     else:
+-        #         raise ValueError(
+-        #             f"Unsupported kda_implementation: {kda_implementation}. "
+-        #             "Expected 'fused' or 'naive'."
+-        #         )
+-
+-        # else:
+-        #     o, recurrent_state = fused_recurrent_kda(
+-        #         q=q,
+-        #         k=k,
+-        #         v=v,
+-        #         g=g,
+-        #         beta=beta,
+-        #         A_log=self.A_log,
+-        #         dt_bias=self.dt_bias,
+-        #         initial_state=recurrent_state,
+-        #         output_final_state=True,
+-        #         use_qk_l2norm_in_kernel=True,
+-        #         use_gate_in_kernel=True,
+-        #         use_beta_sigmoid_in_kernel=True,
+-        #         lower_bound=self.gate_lower_bound,
+-        #         transpose_state_layout=True,
+-        #         cu_seqlens=cu_seqlens,
+-        #     )
++        if _kimi_partition_invariant_kda_enabled():
++            recurrent_output, recurrent_forward_state = (
++                _partition_invariant_kda_forward(
++                    q=q,
++                    k=k,
++                    v=v,
++                    raw_g=g,
++                    beta=beta,
++                    A_log=self.A_log,
++                    dt_bias=self.dt_bias,
++                    initial_state=initial_recurrent_state,
++                    cu_seqlens=cu_seqlens,
++                    lower_bound=self.gate_lower_bound,
++                )
++            )
++            if recurrent_output.shape != chunk_output.shape:
++                raise RuntimeError(
++                    "partition-invariant KDA output shape mismatch: "
++                    f"recurrent={tuple(recurrent_output.shape)}, "
++                    f"chunk={tuple(chunk_output.shape)}"
++                )
++            if (
++                chunk_recurrent_state is None
++                or recurrent_forward_state.shape != chunk_recurrent_state.shape
++            ):
++                raise RuntimeError(
++                    "partition-invariant KDA final-state shape mismatch: "
++                    f"recurrent={tuple(recurrent_forward_state.shape)}, "
++                    "chunk="
++                    f"{None if chunk_recurrent_state is None else tuple(chunk_recurrent_state.shape)}"
++                )
++
++            # Exact recurrent values in forward, chunk_kda's supported
++            # autograd in backward.  Subtracting a tensor from its detached
++            # identity is exactly zero, while retaining a unit gradient.
++            o = recurrent_output.detach() + (
++                chunk_output - chunk_output.detach()
++            )
++            recurrent_state = recurrent_forward_state.detach() + (
++                chunk_recurrent_state - chunk_recurrent_state.detach()
++            )
++
++            global _KIMI_PARTITION_INVARIANT_KDA_LOGGED
++            rank = (
++                torch.distributed.get_rank()
++                if torch.distributed.is_initialized()
++                else 0
++            )
++            if not _KIMI_PARTITION_INVARIANT_KDA_LOGGED and rank == 0:
++                _KIMI_PARTITION_INVARIANT_KDA_LOGGED = True
++                logger.warning(
++                    "Kimi actor PARTITION-INVARIANT KDA FORWARD ACTIVE: "
++                    "forward=fused_recurrent_kda "
++                    "backward=training_chunk_kda_straight_through "
++                    "packed_state_indices=per_token"
++                )
++        else:
++            o = chunk_output
++            recurrent_state = chunk_recurrent_state
+         if cache_params is not None:
+             cache_params.recurrent_states[self.layer_idx] = recurrent_state
+             cache_params.conv_states[self.layer_idx] = (
+@@ -807,6 +941,7 @@ class KimiMoEGate(nn.Module):
+     def __init__(self, config: KimiLinearConfig):
+         super().__init__()
+         self.config = config
++        self.layer_idx = -1
+         self.top_k = config.num_experts_per_token
+         self.num_experts = config.num_experts
+         self.routed_scaling_factor = config.routed_scaling_factor
+@@ -831,7 +966,17 @@ class KimiMoEGate(nn.Module):
+ 
+         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+ 
+-    def forward(self, hidden_states):
++    def forward(
++        self,
++        hidden_states,
++        replay_topk_idx: torch.Tensor | None = None,
++        replay_topk_weight: torch.Tensor | None = None,
++        replay_mask: torch.Tensor | None = None,
++    ):
++        if (replay_topk_idx is None) != (replay_topk_weight is None):
++            raise ValueError(
++                "full R3 requires replay_topk_idx and replay_topk_weight together"
++            )
+         bsz, seq_len, h = hidden_states.shape
+         # compute gating score
+         hidden_states = hidden_states.view(-1, h)
+@@ -877,7 +1022,82 @@ class KimiMoEGate(nn.Module):
+         _, topk_idx = torch.topk(
+             tmp_scores, k=self.top_k, dim=-1, sorted=False,
+         )
++        native_topk_idx = topk_idx
++        forced_mask = None
++        forced_weight = None
++        if replay_topk_idx is not None:
++            forced_idx = replay_topk_idx.reshape(-1, self.top_k).to(
++                device=topk_idx.device,
++                dtype=topk_idx.dtype,
++            )
++            if forced_idx.shape != topk_idx.shape:
++                raise ValueError(
++                    f"R3 route shape {tuple(forced_idx.shape)} does not match "
++                    f"native route shape {tuple(topk_idx.shape)} at layer "
++                    f"{self.layer_idx}"
++                )
++            if replay_mask is None:
++                raise ValueError("full R3 replay requires an explicit replay mask")
++            forced_weight = replay_topk_weight.reshape(-1, self.top_k).to(
++                device=scores.device,
++                dtype=scores.dtype,
++            )
++            if forced_weight.shape != topk_idx.shape:
++                raise ValueError(
++                    f"R3 weight shape {tuple(forced_weight.shape)} does not match "
++                    f"native route shape {tuple(topk_idx.shape)} at layer "
++                    f"{self.layer_idx}"
++                )
++            forced_mask = replay_mask.reshape(-1).to(
++                device=topk_idx.device,
++                dtype=torch.bool,
++            )
++            if forced_mask.numel() != topk_idx.shape[0]:
++                raise ValueError(
++                    f"R3 mask rows {forced_mask.numel()} do not match route rows "
++                    f"{topk_idx.shape[0]} at layer {self.layer_idx}"
++                )
++            if forced_mask.any():
++                selected = forced_idx[forced_mask]
++                if selected.min() < 0 or selected.max() >= self.num_experts:
++                    raise ValueError(
++                        f"R3 expert ids out of range at layer {self.layer_idx}: "
++                        f"min={int(selected.min())} max={int(selected.max())} "
++                        f"num_experts={self.num_experts}"
++                    )
++                selected_weight = forced_weight[forced_mask]
++                if not bool(torch.isfinite(selected_weight).all()):
++                    raise ValueError(
++                        f"R3 weights contain NaN/Inf at layer {self.layer_idx}"
++                    )
++                if bool((selected_weight < 0).any()):
++                    raise ValueError(
++                        f"R3 weights contain negative values at layer {self.layer_idx}"
++                    )
++                if bool((selected_weight.sum(dim=-1) <= 0).any()):
++                    raise ValueError(
++                        f"R3 weights sum to zero at layer {self.layer_idx}"
++                    )
++                if self.moe_renormalize:
++                    selected_sums = selected_weight.float().sum(dim=-1)
++                    expected_sum = float(self.routed_scaling_factor)
++                    tolerance = max(abs(expected_sum) * 0.02, 0.02)
++                    close = torch.isclose(
++                        selected_sums,
++                        torch.full_like(selected_sums, expected_sum),
++                        rtol=0.0,
++                        atol=tolerance,
++                    )
++                    if not bool(close.all()):
++                        raise ValueError(
++                            "R3 weights violate normalized router sum at layer "
++                            f"{self.layer_idx}: actual="
++                            f"{selected_sums[~close].tolist()}, "
++                            f"expected={expected_sum}, tolerance={tolerance}"
++                        )
++            topk_idx = torch.where(forced_mask.unsqueeze(1), forced_idx, topk_idx)
+         topk_weight = scores.gather(1, topk_idx)
++        pre_normalization_topk_weight = topk_weight
+ 
+         # norm gate to sum 1
+         if self.top_k > 1 and self.moe_renormalize:
+@@ -886,6 +1106,89 @@ class KimiMoEGate(nn.Module):
+         # must multiply the scaling factor
+         topk_weight = topk_weight * self.routed_scaling_factor
+ 
++        if forced_mask is not None:
++            local_topk_weight = topk_weight
++            # Match rollout values in the forward pass while retaining the
++            # actor router's local derivative.  Replacing topk_weight with a
++            # detached replay tensor outright would silently freeze the gate
++            # on every replayed row during PPO updates.
++            replay_weight_st = forced_weight + (
++                topk_weight - topk_weight.detach()
++            )
++            topk_weight = torch.where(
++                forced_mask.unsqueeze(1), replay_weight_st, topk_weight
++            )
++            if bool(forced_mask.any()):
++                global _KIMI_FULL_R3_GATE_LOGGED
++                if not _KIMI_FULL_R3_GATE_LOGGED:
++                    replayed_ids = topk_idx[forced_mask]
++                    expected_ids = forced_idx[forced_mask]
++                    replayed_weights = topk_weight[forced_mask]
++                    expected_weights = forced_weight[forced_mask]
++                    if not torch.equal(replayed_ids, expected_ids):
++                        raise RuntimeError(
++                            "Kimi full R3 gate failed to return the replayed expert IDs"
++                        )
++                    if not torch.equal(replayed_weights, expected_weights):
++                        max_difference = float(
++                            (replayed_weights - expected_weights)
++                            .abs()
++                            .max()
++                            .item()
++                        )
++                        raise RuntimeError(
++                            "Kimi full R3 gate failed to return the replayed "
++                            f"weights exactly: max_abs_diff={max_difference}"
++                        )
++
++                    native_ids = native_topk_idx[forced_mask]
++                    native_overlap = (
++                        expected_ids.unsqueeze(-1)
++                        == native_ids.unsqueeze(-2)
++                    ).any(dim=-1).float().mean()
++                    local_weight_abs_diff = (
++                        expected_weights
++                        - local_topk_weight[forced_mask].detach()
++                    ).abs()
++                    forced_pre_normalization = (
++                        pre_normalization_topk_weight[forced_mask]
++                        .detach()
++                        .float()
++                    )
++                    forced_pre_normalization_sums = (
++                        forced_pre_normalization.sum(dim=-1)
++                    )
++                    tiny = torch.finfo(forced_pre_normalization.dtype).tiny
++                    zero_or_subnormal_rows = int(
++                        (forced_pre_normalization_sums <= tiny).sum().item()
++                    )
++                    rank = (
++                        torch.distributed.get_rank()
++                        if torch.distributed.is_initialized()
++                        else 0
++                    )
++                    marker = (
++                        "Kimi MoE full R3 GATE REPLAY ACTIVE: "
++                        f"rank={rank} layer={self.layer_idx} "
++                        f"replay_rows={int(forced_mask.sum().item())} "
++                        f"topk={self.top_k} external_ids=True "
++                        "external_weights=True straight_through_grad=True "
++                        "forward_ids_exact=True forward_weights_exact=True "
++                        f"native_topk_overlap={float(native_overlap.item()):.6f} "
++                        "local_weight_abs_diff_mean="
++                        f"{float(local_weight_abs_diff.mean().item()):.8f} "
++                        "local_weight_abs_diff_max="
++                        f"{float(local_weight_abs_diff.max().item()):.8f} "
++                        "local_forced_score_sum_min="
++                        f"{float(forced_pre_normalization_sums.min().item()):.8e} "
++                        "local_forced_score_zero_or_subnormal_rows="
++                        f"{zero_or_subnormal_rows} "
++                        f"weight_dtype={replay_topk_weight.dtype}"
++                    )
++                    logger.warning(marker)
++                    print(marker, flush=True)
++                    _KIMI_FULL_R3_GATE_LOGGED = True
++
+         return topk_idx, topk_weight
+ 
+ 
+@@ -898,6 +1201,7 @@ class KimiSparseMoeBlock(nn.Module):
+     def __init__(self, config: KimiLinearConfig):
+         super().__init__()
+         self.config = config
++        self.layer_idx = -1
+         self.hidden_dim = config.hidden_size
+         self.num_experts = config.num_experts
+         self.top_k = config.num_experts_per_token
+@@ -942,10 +1246,21 @@ class KimiSparseMoeBlock(nn.Module):
+                     self.moe_hidden_size, eps=config.rms_norm_eps,
+                 )
+ 
+-    def forward(self, hidden_states):
++    def forward(
++        self,
++        hidden_states,
++        replay_topk_idx: torch.Tensor | None = None,
++        replay_topk_weight: torch.Tensor | None = None,
++        replay_mask: torch.Tensor | None = None,
++    ):
+         identity = hidden_states
+         orig_shape = hidden_states.shape
+-        topk_idx, topk_weight = self.gate(hidden_states)
++        topk_idx, topk_weight = self.gate(
++            hidden_states,
++            replay_topk_idx=replay_topk_idx,
++            replay_topk_weight=replay_topk_weight,
++            replay_mask=replay_mask,
++        )
+         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+ 
+         if self.use_latent_moe:
+@@ -1026,6 +1341,8 @@ class KimiDecoderLayer(nn.Module):
+             and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
+         ):
+             self.block_sparse_moe = KimiSparseMoeBlock(config)
++            self.block_sparse_moe.layer_idx = layer_idx
++            self.block_sparse_moe.gate.layer_idx = layer_idx
+         else:
+             self.mlp = KimiMLP(config)
+         self.input_layernorm = KimiRMSNorm(
+@@ -1057,11 +1374,20 @@ class KimiDecoderLayer(nn.Module):
+         block_residual: torch.Tensor | None = None,
+         **kwargs: Unpack[FlashAttentionKwargs],
+     ):
++        replay_topk_idx = kwargs.pop("replay_topk_idx", None)
++        replay_topk_weight = kwargs.pop("replay_topk_weight", None)
++        replay_mask = kwargs.pop("router_replay_mask", None)
+         if self.use_attn_residuals:
+-            return self._forward_attn_residual(
++            result = self._forward_attn_residual(
+                 hidden_states, attention_mask, position_ids,
+                 past_key_values, output_attentions, use_cache,
+-                block_residual, **kwargs)
++                block_residual,
++                replay_topk_idx=replay_topk_idx,
++                replay_topk_weight=replay_topk_weight,
++                router_replay_mask=replay_mask,
++                **kwargs,
++            )
++            return result
+ 
+         residual = hidden_states
+ 
+@@ -1093,7 +1419,12 @@ class KimiDecoderLayer(nn.Module):
+         residual = hidden_states
+         hidden_states = self.post_attention_layernorm(hidden_states)
+         if hasattr(self, "block_sparse_moe"):
+-            hidden_states = self.block_sparse_moe(hidden_states)
++            hidden_states = self.block_sparse_moe(
++                hidden_states,
++                replay_topk_idx=replay_topk_idx,
++                replay_topk_weight=replay_topk_weight,
++                replay_mask=replay_mask,
++            )
+         else:
+             hidden_states = self.mlp(hidden_states)
+         hidden_states = residual + hidden_states
+@@ -1111,6 +1442,9 @@ class KimiDecoderLayer(nn.Module):
+         block_residual: torch.Tensor | None = None,
+         **kwargs: Unpack[FlashAttentionKwargs],
+     ):
++        replay_topk_idx = kwargs.pop("replay_topk_idx", None)
++        replay_topk_weight = kwargs.pop("replay_topk_weight", None)
++        replay_mask = kwargs.pop("router_replay_mask", None)
+         batch_size, seq_len, hidden_size = hidden_states.shape
+         prefix_sum = hidden_states
+ 
+@@ -1140,6 +1474,7 @@ class KimiDecoderLayer(nn.Module):
+                 use_cache=use_cache,
+                 **kwargs,
+             )
++
+         else:
+             hidden_states = self.self_attn(
+                 hidden_states=hidden_states,
+@@ -1161,10 +1496,14 @@ class KimiDecoderLayer(nn.Module):
+             self.mlp_res_proj,
+             self.mlp_res_norm,
+         ).view(batch_size, seq_len, hidden_size)
+-
+         hidden_states = self.post_attention_layernorm(hidden_states)
+         if hasattr(self, "block_sparse_moe"):
+-            hidden_states = self.block_sparse_moe(hidden_states)
++            hidden_states = self.block_sparse_moe(
++                hidden_states,
++                replay_topk_idx=replay_topk_idx,
++                replay_topk_weight=replay_topk_weight,
++                replay_mask=replay_mask,
++            )
+         else:
+             hidden_states = self.mlp(hidden_states)
+ 
+@@ -1294,6 +1633,9 @@ class KimiLinearModel(KimiPreTrainedModel):
+     ) -> tuple | BaseModelOutputWithPast:
+ 
+         use_cache = use_cache if use_cache is not None else self.config.use_cache
++        routed_experts = kwargs.pop("routed_experts", None)
++        routed_expert_weights = kwargs.pop("routed_expert_weights", None)
++        router_replay_mask = kwargs.pop("router_replay_mask", None)
+ 
+         if (input_ids is None) and (inputs_embeds is None):
+             raise ValueError(
+@@ -1303,6 +1645,53 @@ class KimiLinearModel(KimiPreTrainedModel):
+         if inputs_embeds is None:
+             inputs_embeds = self.embed_tokens(input_ids)
+ 
++        if (
++            routed_experts is not None
++            or routed_expert_weights is not None
++            or router_replay_mask is not None
++        ):
++            if (
++                routed_experts is None
++                or routed_expert_weights is None
++                or router_replay_mask is None
++            ):
++                raise ValueError(
++                    "routed_experts, routed_expert_weights, and "
++                    "router_replay_mask must be provided together"
++                )
++            if routed_experts.dim() != 4:
++                raise ValueError(
++                    "routed_experts must be [batch, model_rows, layers, topk], "
++                    f"got {tuple(routed_experts.shape)}"
++                )
++            if routed_experts.shape[:2] != inputs_embeds.shape[:2]:
++                raise ValueError(
++                    "R3 route rows must exactly match decoder input rows: "
++                    f"routes={tuple(routed_experts.shape[:2])}, "
++                    f"hidden={tuple(inputs_embeds.shape[:2])}"
++                )
++            if routed_experts.shape[2] < len(self.layers):
++                raise ValueError(
++                    f"R3 layer axis {routed_experts.shape[2]} is shorter than "
++                    f"model layers {len(self.layers)}"
++                )
++            if routed_expert_weights.shape != routed_experts.shape:
++                raise ValueError(
++                    "R3 weights must be elementwise aligned with expert IDs: "
++                    f"ids={tuple(routed_experts.shape)}, "
++                    f"weights={tuple(routed_expert_weights.shape)}"
++                )
++            if not routed_expert_weights.is_floating_point():
++                raise TypeError(
++                    "R3 routed_expert_weights must be floating point, got "
++                    f"{routed_expert_weights.dtype}"
++                )
++            if router_replay_mask.shape != routed_experts.shape[:2]:
++                raise ValueError(
++                    f"R3 mask shape {tuple(router_replay_mask.shape)} does not "
++                    f"match route rows {tuple(routed_experts.shape[:2])}"
++                )
++
+         if use_cache and past_key_values is None:
+             past_key_values = KimiDynamicCache(config=self.config)
+ 
+@@ -1339,6 +1728,16 @@ class KimiLinearModel(KimiPreTrainedModel):
+ 
+         for decoder_layer in self.layers:
+             layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
++            replay_topk_idx = (
++                routed_experts[:, :, decoder_layer.layer_idx, :]
++                if routed_experts is not None
++                else None
++            )
++            replay_topk_weight = (
++                routed_expert_weights[:, :, decoder_layer.layer_idx, :]
++                if routed_expert_weights is not None
++                else None
++            )
+ 
+             if self.use_attn_residuals:
+                 hidden_states, block_residual = decoder_layer(
+@@ -1347,6 +1746,9 @@ class KimiLinearModel(KimiPreTrainedModel):
+                     past_key_values=past_key_values,
+                     cache_position=cache_position,
+                     block_residual=block_residual,
++                    replay_topk_idx=replay_topk_idx,
++                    replay_topk_weight=replay_topk_weight,
++                    router_replay_mask=router_replay_mask,
+                     **kwargs,
+                 )
+             else:
+@@ -1355,6 +1757,9 @@ class KimiLinearModel(KimiPreTrainedModel):
+                     attention_mask=layer_mask,
+                     past_key_values=past_key_values,
+                     cache_position=cache_position,
++                    replay_topk_idx=replay_topk_idx,
++                    replay_topk_weight=replay_topk_weight,
++                    router_replay_mask=router_replay_mask,
+                     **kwargs,
+                 )
+ 
+@@ -1457,6 +1862,7 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
+             output_hidden_states=output_hidden_states,
+             return_dict=return_dict,
+             cache_position=cache_position,
++            **kwargs,
+         )
+ 
+         # Modification start: return hidden_states to the top-level model for
+diff --git a/fsdp_turbo/models/kimi_k3/ops/gdn/triton/convolution.py b/fsdp_turbo/models/kimi_k3/ops/gdn/triton/convolution.py
+index 30eba6c..ab5176c 100644
+--- a/fsdp_turbo/models/kimi_k3/ops/gdn/triton/convolution.py
++++ b/fsdp_turbo/models/kimi_k3/ops/gdn/triton/convolution.py
+@@ -524,6 +524,7 @@ def causal_conv1d_fwd_impl(
+     output_final_state: bool = False,
+     activation: Optional[str] = None,
+     cu_seqlens: Optional[torch.Tensor] = None,
++    precomputed_chunk_indices: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     shape = x.shape
+     if x.shape[-1] != weight.shape[-1]:
+@@ -545,9 +546,26 @@ def causal_conv1d_fwd_impl(
+     NUM_BLKS_D = triton.cdiv(D, BD)
+ 
+     if cu_seqlens is not None:
+-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
++        # Building the general varlen table calls ``cu_seqlens.tolist()`` and
++        # therefore performs a device-to-host synchronization.  That is fine
++        # for actor training and eager prefill, but illegal while vLLM captures
++        # a decode ACL graph.  Decode has one token (and consequently exactly
++        # one chunk) per sequence, so its caller can provide the static [N, 2]
++        # table without changing the Triton kernel or its numerical behavior.
++        chunk_indices = precomputed_chunk_indices
++        if chunk_indices is None:
++            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
++        elif chunk_indices.ndim != 2 or chunk_indices.shape[1] != 2:
++            raise ValueError(
++                "precomputed_chunk_indices must have shape [num_chunks, 2], "
++                f"got {tuple(chunk_indices.shape)}"
++            )
+         NUM_CHKS = len(chunk_indices)
+     else:
++        if precomputed_chunk_indices is not None:
++            raise ValueError(
++                "precomputed_chunk_indices requires cu_seqlens"
++            )
+         chunk_indices = None
+ 
+         NUM_CHKS = triton.cdiv(T, BT) * B
+diff --git a/fsdp_turbo/models/kimi_k3/ops/kda/short_conv.py b/fsdp_turbo/models/kimi_k3/ops/kda/short_conv.py
+index 33a2568..4b6ac80 100644
+--- a/fsdp_turbo/models/kimi_k3/ops/kda/short_conv.py
++++ b/fsdp_turbo/models/kimi_k3/ops/kda/short_conv.py
+@@ -171,10 +171,20 @@ class ShortConvolution(nn.Conv1d):
+             )
+             self.backend = 'triton'
+ 
++        # K3 checkpoints keep short-convolution weights in FP32, while the
++        # vLLM-Ascend contract casts them to the BF16 activation dtype before
++        # its causal-conv AscendC kernel. Match that contract here as well;
++        # otherwise FSDP and rollout use different convolution arithmetic.
++        conv_weight = rearrange(self.weight, "d 1 w -> w d")
++        if conv_weight.dtype != x.dtype:
++            conv_weight = conv_weight.to(dtype=x.dtype)
++        conv_bias = self.bias
++        if conv_bias is not None and conv_bias.dtype != x.dtype:
++            conv_bias = conv_bias.to(dtype=x.dtype)
+         return causal_conv1d(
+             x=x,
+-            weight=rearrange(self.weight, "d 1 w -> w d"),  # NOTE： 修改了权重格式
+-            bias=self.bias,
++            weight=conv_weight,
++            bias=conv_bias,
+             residual=residual,
+             initial_state=cache,
+             output_final_state=output_final_state,
+@@ -201,13 +211,16 @@ class ShortConvolution(nn.Conv1d):
+         if cache is None:
+             cache = x.new_zeros(N, D, W)
+         # NOTE: we follow the fast mode that updates the cache in-place
++        conv_weight = rearrange(self.weight, "d 1 w -> d w")
++        if conv_weight.dtype != x.dtype:
++            conv_weight = conv_weight.to(dtype=x.dtype)
+         if self.backend == 'triton':
+             y, cache = causal_conv1d_update(
+                 x=x,
+                 cache=cache,
+                 residual=residual,
+-                weight=rearrange(self.weight, "d 1 w -> d w"),
+-                bias=self.bias,
++                weight=conv_weight,
++                bias=self.bias.to(dtype=x.dtype) if self.bias is not None and self.bias.dtype != x.dtype else self.bias,
+                 activation=self.activation,
+             )
+             return y, (cache if output_final_state else None)
+diff --git a/fsdp_turbo/training/clip_grads.py b/fsdp_turbo/training/clip_grads.py
+index 785a0eb..5218b01 100644
+--- a/fsdp_turbo/training/clip_grads.py
++++ b/fsdp_turbo/training/clip_grads.py
+@@ -13,7 +13,7 @@ before computation, and the total norm is synchronized across the
+ sharding group(s) via ``all_reduce``.
+ """
+ 
+-from collections import defaultdict
++import math
+ from typing import Optional, Union
+ 
+ import torch
+@@ -100,54 +100,53 @@ def compute_grad_norm(
+     """
+     if isinstance(parameters, torch.Tensor):
+         parameters = [parameters]
++    norm_type = float(norm_type)
+ 
+-    # Group parameters by their shard-group signature so that gradients
+-    # sharing the same set of sharded mesh dimensions can be aggregated
+-    # locally before a single all-reduce per group.  This is required
+-    # because a parameter that is *Replicate* along a dimension must NOT
+-    # be summed across that dimension (otherwise its contribution is
+-    # multiplied by the group size).  Each group is reduced only along
+-    # the dimensions its members are actually sharded on.
+-    grouped_grads = defaultdict(list)
++    # Group scalar partial norms by shard-group signature.  Do not retain
++    # FP32 copies of every gradient: for large models that temporarily
++    # doubles the complete local gradient footprint until clipping ends.
++    # ``vector_norm(..., dtype=float32)`` performs the reduction in FP32
++    # while materializing only a scalar result for each tensor.
++    grouped_partials = {}
+     grouped_groups = {}
+     for p in parameters:
+         if p.grad is not None:
+-            local_g = _to_local_if_dtensor(p.grad).detach().float()
++            local_g = _to_local_if_dtensor(p.grad).detach()
+             shard_groups = _get_shard_groups_if_dtensor(p.grad, group)
+             sig = tuple(id(g) for g in shard_groups)
+-            grouped_grads[sig].append(local_g)
+             grouped_groups[sig] = shard_groups
+-
+-    if not grouped_grads:
++            if norm_type == inf:
++                partial = local_g.abs().max().to(torch.float).reshape(())
++                if sig in grouped_partials:
++                    grouped_partials[sig] = torch.maximum(grouped_partials[sig], partial)
++                else:
++                    grouped_partials[sig] = partial
++            else:
++                partial = torch.linalg.vector_norm(local_g, ord=norm_type, dtype=torch.float32) ** norm_type
++                if sig in grouped_partials:
++                    grouped_partials[sig] += partial
++                else:
++                    grouped_partials[sig] = partial
++
++    if not grouped_partials:
+         return 0.0
+ 
+-    norm_type = float(norm_type)
+-    device = next(iter(grouped_grads.values()))[0].device
++    device = next(iter(grouped_partials.values())).device
+ 
+     if norm_type == inf:
+         # For each group: local max over its members, all-reduce MAX across
+         # every sharded dimension, then take the global max across groups.
+         global_max = torch.zeros((), dtype=torch.float, device=device)
+-        for sig, grads in grouped_grads.items():
+-            local_max = max(g.abs().max() for g in grads)
+-            local_max_t = local_max.to(torch.float).reshape(())
++        for sig, local_max in grouped_partials.items():
+             for grp in grouped_groups[sig]:
+-                torch.distributed.all_reduce(local_max_t, op=torch.distributed.ReduceOp.MAX, group=grp)
+-            global_max = torch.max(global_max, local_max_t)
++                torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=grp)
++            global_max = torch.maximum(global_max, local_max)
+         return global_max.item()
+ 
+-    # General p-norm: for each group, sum local ||grad||^p over its members,
+-    # all-reduce SUM across every sharded dimension, then accumulate across
+-    # groups.
++    # General p-norm: each group already holds the sum of local ||grad||^p
++    # scalars. Reduce those scalars across the dimensions that shard them.
+     total_sum = torch.zeros((), dtype=torch.float, device=device)
+-    for sig, grads in grouped_grads.items():
+-        local_sum = torch.zeros((), dtype=torch.float, device=device)
+-        if norm_type == 2.0:
+-            for g in grads:
+-                local_sum += g.norm() ** 2
+-        else:
+-            for g in grads:
+-                local_sum += g.norm(norm_type) ** norm_type
++    for sig, local_sum in grouped_partials.items():
+         for grp in grouped_groups[sig]:
+             torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM, group=grp)
+         total_sum += local_sum
+@@ -162,9 +161,14 @@ def clip_grad_by_norm(
+ ) -> None:
+     """Clip gradients in-place so that their total norm <= ``max_norm``.
+ 
+-    This is a **no-op** when ``total_norm <= max_norm``.
+-    DTensor gradients are clipped on their local shards directly
+-    (the clip coefficient is the same on every rank after all-reduce).
++    This is a **no-op** when ``total_norm`` is zero, non-finite, or already
++    below ``max_norm``.  A NaN/Inf norm must be handled by the caller's
++    explicit skip/fail-fast policy; multiplying otherwise-finite gradients by
++    a NaN coefficient destroys the evidence needed to locate the original
++    failing tensor.
++
++    DTensor gradients are clipped on their local shards directly (the clip
++    coefficient is the same on every rank after all-reduce).
+ 
+     Args:
+         parameters: Model parameters whose ``.grad`` will be scaled.
+@@ -172,7 +176,7 @@ def clip_grad_by_norm(
+         total_norm: The current total gradient norm (as returned by
+             :func:`compute_grad_norm`).
+     """
+-    if total_norm == 0.0 or max_norm <= 0.0:
++    if not math.isfinite(total_norm) or total_norm == 0.0 or max_norm <= 0.0:
+         return
+ 
+     clip_coeff = max_norm / (total_norm + 1e-6)
+@@ -207,8 +211,8 @@ def clip_grad_norm(
+         max_norm: Maximum allowed total gradient norm.
+         norm_type: Type of the p-norm. Defaults to 2.0.
+         group: Process group for all-reducing the gradient norm
+-            across sharding ranks.  If ``None`` and DTensor
+-            gradients are present, the group is inferred automatically.
++            across sharding ranks.  If ``None`` and DTensor gradients
++            are present, the group is inferred automatically.
+ 
+     Returns:
+         The total gradient norm **before** clipping (as a float),
+diff --git a/tests/distributed/test_efsdp_ep_ownership.py b/tests/distributed/test_efsdp_ep_ownership.py
+new file mode 100644
+index 0000000..5550d0e
+--- /dev/null
++++ b/tests/distributed/test_efsdp_ep_ownership.py
+@@ -0,0 +1,66 @@
++from types import SimpleNamespace
++import unittest
++
++import torch
++
++from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import (
++    _validate_efsdp_ep_ownership,
++    _validate_fsdp_ep_collective_boundaries,
++)
++
++
++class _Moe(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.experts = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
++        self.gate = torch.nn.Linear(2, 2)
++        self.shared_experts = torch.nn.Linear(2, 2)
++
++
++class _Model(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.moe = _Moe()
++
++
++class TestEfsdpEpOwnership(unittest.TestCase):
++    def setUp(self):
++        self.model = _Model()
++        self.plan = SimpleNamespace(apply_modules=["moe.experts"])
++
++    def test_ep_module_and_descendants_are_valid(self):
++        _validate_efsdp_ep_ownership(
++            self.model,
++            self.plan,
++            [self.model.moe.experts, self.model.moe.experts[0]],
++        )
++
++    def test_replicated_moe_module_is_rejected(self):
++        with self.assertRaisesRegex(RuntimeError, "moe.shared_experts"):
++            _validate_efsdp_ep_ownership(
++                self.model,
++                self.plan,
++                [self.model.moe.experts, self.model.moe.shared_experts],
++            )
++
++    def test_enclosing_world_fsdp_boundary_is_safe(self):
++        topology = _validate_fsdp_ep_collective_boundaries(
++            self.model,
++            self.plan,
++            SimpleNamespace(apply_modules={"moe": {}}),
++        )
++        self.assertEqual(topology["ep_targets"], 1)
++        self.assertEqual(topology["enclosed_ep_targets"], 1)
++        self.assertEqual(topology["interleaved_targets"], 0)
++
++    def test_replicated_child_world_fsdp_boundary_is_rejected(self):
++        with self.assertRaisesRegex(RuntimeError, "moe.shared_experts"):
++            _validate_fsdp_ep_collective_boundaries(
++                self.model,
++                self.plan,
++                SimpleNamespace(apply_modules={"moe.shared_experts": {}}),
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/training/test_clip_grads_nonfinite.py b/tests/training/test_clip_grads_nonfinite.py
+new file mode 100644
+index 0000000..c082e19
+--- /dev/null
++++ b/tests/training/test_clip_grads_nonfinite.py
+@@ -0,0 +1,44 @@
++import importlib.util
++import math
++from pathlib import Path
++
++import pytest
++import torch
++
++
++_MODULE_PATH = (
++    Path(__file__).resolve().parents[2]
++    / "fsdp_turbo"
++    / "training"
++    / "clip_grads.py"
++)
++_SPEC = importlib.util.spec_from_file_location("kimi_test_clip_grads", _MODULE_PATH)
++clip_grads = importlib.util.module_from_spec(_SPEC)
++assert _SPEC.loader is not None
++_SPEC.loader.exec_module(clip_grads)
++
++
++@pytest.mark.parametrize("total_norm", [math.nan, math.inf, -math.inf])
++def test_nonfinite_norm_does_not_poison_finite_gradients(total_norm):
++    parameter = torch.nn.Parameter(torch.ones(4))
++    parameter.grad = torch.tensor([1.0, -2.0, 3.0, -4.0])
++    original = parameter.grad.clone()
++
++    clip_grads.clip_grad_by_norm([parameter], max_norm=1.0, total_norm=total_norm)
++
++    torch.testing.assert_close(parameter.grad, original)
++    assert torch.isfinite(parameter.grad).all()
++
++
++def test_finite_norm_is_still_clipped():
++    parameter = torch.nn.Parameter(torch.ones(2))
++    parameter.grad = torch.tensor([3.0, 4.0])
++
++    clip_grads.clip_grad_by_norm([parameter], max_norm=1.0, total_norm=5.0)
++
++    torch.testing.assert_close(
++        parameter.grad,
++        torch.tensor([0.6, 0.8]),
++        rtol=1e-5,
++        atol=1e-6,
++    )
+diff --git a/tests/unit_tests/training/test_clip_grads.py b/tests/unit_tests/training/test_clip_grads.py
+new file mode 100644
+index 0000000..cac090e
+--- /dev/null
++++ b/tests/unit_tests/training/test_clip_grads.py
+@@ -0,0 +1,30 @@
++import math
++
++import pytest
++import torch
++
++from fsdp_turbo.training.clip_grads import compute_grad_norm
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("norm_type", [1.0, 1.5, 2.0, float("inf")])
++def test_compute_grad_norm_matches_flat_fp32_reference(dtype, norm_type):
++    generator = torch.Generator().manual_seed(7)
++    parameters = []
++    flat_grads = []
++    for shape in ((13, 17), (9,), (2, 3, 5)):
++        parameter = torch.nn.Parameter(torch.empty(shape, dtype=dtype))
++        parameter.grad = torch.randn(shape, generator=generator, dtype=torch.float32).to(dtype)
++        parameters.append(parameter)
++        flat_grads.append(parameter.grad.float().reshape(-1))
++
++    actual = compute_grad_norm(parameters, norm_type)
++    expected = torch.linalg.vector_norm(
++        torch.cat(flat_grads), ord=norm_type, dtype=torch.float32
++    ).item()
++
++    assert math.isclose(actual, expected, rel_tol=2e-6, abs_tol=2e-6)
++
++
++def test_compute_grad_norm_without_gradients_is_zero():
++    assert compute_grad_norm([torch.nn.Parameter(torch.ones(3))]) == 0.0
