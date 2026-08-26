@@ -29,7 +29,6 @@ from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutCo
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
 
-
 @dataclass
 class TensorMeta:
     name: str

@@ -69,7 +69,7 @@ def gather_from_labels(data: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def logprobs_from_logits(logits, labels, inplace_backward=True):
+def logprobs_from_logits(logits, labels, inplace_backward=True, force_fp32=False):
     """
     Compute per-token log-probabilities for the given labels.
 
@@ -82,10 +82,19 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
         logits (Tensor): Model outputs of shape (..., vocab_size).
         labels (LongTensor): True class indices of shape matching logits[..., :-1].
         inplace_backward (bool): If True and Flash-Attn is available, perform backward in-place.
+        force_fp32 (bool): Compute the returned log-probabilities in FP32. On NPU
+            this uses chunked FP32 cross-entropy so the full vocabulary logits are
+            not duplicated at once.
 
     Returns:
         Tensor: Log-probabilities of the target labels, shape logits.shape[:-1].
     """
+    if force_fp32:
+        if NPU_CROSS_ENTROPY_LOSS_AVAILABLE and logits.device.type == "npu":
+            return logprobs_from_logits_torch_npu(logits, labels, force_fp32=True)
+        # Keep the fallback numerically consistent when running outside NPU.
+        logits = logits.float()
+
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         batch_dim = logits.shape[:-1]
         last_dim = logits.shape[-1]
@@ -93,7 +102,7 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
         labels = labels.reshape(-1)
         output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
         output = output.view(*batch_dim)
-    elif NPU_CROSS_ENTROPY_LOSS_AVAILABLE:
+    elif NPU_CROSS_ENTROPY_LOSS_AVAILABLE and logits.device.type == "npu":
         output = logprobs_from_logits_torch_npu(logits, labels)
     else:
         output = logprobs_from_logits_v2(logits, labels)
@@ -126,7 +135,9 @@ def logprobs_from_logits_flash_attn(
     return -output[0]
 
 
-def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def logprobs_from_logits_torch_npu(
+    logits: torch.Tensor, labels: torch.Tensor, force_fp32: bool = False, chunk_size: int = 1024
+) -> torch.Tensor:
     """Compute log-probabilities using Ascend NPU's optimized cross-entropy.
 
     Uses torch_npu's native cross-entropy implementation for efficient
@@ -141,7 +152,24 @@ def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -
     """
     batch_dim = logits.shape[:-1]
     logits = logits.reshape(-1, logits.shape[-1])
-    loss, _, _, _ = torch_npu.npu_cross_entropy_loss(logits, labels.reshape(-1), reduction="none")
+    labels = labels.reshape(-1)
+
+    if force_fp32:
+        if logits.shape[0] == 0:
+            return logits.new_empty(batch_dim, dtype=torch.float32)
+        output_chunks = []
+        for start in range(0, logits.shape[0], chunk_size):
+            end = min(start + chunk_size, logits.shape[0])
+            # Only the active chunk is promoted, keeping the extra HBM bounded
+            # by chunk_size * vocab_size instead of the complete micro-batch.
+            chunk_logits = logits[start:end].float()
+            loss, _, _, _ = torch_npu.npu_cross_entropy_loss(
+                chunk_logits, labels[start:end], reduction="none"
+            )
+            output_chunks.append(-loss)
+        return torch.cat(output_chunks, dim=0).view(*batch_dim)
+
+    loss, _, _, _ = torch_npu.npu_cross_entropy_loss(logits, labels, reduction="none")
     return -loss.view(*batch_dim)
 
 

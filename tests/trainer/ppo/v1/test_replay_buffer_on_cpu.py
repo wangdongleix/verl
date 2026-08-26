@@ -383,6 +383,37 @@ def test_sync_failure_without_trajectories_uses_padding_path_by_default(tq_init,
         _clear_partition(partition_id)
 
 
+def test_sync_failure_discards_partial_trajectory_without_seq_len(tq_init, partition_id):
+    uid = _uid()
+    complete_key = _trajectory_key(uid, 0)
+    incomplete_key = _trajectory_key(uid, 1)
+    tq.kv_put(
+        key=complete_key,
+        partition_id=partition_id,
+        fields={"input_ids": torch.tensor([1, 2, 3])},
+        tag={"is_prompt": False, "seq_len": 3, "global_steps": 0},
+    )
+    # Reproduce a metadata row left behind when TQ data serialization fails.
+    tq.kv_put(
+        key=incomplete_key,
+        partition_id=partition_id,
+        tag={"is_prompt": False, "status": "success", "global_steps": 0},
+    )
+    _set_prompt_status(partition_id, uid, "failure")
+
+    rb = _make_rb()
+    try:
+        batch, metrics = rb.sample(global_steps=0, partition_id=partition_id, batch_size=1)
+
+        assert batch.keys == [complete_key]
+        assert all(tag["seq_len"] > 0 for tag in batch.tags)
+        assert metrics == {}
+        remaining = tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        assert incomplete_key not in remaining
+    finally:
+        _clear_partition(partition_id)
+
+
 def test_sync_all_empty_failures_raise_without_refill(tq_init, partition_id):
     failures = [PromptSpec(uid=_uid(), status="failure", sessions=0) for _ in range(2)]
     _produce(partition_id, failures).join_and_check()

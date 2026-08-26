@@ -21,6 +21,12 @@ from verl.utils.device import get_device_name, is_npu_available
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# ``export_kimi_packed_local_param`` keeps a target-layout expert offset in
+# the transport name so that it can stream a local packed tensor without
+# materializing all experts. Kimi's vLLM model consumes this ABI directly;
+# legacy callers may still expand it into per-expert checkpoint keys.
+_KIMI_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
+
 
 def apply_npu_fsdp_patches(model_config=None):
     """Apply NPU patches for FSDP backend if NPU is available."""
@@ -99,6 +105,69 @@ def unfuse_moe_params(weights, model_type: str | None = None):
     weight sync, so stream those keys without materializing a full dict.
     """
     for name, tensor in weights:
+        if _KIMI_PACKED_LOCAL_MARKER in name:
+            packed_name, _, offset_text = name.rpartition(_KIMI_PACKED_LOCAL_MARKER)
+            try:
+                expert_offset = int(offset_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid Kimi packed-local expert offset in parameter name: {name}"
+                ) from exc
+
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi packed-local parameter must be 3-D: {name}, shape={tuple(tensor.shape)}"
+                )
+
+            # Kimi's rollout loader has an offset-aware packed ABI that
+            # validates the target EP range and requires every local expert
+            # load to succeed. Preserve the marker so that strict loader and
+            # packed_received/packed_loaded auditing are actually exercised.
+            # Expanding here used the legacy permissive checkpoint path,
+            # silently bypassing both safeguards.
+            if model_type == "kimi_k3":
+                yield name, tensor
+                continue
+
+            if packed_name.endswith(".gate_up_proj"):
+                # Training packs the original checkpoint matrices as
+                # [experts, hidden, 2 * intermediate].  vLLM's Kimi loader
+                # consumes the original per-expert [intermediate, hidden]
+                # w1/w3 matrices and performs its own TP slicing.
+                base = packed_name.removesuffix(".gate_up_proj")
+                if tensor.size(2) % 2:
+                    raise ValueError(
+                        f"Kimi packed gate/up width must be even: {name}, shape={tuple(tensor.shape)}"
+                    )
+                intermediate_size = tensor.size(2) // 2
+                for local_expert_id in range(tensor.size(0)):
+                    expert_id = expert_offset + local_expert_id
+                    gate_up = tensor[local_expert_id]
+                    yield (
+                        f"{base}.{expert_id}.w1.weight",
+                        gate_up[:, :intermediate_size].transpose(0, 1).contiguous(),
+                    )
+                    yield (
+                        f"{base}.{expert_id}.w3.weight",
+                        gate_up[:, intermediate_size:].transpose(0, 1).contiguous(),
+                    )
+                continue
+
+            if packed_name.endswith(".down_proj"):
+                # Training stores down_proj as [experts, intermediate, hidden]
+                # so that each row is contiguous during EP resharding.  The
+                # checkpoint/vLLM contract is [hidden, intermediate] w2.
+                base = packed_name.removesuffix(".down_proj")
+                for local_expert_id in range(tensor.size(0)):
+                    expert_id = expert_offset + local_expert_id
+                    yield (
+                        f"{base}.{expert_id}.w2.weight",
+                        tensor[local_expert_id].transpose(0, 1).contiguous(),
+                    )
+                continue
+
+            raise ValueError(f"Unsupported Kimi packed-local parameter name: {name}")
+
         # GPT-OSS checkpoint weights use packed 3D expert tensors directly.
         # Splitting them into per-expert 2D tensors makes vLLM's GPT-OSS loader
         # index a 2D tensor as 3D during TP slicing.
@@ -121,3 +190,4 @@ def unfuse_moe_params(weights, model_type: str | None = None):
             continue
 
         yield name, tensor
+

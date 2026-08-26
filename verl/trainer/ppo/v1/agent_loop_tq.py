@@ -18,6 +18,7 @@
 import asyncio
 import logging
 import os
+from numbers import Integral
 from typing import Any
 
 import ray
@@ -36,6 +37,44 @@ from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+_TQ_MIN_INT = -(1 << 63)
+_TQ_MAX_INT = (1 << 64) - 1
+
+
+def _normalize_transfer_queue_ints(value: Any, path: str = "field") -> Any:
+    """Make non-tensor metadata safe for TransferQueue's integer wire type.
+
+    Model- and reward-produced metadata is untrusted: Python integers can have
+    arbitrary precision, while TransferQueue accepts only ``[-2**63, 2**64)``.
+    Preserve an out-of-range value losslessly as a decimal string and report its
+    field path.  Tensor payloads are deliberately left untouched.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Integral):
+        integer = int(value)
+        if _TQ_MIN_INT <= integer <= _TQ_MAX_INT:
+            return integer
+        logger.warning(
+            "TransferQueue metadata integer normalized to a decimal string: "
+            "path=%s bit_length=%d",
+            path,
+            integer.bit_length(),
+        )
+        return str(integer)
+    if isinstance(value, dict):
+        return {
+            _normalize_transfer_queue_ints(key, f"{path}.<key>"): _normalize_transfer_queue_ints(
+                item, f"{path}.{key}"
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_transfer_queue_ints(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, tuple):
+        return tuple(_normalize_transfer_queue_ints(item, f"{path}[{index}]") for index, item in enumerate(value))
+    return value
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -190,9 +229,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
 
-            keys.append(f"{uid}_{session_id}_{i}")
+            rollout_key = f"{uid}_{session_id}_{i}"
+            keys.append(rollout_key)
             field = output.as_dict()
             field.update(kwargs)
+            # ``uid`` intentionally remains the prompt/group id used by GRPO.
+            # Persist the unique TransferQueue row key separately so audit
+            # dumps can verify and sort rows without conflating the two ids.
+            field["rollout_key"] = rollout_key
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             # TODO: uniform response_mask and loss_mask
@@ -200,6 +244,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            # A reward plug-in can expose arbitrary-precision Python integers
+            # (for example, a hallucinated CountBench ``\\boxed{...}``).  Keep
+            # such audit metadata lossless without letting the TQ encoder abort
+            # the complete rollout batch.
+            field = _normalize_transfer_queue_ints(field, path=f"field[{rollout_key}]")
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(

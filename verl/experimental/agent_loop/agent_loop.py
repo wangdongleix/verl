@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.utils import tensordict_utils as tu
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -76,6 +77,118 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+KIMI_FULL_MODEL_ROUTE_SEMANTICS = "kimi_natural_rollout_full_model_rows_v1"
+
+
+def _validate_kimi_full_model_routes(
+    routes: torch.Tensor,
+    route_weights: torch.Tensor,
+    hf_config: Any,
+) -> None:
+    """Fail closed when a Kimi rollout contains incomplete full-R3 data.
+
+    Ascend may TP-shard ``topk_ids`` before the capturer sees it.  The broken
+    capture path left the missing shards as zeros; zero is a legal expert ID,
+    so a range check alone cannot detect that corruption.  Every real top-k
+    row contains distinct expert IDs, which gives us a cheap CPU-side
+    integrity check before the batch reaches an actor forward.
+    """
+    if routes.dim() != 3:
+        raise ValueError(
+            "Kimi full-model routes must be [model_rows, layers, topk], "
+            f"got {tuple(routes.shape)}"
+        )
+    if route_weights.shape != routes.shape:
+        raise ValueError(
+            "Kimi full-model route weights must be elementwise aligned with "
+            f"expert IDs, got ids={tuple(routes.shape)}, "
+            f"weights={tuple(route_weights.shape)}"
+        )
+    if not route_weights.is_floating_point():
+        raise TypeError(
+            "Kimi full-model route weights must be floating point, got "
+            f"{route_weights.dtype}"
+        )
+
+    text_config = getattr(hf_config, "text_config", hf_config)
+    expected_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
+    num_experts = int(getattr(text_config, "num_experts", 0) or 0)
+    expected_topk = int(getattr(text_config, "num_experts_per_token", 0) or 0)
+    first_dense = int(getattr(text_config, "first_k_dense_replace", 0) or 0)
+    moe_frequency = int(getattr(text_config, "moe_layer_freq", 1) or 1)
+    if expected_layers <= 0 or num_experts <= 0 or expected_topk <= 0:
+        raise ValueError(
+            "Kimi R3 requires positive num_hidden_layers, num_experts, and "
+            "num_experts_per_token in the model config"
+        )
+    if routes.shape[1:] != (expected_layers, expected_topk):
+        raise ValueError(
+            "Kimi route capture shape does not match the model config: "
+            f"routes={tuple(routes.shape)}, layers={expected_layers}, "
+            f"topk={expected_topk}"
+        )
+    if routes.shape[0] == 0:
+        return
+
+    moe_layers = [
+        layer_idx
+        for layer_idx in range(expected_layers)
+        if layer_idx >= first_dense and layer_idx % moe_frequency == 0
+    ]
+    if not moe_layers:
+        return
+    moe_routes = routes[:, moe_layers, :].to(dtype=torch.long)
+    moe_weights = route_weights[:, moe_layers, :].to(dtype=torch.float32)
+    minimum = int(moe_routes.min().item())
+    maximum = int(moe_routes.max().item())
+    if minimum < 0 or maximum >= num_experts:
+        raise ValueError(
+            "Kimi route capture contains an out-of-range expert ID: "
+            f"min={minimum}, max={maximum}, num_experts={num_experts}"
+        )
+
+    ordered = torch.sort(moe_routes, dim=-1).values
+    duplicate = ordered[..., 1:] == ordered[..., :-1]
+    if bool(duplicate.any()):
+        bad = torch.nonzero(duplicate, as_tuple=False)[0]
+        response_row = int(bad[0].item())
+        moe_layer_offset = int(bad[1].item())
+        layer_idx = moe_layers[moe_layer_offset]
+        raise ValueError(
+            "Kimi route capture contains duplicate top-k expert IDs; this "
+            "usually means TP shards were left as zero placeholders: "
+            f"response_row={response_row}, layer={layer_idx}, "
+            f"routes={moe_routes[response_row, moe_layer_offset].tolist()}"
+        )
+    if not bool(torch.isfinite(moe_weights).all()):
+        raise ValueError("Kimi full R3 route weights contain NaN or Inf")
+    if bool((moe_weights < 0).any()):
+        raise ValueError("Kimi full R3 route weights contain negative values")
+    if bool((moe_weights.sum(dim=-1) <= 0).any()):
+        raise ValueError(
+            "Kimi full R3 contains a MoE row whose captured weights sum to zero"
+        )
+    if bool(getattr(text_config, "moe_renormalize", False)):
+        expected_sum = float(
+            getattr(text_config, "routed_scaling_factor", 1.0)
+        )
+        weight_sums = moe_weights.sum(dim=-1)
+        tolerance = max(abs(expected_sum) * 0.02, 0.02)
+        close = torch.isclose(
+            weight_sums,
+            torch.full_like(weight_sums, expected_sum),
+            rtol=0.0,
+            atol=tolerance,
+        )
+        if not bool(close.all()):
+            bad = torch.nonzero(~close, as_tuple=False)[0]
+            raise ValueError(
+                "Kimi full R3 captured weights violate the normalized router "
+                "sum contract: "
+                f"row={int(bad[0])}, layer={moe_layers[int(bad[1])]}, "
+                f"actual={float(weight_sums[tuple(bad.tolist())])}, "
+                f"expected={expected_sum}, tolerance={tolerance}"
+            )
 
 
 class AgentLoopMetrics(BaseModel):
@@ -100,6 +213,10 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
+    routed_expert_weights: Optional[Any] = None
+    """Executed router weights paired elementwise with routed_experts."""
+    routed_experts_source_semantics: Optional[str] = None
+    """Explicit row semantics for routed_experts; never infer this from shape."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
@@ -126,18 +243,104 @@ class AgentLoopOutput(BaseModel):
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
 
         routed_experts = output.pop("routed_experts", None)
+        routed_expert_weights = output.pop("routed_expert_weights", None)
+        route_semantics = output.pop("routed_experts_source_semantics", None)
+        if routed_experts is None and routed_expert_weights is not None:
+            raise ValueError(
+                "router weights cannot be transported without expert IDs"
+            )
+        if (
+            route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS
+            and routed_experts is not None
+            and routed_expert_weights is None
+        ):
+            raise ValueError(
+                "Kimi full R3 requires routed_experts and "
+                "routed_expert_weights together"
+            )
         if routed_experts is not None:
             routed_experts = torch.tensor(routed_experts, dtype=torch.int64)
-            # Router replay indexes this field by absolute token position, so it must
-            # span the whole sequence. The rollout engine records fewer rows than that:
-            # it only sees tokens fed through the model, and multi-turn loops stop
-            # recording at the last generation. Trailing rows stay zero; replay masks
-            # them out instead of consuming them.
-            total_length = output["prompts"].size(0) + output["responses"].size(0)
-            aligned = routed_experts.new_zeros((total_length, *routed_experts.shape[1:]))
-            num_rows = min(routed_experts.size(0), total_length)
-            aligned[:num_rows] = routed_experts[:num_rows]
+            if routed_expert_weights is not None:
+                # Keep the exact BF16 values decoded by the rollout in an
+                # FP32 carrier while they pass through TensorDict and
+                # TransferQueue.  Every BF16 value is exactly representable
+                # in FP32.  Converting to BF16 here made the transport depend
+                # on TransferQueue's nested-BF16 serialization; restore BF16
+                # only at the actor input boundary, where the value is
+                # immediately consumed by the gate.
+                routed_expert_weights = torch.tensor(
+                    routed_expert_weights, dtype=torch.float32
+                )
+            if (
+                routed_expert_weights is not None
+                and routed_expert_weights.shape != routed_experts.shape
+            ):
+                raise ValueError(
+                    "Kimi full R3 IDs/weights are misaligned: "
+                    f"ids={tuple(routed_experts.shape)}, "
+                    f"weights={tuple(routed_expert_weights.shape)}"
+                )
+            if route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS:
+                if routed_experts.dim() != 3:
+                    raise ValueError(
+                        "Kimi full-model routed_experts must be "
+                        "[model_rows, layers, topk], "
+                        f"got {tuple(routed_experts.shape)}"
+                    )
+                if not bool(torch.all(output["response_mask"] == 1)):
+                    raise ValueError(
+                        "Kimi full-model routing replay currently supports "
+                        "single-turn all-generated responses only"
+                    )
+                logical_rows = output["prompts"].size(0) + output["responses"].size(0)
+                if routed_experts.size(0) < logical_rows - 1:
+                    raise ValueError(
+                        "Kimi full-model route capture is shorter than the causal "
+                        "logical input: "
+                        f"routes={routed_experts.size(0)}, logical={logical_rows}"
+                    )
+                minimum = int(routed_experts.min().item()) if routed_experts.numel() else 0
+                maximum = int(routed_experts.max().item()) if routed_experts.numel() else 0
+                if minimum < 0 or maximum > 255:
+                    raise ValueError(
+                        "Kimi full-model route transport requires uint8 expert IDs, "
+                        f"got min={minimum}, max={maximum}"
+                    )
+                # Preserve every vLLM model row. list_of_dict_to_tensordict
+                # converts unequal row counts into a jagged tensor, so no
+                # max-model-length padding is needed in TransferQueue.
+                aligned = routed_experts.to(torch.uint8)
+                aligned_weights = routed_expert_weights
+            elif route_semantics is None:
+                # Backward-compatible text-only routing uses absolute logical
+                # token positions and therefore spans the complete sequence.
+                total_length = output["prompts"].size(0) + output["responses"].size(0)
+                aligned = routed_experts.new_zeros(
+                    (total_length, *routed_experts.shape[1:])
+                )
+                aligned_weights = (
+                    routed_expert_weights.new_zeros(
+                        (total_length, *routed_expert_weights.shape[1:])
+                    )
+                    if routed_expert_weights is not None
+                    else None
+                )
+                num_rows = min(routed_experts.size(0), total_length)
+                aligned[:num_rows] = routed_experts[:num_rows]
+                if aligned_weights is not None:
+                    aligned_weights[:num_rows] = routed_expert_weights[:num_rows]
+            else:
+                raise ValueError(
+                    f"unsupported routed_experts_source_semantics={route_semantics!r}"
+                )
             output["routed_experts"] = aligned
+            if aligned_weights is not None:
+                output["routed_expert_weights"] = aligned_weights
+            # The V1/TransferQueue path serializes ``AgentLoopOutput.as_dict``
+            # directly and does not call ``AgentLoopManager._postprocess``.
+            # Keep the row contract beside the routed-experts field so it
+            # survives replay-buffer storage, reordering and microbatching.
+            output["routed_experts_transport_semantics"] = route_semantics
 
         # rm_scores: reward score for each token
         reward_score = output.pop("reward_score", None)
@@ -182,6 +385,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded token ids corresponding to the teacher log probabilities."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
+    routed_expert_weights: Optional[torch.Tensor] = None
+    """Padded router weights paired elementwise with routed_experts."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -201,6 +406,14 @@ class ToolListWrap:
 
     def __init__(self, tools: list):
         self.tools = tools
+
+
+class ModelConfigWrap:
+    """Wrapper for ``HFModelConfig`` to keep Hydra from recursively
+    interpreting its nested ``_target_`` fields during agent construction."""
+
+    def __init__(self, config: HFModelConfig):
+        self.config = config
 
 
 class AgentLoopBase(ABC):
@@ -224,10 +437,15 @@ class AgentLoopBase(ABC):
         processor: AutoProcessor,
         dataset_cls: type[RLHFDataset],
         data_config: DictConfigWrap,
+        model_config: Optional[HFModelConfig] = None,
         **kwargs,
     ):
         self.config = trainer_config.config
         self.rollout_config = self.config.actor_rollout_ref.rollout
+        # AgentLoopWorker already materializes HFModelConfig once per worker.
+        # Pass that object into each short-lived loop instead of rebuilding the
+        # tokenizer/processor/config for every trajectory.
+        self.model_config = model_config.config if isinstance(model_config, ModelConfigWrap) else model_config
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
@@ -702,6 +920,7 @@ class AgentLoopWorker:
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
+                model_config=ModelConfigWrap(self.model_config),
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
@@ -794,6 +1013,20 @@ class AgentLoopWorker:
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
         routed_experts = None
+        routed_expert_weights = None
+        if output.routed_experts is None and output.routed_expert_weights is not None:
+            raise ValueError(
+                "router weights cannot be postprocessed without expert IDs"
+            )
+        if (
+            output.routed_experts_source_semantics
+            == KIMI_FULL_MODEL_ROUTE_SEMANTICS
+            and output.routed_experts is not None
+            and output.routed_expert_weights is None
+        ):
+            raise ValueError(
+                "Kimi full R3 postprocess requires expert IDs and weights together"
+            )
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
             length, layer_num, topk_num = output.routed_experts.shape
@@ -806,19 +1039,108 @@ class AgentLoopWorker:
                 experts_tensor = output.routed_experts
             else:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
-            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
-
-            # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            end_pos = min(start_pos + length, total_length)
-
-            # Add boundary checks for robustness
-            if start_pos < 0 or end_pos > total_length:
-                raise ValueError(
-                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+            if isinstance(output.routed_expert_weights, np.ndarray):
+                route_weights_array = output.routed_expert_weights
+                if not route_weights_array.flags.writeable:
+                    route_weights_array = route_weights_array.copy()
+                weights_tensor = torch.from_numpy(route_weights_array)
+            elif isinstance(output.routed_expert_weights, torch.Tensor):
+                weights_tensor = output.routed_expert_weights
+            elif output.routed_expert_weights is None:
+                weights_tensor = None
+            else:
+                raise TypeError(
+                    "Unsupported type for routed_expert_weights: "
+                    f"{type(output.routed_expert_weights)}"
                 )
-
-            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+            if weights_tensor is not None:
+                # See AgentLoopOutput.as_dict: FP32 is an exact carrier for
+                # the captured BF16 bits and avoids lossy/unsupported jagged
+                # BF16 transport.  The FSDP actor converts once, immediately
+                # before replay.
+                weights_tensor = weights_tensor.to(torch.float32)
+            if (
+                weights_tensor is not None
+                and weights_tensor.shape != experts_tensor.shape
+            ):
+                raise ValueError(
+                    "Kimi full R3 postprocess IDs/weights are misaligned: "
+                    f"ids={tuple(experts_tensor.shape)}, "
+                    f"weights={tuple(weights_tensor.shape)}"
+                )
+            route_semantics = output.routed_experts_source_semantics
+            if route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS:
+                response_rows = len(output.response_ids)
+                if len(output.response_mask) != response_rows or any(
+                    int(value) != 1 for value in output.response_mask
+                ):
+                    raise ValueError(
+                        "Kimi full-model routing replay currently supports "
+                        "single-turn all-generated responses only"
+                    )
+                logical_rows = len(output.prompt_ids) + response_rows
+                if length < logical_rows - 1:
+                    raise ValueError(
+                        "Kimi full-model route capture is shorter than the causal "
+                        f"logical input: routes={length}, logical={logical_rows}"
+                    )
+                _validate_kimi_full_model_routes(
+                    experts_tensor,
+                    weights_tensor,
+                    self.model_config.hf_config,
+                )
+                routed_experts = torch.nested.as_nested_tensor(
+                    [experts_tensor.to(torch.uint8)],
+                    layout=torch.jagged,
+                )
+                routed_expert_weights = torch.nested.as_nested_tensor(
+                    [weights_tensor],
+                    layout=torch.jagged,
+                )
+                if not getattr(
+                    self, "_kimi_full_model_transport_logged", False
+                ):
+                    marker = (
+                        "Kimi full-model route transport ACTIVE: "
+                        f"raw_rows={length} logical_rows={logical_rows} "
+                        f"response_rows={response_rows}"
+                    )
+                    logger.warning(marker)
+                    print(marker, flush=True)
+                    self._kimi_full_model_transport_logged = True
+            elif route_semantics is None:
+                routed_experts = torch.zeros(
+                    1,
+                    total_length,
+                    layer_num,
+                    topk_num,
+                    dtype=experts_tensor.dtype,
+                )
+                if weights_tensor is not None:
+                    routed_expert_weights = torch.zeros(
+                        1,
+                        total_length,
+                        layer_num,
+                        topk_num,
+                        dtype=torch.bfloat16,
+                    )
+                # Text-only/backward-compatible route payloads use the logical
+                # token axis.  Kimi multimodal payloads must never reach this
+                # branch without explicit row semantics.
+                start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+                end_pos = min(start_pos + length, total_length)
+                if start_pos < 0 or end_pos > total_length:
+                    raise ValueError(
+                        f"Invalid position range: start_pos={start_pos}, "
+                        f"end_pos={end_pos}, total_length={total_length}"
+                    )
+                routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+                if routed_expert_weights is not None:
+                    routed_expert_weights[:, start_pos:end_pos] = weights_tensor.unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"unsupported routed_experts_source_semantics={route_semantics!r}"
+                )
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(
@@ -866,6 +1188,8 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
+            routed_expert_weights=routed_expert_weights,
+            routed_experts_source_semantics=output.routed_experts_source_semantics,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
@@ -1064,8 +1388,38 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+        route_presence = [input.routed_experts is not None for input in inputs]
+        if any(route_presence) and not all(route_presence):
+            raise ValueError(
+                "a routing batch cannot mix samples with and without expert IDs"
+            )
+        if all(route_presence):
+            route_tensors = [input.routed_experts for input in inputs]
+            optional_outputs["routed_experts"] = (
+                tu.concat_nested_tensors(route_tensors)
+                if route_tensors[0].is_nested
+                else torch.cat(route_tensors, dim=0)
+            )
+            weight_presence = [
+                input.routed_expert_weights is not None for input in inputs
+            ]
+            if any(weight_presence) and not all(weight_presence):
+                raise ValueError(
+                    "a routing batch cannot mix ID-only and ID+weight samples"
+                )
+            if all(weight_presence):
+                weight_tensors = [
+                    input.routed_expert_weights for input in inputs
+                ]
+                optional_outputs["routed_expert_weights"] = (
+                    tu.concat_nested_tensors(weight_tensors)
+                    if weight_tensors[0].is_nested
+                    else torch.cat(weight_tensors, dim=0)
+                )
+        elif any(input.routed_expert_weights is not None for input in inputs):
+            raise ValueError(
+                "Kimi full R3 batch contains router weights without expert IDs"
+            )
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
@@ -1082,6 +1436,21 @@ class AgentLoopWorker:
             },
             batch_size=len(inputs),
         )
+        if all(route_presence):
+            route_semantics = {
+                item.routed_experts_source_semantics for item in inputs
+            }
+            if route_semantics == {KIMI_FULL_MODEL_ROUTE_SEMANTICS}:
+                tu.assign_non_tensor_data(
+                    batch,
+                    "routed_experts_transport_semantics",
+                    KIMI_FULL_MODEL_ROUTE_SEMANTICS,
+                )
+            elif route_semantics != {None}:
+                raise ValueError(
+                    "a routed-experts batch cannot mix row-semantics contracts, got "
+                    f"{sorted(repr(value) for value in route_semantics)}"
+                )
 
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):

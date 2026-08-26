@@ -14,7 +14,10 @@
 
 import asyncio
 
-from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
+import torch
+from transfer_queue.utils.serial_utils import encode
+
+from verl.trainer.ppo.v1.agent_loop_tq import _normalize_transfer_queue_ints, _settle_session_tasks
 
 
 def test_settle_session_tasks_waits_for_siblings_after_failure():
@@ -37,3 +40,24 @@ def test_settle_session_tasks_waits_for_siblings_after_failure():
         assert isinstance(errors[0], RuntimeError)
 
     asyncio.run(run())
+
+
+def test_transfer_queue_metadata_ints_are_normalized_losslessly():
+    tensor = torch.tensor([1, 2], dtype=torch.int64)
+    payload = {
+        "small": 7,
+        "bool": True,
+        "nested": {"too_large": 1 << 80, "too_small": -(1 << 80)},
+        "tensor": tensor,
+    }
+
+    normalized = _normalize_transfer_queue_ints(payload)
+
+    assert normalized["small"] == 7
+    assert normalized["bool"] is True
+    assert normalized["nested"] == {
+        "too_large": str(1 << 80),
+        "too_small": str(-(1 << 80)),
+    }
+    assert normalized["tensor"] is tensor
+    assert list(encode(normalized))

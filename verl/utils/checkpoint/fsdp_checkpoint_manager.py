@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import time
 import warnings
 from dataclasses import asdict, dataclass
 from typing import Optional
@@ -32,13 +33,69 @@ from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
-from verl.utils.transformers_compat import drop_tied_target_keys, get_auto_model_for_vision2seq
+from verl.utils.model import get_hf_auto_model_class
+from verl.utils.transformers_compat import drop_tied_target_keys
 
 from .checkpoint_manager import BaseCheckpointManager
 
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _rewrite_packed_moe_state_dict_for_hf_export(model, state_dict: dict) -> list[str]:
+    """Expand packed MoE weights only after FSDP produced rank-0 full tensors.
+
+    Packed expert modules expose a small post-processing protocol and do not
+    override their recursive ``_save_to_state_dict`` hook.  The default
+    physical state dict makes sharded resume checkpoints cheap: no per-layer
+    DTensor full-gathers and no per-expert key explosion happen on every rank.
+
+    Returns the module names that were rewritten.  A packed key that cannot be
+    matched back to its owning module is an error; silently writing a hybrid
+    packed/external HF checkpoint would not be loadable by the original Kimi
+    implementation.
+    """
+
+    rewritten = []
+    for module_name, module in model.named_modules():
+        rewrite = getattr(module, "rewrite_packed_state_dict_for_external_export", None)
+        if not callable(rewrite):
+            continue
+
+        # FSDP1 may expose its implementation wrapper in ``named_modules``
+        # while stripping it from full-state-dict keys.  FSDP2 normally uses
+        # the first candidate unchanged.
+        module_names = [module_name]
+        stripped = module_name.replace("_fsdp_wrapped_module.", "")
+        if stripped != module_name:
+            module_names.append(stripped)
+        if module_name.startswith("module."):
+            module_names.append(module_name.removeprefix("module."))
+
+        for candidate in dict.fromkeys(module_names):
+            prefix = f"{candidate}." if candidate else ""
+            gate_key = f"{prefix}gate_up_proj"
+            down_key = f"{prefix}down_proj"
+            if gate_key not in state_dict and down_key not in state_dict:
+                continue
+            if gate_key not in state_dict or down_key not in state_dict:
+                missing = down_key if gate_key in state_dict else gate_key
+                raise RuntimeError(
+                    f"Incomplete packed MoE full state for {candidate or '<root>'}: missing {missing}"
+                )
+            rewrite(state_dict, prefix)
+            rewritten.append(candidate or "<root>")
+            break
+
+    packed_suffixes = (".experts.gate_up_proj", ".experts.down_proj")
+    leftovers = [key for key in state_dict if key.endswith(packed_suffixes)]
+    if leftovers:
+        raise RuntimeError(
+            "HF export still contains packed MoE keys after rank-0 rewrite; "
+            f"first keys: {leftovers[:5]}"
+        )
+    return rewritten
 
 
 @dataclass
@@ -289,6 +346,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         """
         if local_path is None:
             return
+        checkpoint_started = time.perf_counter()
+        model_state_seconds = None
+        model_write_seconds = None
 
         # record the previous global step
         self.previous_global_step = global_step
@@ -318,7 +378,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
                 if self.should_save_model:
+                    # Kimi relies on nn.Module's physical state-dict ABI and
+                    # emits the two packed expert parameters here. Never
+                    # expand to w1/w2/w3 in a sharded resume checkpoint.
+                    model_state_started = time.perf_counter()
                     model_state_dict = self.model.state_dict()
+                    model_state_seconds = time.perf_counter() - model_state_started
+                    if self.rank == 0:
+                        packed_moe_keys = sum(
+                            key.endswith((".experts.gate_up_proj", ".experts.down_proj"))
+                            for key in model_state_dict
+                        )
+                        if packed_moe_keys:
+                            log_with_rank(
+                                "Checkpoint model state uses packed/sharded MoE ABI: "
+                                f"packed_keys={packed_moe_keys}, external_expansion=OFF",
+                                rank=self.rank,
+                                logger=logger,
+                                log_only_rank_0=True,
+                            )
                     if self.should_save_lora_only and self._has_lora():
                         n_total = len(model_state_dict)
                         model_state_dict = {
@@ -344,7 +422,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                             logger=logger,
                             log_only_rank_0=True,
                         )
+                    model_write_started = time.perf_counter()
                     torch.save(model_state_dict, model_path)
+                    model_write_seconds = time.perf_counter() - model_write_started
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
                 if self.should_save_optimizer:
@@ -422,24 +502,41 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.should_save_hf_model:
             # Only rank 0 will save hf model and,
             # offload to cpu to save LLMs which may be too large to fit in one GPU
+            hf_collect_started = time.perf_counter()
             state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
+            hf_collect_seconds = time.perf_counter() - hf_collect_started
 
             if self.rank == 0:
+                # FSDP has already performed the one model-wide full-state
+                # collection.  Convert packed Kimi experts locally on rank 0;
+                # this operation must never receive DTensors or communicate.
+                if fsdp_version(self.model) == 1:
+                    export_model = self.model._fsdp_wrapped_module
+                else:
+                    export_model = self.model
+                hf_rewrite_started = time.perf_counter()
+                rewritten_moe_modules = _rewrite_packed_moe_state_dict_for_hf_export(
+                    export_model, state_dict
+                )
+                hf_rewrite_seconds = time.perf_counter() - hf_rewrite_started
+                if rewritten_moe_modules:
+                    log_with_rank(
+                        "HF checkpoint MoE export rewrote full CPU tensors on rank 0: "
+                        f"layers={len(rewritten_moe_modules)}, per_layer_collectives=0",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+
                 hf_local_path = os.path.join(local_path, "huggingface")
                 os.makedirs(hf_local_path, exist_ok=True)
 
-                if "ForTokenClassification" in model_config.architectures[0]:
-                    from transformers import AutoModelForTokenClassification
-
-                    auto_model_cls = AutoModelForTokenClassification
-                elif "ForCausalLM" in model_config.architectures[0]:
-                    from transformers import AutoModelForCausalLM
-
-                    auto_model_cls = AutoModelForCausalLM
-                elif "ForConditionalGeneration" in model_config.architectures[0]:
-                    auto_model_cls = get_auto_model_for_vision2seq()
-                else:
-                    raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
+                # Use the same resolver as initial model loading. In particular,
+                # Kimi K3 advertises its remote implementation through AutoModel
+                # and AutoModelForCausalLM, but not through the generic vision
+                # AutoModelForImageTextToText class. Selecting an auto class from
+                # the architecture name alone therefore fails before export.
+                auto_model_cls = get_hf_auto_model_class(model_config)
 
                 with init_empty_weights():
                     save_model = auto_model_cls.from_config(
@@ -459,9 +556,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                 drop_tied_target_keys(state_dict, save_model, model_config)
 
+                hf_write_started = time.perf_counter()
                 save_model.save_pretrained(hf_local_path, state_dict=state_dict)
+                hf_write_seconds = time.perf_counter() - hf_write_started
                 log_with_rank(
                     f"Saved hf_model to {os.path.abspath(hf_local_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+                log_with_rank(
+                    "HF checkpoint phase timings: "
+                    f"full_state_collect={hf_collect_seconds:.3f}s, "
+                    f"rank0_local_moe_rewrite={hf_rewrite_seconds:.3f}s, "
+                    f"rank0_write={hf_write_seconds:.3f}s",
                     rank=self.rank,
                     logger=logger,
                     log_only_rank_0=True,
@@ -474,3 +582,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if self.rank == 0:
             self.register_checkpoint(local_path, max_ckpt_to_keep)
+            log_with_rank(
+                "Resumable checkpoint completed: "
+                f"step={global_step}, total={time.perf_counter() - checkpoint_started:.3f}s, "
+                f"model_state={model_state_seconds if model_state_seconds is not None else 0.0:.3f}s, "
+                f"model_write={model_write_seconds if model_write_seconds is not None else 0.0:.3f}s, "
+                f"path={os.path.abspath(local_path)}",
+                rank=self.rank,
+                logger=logger,
+                log_only_rank_0=True,
+            )

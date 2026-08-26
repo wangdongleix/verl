@@ -18,6 +18,14 @@ optimizer_offload: false
 # Only for FSDP2: offload param/grad/optimizer during train
 offload_policy: false
 
+# Checkpoint initialization mode. ``streaming_local`` is supported by the
+# Kimi-K3 FSDP-Turbo backend and loads only each rank's local DTensor shard.
+checkpoint_load_mode: legacy_full_state
+
+# Fail on missing parameters, shape mismatches, or incomplete local coverage
+# when streaming_local is enabled.
+checkpoint_load_strict: true
+
 # Reshard after forward pass to reduce memory footprint
 # For FSDP1, `false` enables `ShardingStrategy.SHARD_GRAD_OP`
 reshard_after_forward: true

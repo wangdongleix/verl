@@ -263,6 +263,11 @@ class FSDPEngineConfig(EngineConfig):
             within-budget micro-batch onto a single shape. Only read when ``pad_to_length=True``.
             default 1024
         qat (QATEngineConfig): QAT configuration, default disabled
+        checkpoint_load_mode (str): Checkpoint initialization mode. ``legacy_full_state``
+            preserves the original full-state load; ``streaming_local`` is supported by
+            the Kimi-K3 FSDP-Turbo backend and loads only each rank's local shard.
+        checkpoint_load_strict (bool): Fail on missing parameters, shape mismatches, or
+            incomplete local coverage in the streaming loader.
     """
 
     # ulysses_sequence_parallel_size is mutable for backward compatibility
@@ -287,6 +292,8 @@ class FSDPEngineConfig(EngineConfig):
     pad_to_length_bucket: int = 1024
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
     turbo_config: dict[str, Any] = field(default_factory=dict)
+    checkpoint_load_mode: str = "legacy_full_state"
+    checkpoint_load_strict: bool = True
 
     def __post_init__(self):
         super().__post_init__()

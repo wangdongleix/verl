@@ -67,6 +67,75 @@ def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> to
     )
 
 
+def build_padding_full_r3_pair(
+    source_routed_experts: Any,
+    source_routed_expert_weights: Any,
+    causal_rows: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build a valid causal full-R3 pair for a synthetic padding sample.
+
+    Full-model R3 needs one route row for every model input row except the
+    final causal token.  A zero-filled route is not valid: top-k IDs must be
+    real and the executed weights must have a positive sum.  Reuse one already
+    validated source row; padding samples have a zero loss mask, so the choice
+    cannot contribute a policy gradient.
+    """
+    if source_routed_experts is None and source_routed_expert_weights is None:
+        return None, None
+    if not isinstance(source_routed_experts, torch.Tensor):
+        raise TypeError(
+            "full R3 padding requires tensor routed_experts when weights are present"
+        )
+    if not isinstance(source_routed_expert_weights, torch.Tensor):
+        raise TypeError(
+            "full R3 padding requires tensor routed_expert_weights with expert IDs"
+        )
+    if source_routed_experts.dim() != 3:
+        raise ValueError(
+            "full R3 padding source IDs must be [rows, layers, topk], got "
+            f"{tuple(source_routed_experts.shape)}"
+        )
+    if source_routed_expert_weights.shape != source_routed_experts.shape:
+        raise ValueError(
+            "full R3 padding source IDs/weights are misaligned: "
+            f"ids={tuple(source_routed_experts.shape)}, "
+            f"weights={tuple(source_routed_expert_weights.shape)}"
+        )
+    if not source_routed_expert_weights.is_floating_point():
+        raise TypeError(
+            "full R3 padding source weights must be floating point, got "
+            f"{source_routed_expert_weights.dtype}"
+        )
+    if causal_rows < 0:
+        raise ValueError(f"causal_rows must be nonnegative, got {causal_rows}")
+    if causal_rows == 0:
+        return (
+            source_routed_experts[:0].clone(),
+            source_routed_expert_weights[:0].clone(),
+        )
+    if source_routed_experts.shape[0] == 0:
+        raise ValueError("full R3 padding cannot reuse an empty source route")
+
+    flattened_weights = source_routed_expert_weights.float().reshape(
+        source_routed_expert_weights.shape[0], -1
+    )
+    valid_rows = torch.isfinite(flattened_weights).all(dim=1) & (
+        flattened_weights.sum(dim=1) > 0
+    )
+    valid_indices = torch.where(valid_rows)[0]
+    if valid_indices.numel() == 0:
+        raise ValueError(
+            "full R3 padding source has no finite route row with positive weights"
+        )
+    source_row = int(valid_indices[0].item())
+    route = source_routed_experts[source_row : source_row + 1]
+    weights = source_routed_expert_weights[source_row : source_row + 1]
+    return (
+        route.expand(causal_rows, *route.shape[1:]).clone(),
+        weights.expand(causal_rows, *weights.shape[1:]).clone(),
+    )
+
+
 def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
@@ -97,7 +166,24 @@ def construct_minimal_padding_template(
     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
     response_mask = torch.zeros_like(prompts)
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
-    routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+    source_routed_experts = template_sample.get("routed_experts")
+    source_routed_expert_weights = template_sample.get(
+        "routed_expert_weights"
+    )
+    if source_routed_expert_weights is not None:
+        routed_experts, routed_expert_weights = build_padding_full_r3_pair(
+            source_routed_experts,
+            source_routed_expert_weights,
+            causal_rows=max(input_ids.size(0) - 1, 0),
+        )
+    else:
+        # Legacy ID-only replay uses the logical token axis rather than Kimi's
+        # natural full-model causal-row contract.
+        routed_experts = build_padding_routed_experts(
+            source_routed_experts,
+            input_ids.size(0),
+        )
+        routed_expert_weights = None
 
     # Update the fields and remove redundant parts
     template_sample.update(
@@ -116,8 +202,13 @@ def construct_minimal_padding_template(
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:
         template_sample["routed_experts"] = routed_experts
+        if routed_expert_weights is not None:
+            template_sample["routed_expert_weights"] = routed_expert_weights
+        else:
+            template_sample.pop("routed_expert_weights", None)
     else:
         template_sample.pop("routed_experts", None)
+        template_sample.pop("routed_expert_weights", None)
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)

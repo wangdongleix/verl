@@ -408,14 +408,47 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
             # On partial rollout resume the model version may differ, so keep
-            # existing routing and only append routing for newly generated tokens.
-            if output.routed_experts is not None and len(output.token_ids) > 0:
+            # existing routing and only append routing for newly generated
+            # tokens. IDs and weights are one atomic full-R3 record; accepting
+            # only one side would silently recreate ID-only replay.
+            has_route_ids = output.routed_experts is not None
+            has_route_weights = output.routed_expert_weights is not None
+            if has_route_weights and not has_route_ids:
+                raise RuntimeError(
+                    "rollout returned router weights without expert IDs: "
+                    f"ids={has_route_ids}, weights={has_route_weights}"
+                )
+            if has_route_ids and len(output.token_ids) > 0:
+                if has_route_weights and (
+                    output.routed_experts.shape
+                    != output.routed_expert_weights.shape
+                ):
+                    raise RuntimeError(
+                        "full R3 rollout IDs/weights are misaligned: "
+                        f"ids={output.routed_experts.shape}, "
+                        f"weights={output.routed_expert_weights.shape}"
+                    )
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
+                    final_output.routed_expert_weights = output.routed_expert_weights
                 else:
+                    if (
+                        final_output.routed_expert_weights is None
+                    ) != (output.routed_expert_weights is None):
+                        raise RuntimeError(
+                            "a resumed rollout cannot switch between legacy "
+                            "ID-only routing and complete ID+weight R3"
+                        )
                     final_output.routed_experts = np.concatenate(
                         [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]]
                     )
+                    if has_route_weights:
+                        final_output.routed_expert_weights = np.concatenate(
+                            [
+                                final_output.routed_expert_weights,
+                                output.routed_expert_weights[-len(output.token_ids) :],
+                            ]
+                        )
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason

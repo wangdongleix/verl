@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -1136,6 +1138,7 @@ class PPOTrainer(ABC):
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+        temp_filename = os.path.join(dump_path, f".{global_steps}.jsonl.tmp.{os.getpid()}.{uuid.uuid4().hex}")
 
         n = len(inputs)
         base_data = {
@@ -1161,10 +1164,31 @@ class PPOTrainer(ABC):
                 return obj.tolist()
             raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-        with open(filename, "w") as f:
-            for i in range(n):
-                entry = {k: v[i] for k, v in base_data.items()}
-                f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with open(temp_filename, "w") as f:
+                    for i in range(n):
+                        entry = {k: v[i] for k, v in base_data.items()}
+                        f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_filename, filename)
+                break
+            except OSError as exc:
+                try:
+                    os.unlink(temp_filename)
+                except FileNotFoundError:
+                    pass
+                if exc.errno != errno.ENOSPC or attempt == max_attempts:
+                    raise
+                logger.warning(
+                    "Rollout dump hit ENOSPC for %s (attempt %d/%d); retrying in 10 seconds",
+                    filename,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(10)
 
         print(f"Dumped generations to {filename}")
 
@@ -1204,17 +1228,45 @@ class PPOTrainer(ABC):
         self._dump_executor.shutdown(wait=True)
 
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
-        """Fetch rollout data from TransferQueue and dump sorted by uid."""
+        """Dump rollout rows with aligned raw scores, final rewards, and reward diagnostics."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = [
+                "uid",
+                "rollout_key",
+                "prompts",
+                "responses",
+                "rm_scores",
+                "reward_model",
+                "extra_fields",
+            ]
+            if self.config.algorithm.use_kl_in_reward:
+                fields.append("token_level_rewards")
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
-            uids = data.pop("uid").tolist()
+            prompt_uids = data.pop("uid").tolist()
+            rollout_keys = data.pop("rollout_key").tolist()
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             scores = data["rm_scores"].sum(dim=1).tolist()
+            if self.config.algorithm.use_kl_in_reward:
+                rewards = data["token_level_rewards"].sum(dim=1).tolist()
+            else:
+                # With no KL-in-reward transform, rm_scores are exactly the rewards
+                # consumed by advantage estimation. Keep this branch explicit so a
+                # future config change cannot silently relabel a different quantity.
+                rewards = list(scores)
+
+            extra_fields = data.pop("extra_fields", None)
+            if extra_fields is None:
+                reward_infos = [{} for _ in prompt_uids]
+            else:
+                reward_infos = []
+                for item in list(extra_fields):
+                    item = getattr(item, "data", item)
+                    info = item.get("reward_extra_info", {}) if isinstance(item, dict) else {}
+                    reward_infos.append(info if isinstance(info, dict) else {})
 
             reward_model = data.pop("reward_model", None)
             if reward_model is not None:
@@ -1222,22 +1274,50 @@ class PPOTrainer(ABC):
             else:
                 gts = [None] * len(uids)
 
-            # Sort by uid key ({sample}_{rollout}_{output})
+            # The prompt uid groups GRPO samples and is deliberately shared by
+            # rollout.n rows. Use the separately persisted, unique TQ row key
+            # as the ordering authority and fail closed if storage returned a
+            # row set different from the sampled batch metadata.
+            rollout_key_strings = [str(key) for key in rollout_keys]
+            batch_key_strings = [str(key) for key in batch.keys]
+            if sorted(rollout_key_strings) != sorted(batch_key_strings):
+                raise RuntimeError(
+                    "rollout dump key mismatch between TransferQueue rows and batch metadata: "
+                    f"rows={len(rollout_key_strings)}, batch_keys={len(batch_key_strings)}"
+                )
+
             sort_keys = []
-            for key in batch.keys:
-                parts = key.rsplit("_", 2)
-                if len(parts) == 3:
-                    sort_keys.append((parts[0], int(parts[1]), int(parts[2])))
-                else:
-                    sort_keys.append((key, 0, 0))
+            for rollout_key in rollout_key_strings:
+                parts = rollout_key.rsplit("_", 2)
+                try:
+                    sort_key = (
+                        (parts[0], int(parts[1]), int(parts[2]))
+                        if len(parts) == 3
+                        else (rollout_key, 0, 0)
+                    )
+                    sort_keys.append(sort_key)
+                except ValueError:
+                    sort_keys.append((rollout_key, 0, 0))
             sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
 
             inputs = [inputs[i] for i in sorted_indices]
             outputs = [outputs[i] for i in sorted_indices]
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
+            rewards = [rewards[i] for i in sorted_indices]
+            prompt_uids = [prompt_uids[i] for i in sorted_indices]
+            rollout_keys = [rollout_keys[i] for i in sorted_indices]
+            reward_infos = [reward_infos[i] for i in sorted_indices]
 
-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict = {
+                "uid": rollout_keys,
+                "prompt_uid": prompt_uids,
+                "reward": rewards,
+                "rm_score": scores,
+            }
+            reward_component_keys = sorted({key for info in reward_infos for key in info})
+            for key in reward_component_keys:
+                reward_extra_infos_dict[f"reward_{key}"] = [info.get(key) for info in reward_infos]
 
             self._dump_generations(
                 inputs=inputs,

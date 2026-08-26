@@ -118,4 +118,31 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # FSDP2 reuses all-gather buffers between rollout and training.  The
+    # Kimi vision path must use ordinary no_grad in forward-only passes;
+    # propagate this explicitly because the Ray cluster may be pre-started
+    # with a different daemon environment.
+    runtime_env["env_vars"]["VERL_FSDP_FORWARD_ONLY_NO_GRAD"] = os.environ.get(
+        "VERL_FSDP_FORWARD_ONLY_NO_GRAD", "1"
+    )
+    # These Kimi-K3/FSDP-Turbo settings are consumed inside Ray workers.  The
+    # Ray cluster may already be running before the PPO driver starts, so
+    # inheriting the driver's shell environment is not reliable.  Forward
+    # them explicitly through the runtime environment instead of silently
+    # falling back to dense eager vision attention or the default HCCL mode.
+    for key in (
+        "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
+        "VERL_KIMI_EP_SYNC",
+        "VERL_KIMI_LAYER_SYNC",
+        "VERL_FSDP_RELEASE_ALL_GATHER_STATE",
+        "HCCL_OP_EXPANSION_MODE",
+        "HCCL_EXEC_TIMEOUT",
+        "HCCL_CONNECT_TIMEOUT",
+        "HCCL_ASYNC_ERROR_HANDLING",
+        "HCCL_BUFFSIZE",
+        "P2P_HCCL_BUFFSIZE",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

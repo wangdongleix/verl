@@ -17,15 +17,18 @@
 
 from functools import wraps
 
+import torch
+
 from verl.utils.device import is_torch_npu_available
 
 
 def vllm_v013_weight_loader_method_wrapper(fn):
     @wraps(fn)
     def wrapper(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
-        if (shard_id in ("w1", "w3") and param.shape[1] == self.hidden_size) or (
+        needs_legacy_transpose = (shard_id in ("w1", "w3") and param.shape[1] == self.hidden_size) or (
             shard_id == "w2" and param.shape[2] == self.hidden_size
-        ):
+        )
+        if not getattr(param, "_verl_explicit_reload_layout", False) and needs_legacy_transpose:
             param.data = param.data.transpose(1, 2)
         return fn(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
 
@@ -52,6 +55,24 @@ def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
     wrapped_weight_loader._verl_npu_weight_loader_patched = True
     fused_moe.weight_loader = wrapped_weight_loader
     return True
+
+
+@torch.no_grad()
+def prepare_npu_moe_weights_for_reload(model) -> int:
+    """Canonicalize Ascend MoE parameters before an online actor reload.
+
+    Ascend's Kimi implementation exposes this hook on its quant method;
+    other vLLM MoE implementations are left untouched. Returning the number
+    of prepared parameters makes the operation observable in debug logs.
+    """
+    model = getattr(model, "runnable", model)
+    prepared = 0
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        prepare = getattr(method, "prepare_weights_for_loading", None)
+        if callable(prepare):
+            prepared += int(prepare(module) or 0)
+    return prepared
 
 
 def patch_vllm013_rotary_emb():

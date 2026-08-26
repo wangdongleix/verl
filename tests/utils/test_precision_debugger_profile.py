@@ -15,8 +15,9 @@
 import logging
 import types
 
-from verl.utils.profiler.config import PrecisionDebuggerToolConfig
+from verl.utils.profiler.config import PrecisionDebuggerToolConfig, ProfilerConfig
 from verl.utils.profiler.precision_debugger_profile import PrecisionDebuggerProfiler
+from verl.utils.profiler.profile import DistProfiler
 
 
 class _FakeModel:
@@ -40,3 +41,28 @@ def test_resolve_megatron_model_chunks_uses_first_valid_chunk(caplog):
 
     assert model is first_model
     assert "only binds the first of 2 model chunks" in caplog.text
+
+
+def _precision_dist_profiler(rank, *, ranks=None, all_ranks=False):
+    tool_config = PrecisionDebuggerToolConfig()
+    config = ProfilerConfig(
+        tool="precision_debugger",
+        enable=True,
+        all_ranks=all_ranks,
+        ranks=[] if ranks is None else ranks,
+        save_path="/tmp/test_precision_debugger_profile",
+        tool_config=tool_config,
+    )
+    return DistProfiler(rank=rank, config=config, tool_config=tool_config)
+
+
+def test_dist_profiler_honors_explicit_precision_debugger_ranks():
+    """Explicit global ranks prevent shared-path collisions across nodes."""
+    assert _precision_dist_profiler(0, ranks=[0]).check_this_rank()
+    assert not _precision_dist_profiler(16, ranks=[0]).check_this_rank()
+
+
+def test_dist_profiler_preserves_msprobe_rank_filter_fallback():
+    """Without a verl rank selection, msprobe's own rank filter remains authoritative."""
+    assert _precision_dist_profiler(16).check_this_rank()
+    assert _precision_dist_profiler(16, all_ranks=True).check_this_rank()
