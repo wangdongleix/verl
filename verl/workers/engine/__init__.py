@@ -13,6 +13,11 @@
 # limitations under the License.
 import warnings
 
+from .bootstrap import bootstrap_megatron_runtime
+
+# Install the adaptor before importing FSDP/Megatron engine modules.
+bootstrap_megatron_runtime()
+
 from .base import BaseEngine, EngineRegistry
 from .fsdp import FSDPEngine, FSDPEngineWithLMHead, FSDPTurboEngineWithLMHead
 

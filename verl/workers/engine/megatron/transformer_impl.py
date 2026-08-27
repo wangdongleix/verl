@@ -75,6 +75,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _is_kimi_k3_config(hf_config) -> bool:
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return (
+        getattr(hf_config, "model_type", None) == "kimi_k3"
+        or "KimiK3ForConditionalGeneration" in architectures
+    )
+
+
+def _register_kimi_k3_runtime() -> None:
+    """Bootstrap the Kimi bridge through MS-Bridge's public runtime API."""
+    try:
+        from mindspeed_bridge.runtime.auto_register import ensure_kimi_k3_runtime
+    except ImportError as exc:
+        raise RuntimeError(
+            "Kimi K3 Megatron requires MS-Bridge-KIMI-K3 to be installed and importable"
+        ) from exc
+    ensure_kimi_k3_runtime()
+
+
 class MegatronEngine(BaseEngine):
     # mcore keeps model-parallel-local params resident and moves large host
     # buffers every step; pinning the whole delta snapshot set on top of that
@@ -96,6 +115,7 @@ class MegatronEngine(BaseEngine):
         optimizer_config: McoreOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        is_kimi_k3 = _is_kimi_k3_config(model_config.hf_config)
         super().__init__()
 
         self.model_config = model_config
@@ -104,6 +124,11 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_config = checkpoint_config
         assert self.engine_config.use_mbridge, "use_mbridge must be True"
         self._init_device_mesh()
+        if is_kimi_k3:
+            # The task-selected MegatronAdaptor is installed before this module
+            # is imported. Keep the model plugin lazy until the engine topology
+            # is initialized, but before provider/bridge construction.
+            _register_kimi_k3_runtime()
 
         set_random_seed(seed=self.engine_config.seed)
 
@@ -183,7 +208,26 @@ class MegatronEngine(BaseEngine):
         from verl.utils.torch_dtypes import PrecisionType
 
         self.is_value_model = self.model_config.model_type == "value_model"
+        is_kimi_k3 = _is_kimi_k3_config(self.model_config.hf_config)
         self.share_embeddings_and_output_weights = self.model_config.share_embeddings_and_output_weights
+
+        if is_kimi_k3:
+            if self.engine_config.vanilla_mbridge:
+                raise ValueError("Kimi K3 requires Megatron-Bridge; set vanilla_mbridge=False")
+            if self.engine_config.use_remove_padding:
+                raise ValueError("Kimi K3 Megatron requires use_remove_padding=False (BSHD)")
+            if self.engine_config.dynamic_context_parallel:
+                raise ValueError("Kimi K3 Megatron does not support dynamic_context_parallel")
+            if self.engine_config.context_parallel_size != 1:
+                raise ValueError("Kimi K3 verl integration currently requires context_parallel_size=1")
+            if self.engine_config.use_fused_kernels:
+                raise ValueError("Kimi K3 Megatron does not support fused log-prob kernels")
+            if "seq_length" not in self.engine_config.override_transformer_config:
+                raise ValueError(
+                    "Kimi K3 Megatron requires an explicit static expanded sequence length: "
+                    "set override_transformer_config.seq_length to a value large enough for "
+                    "the raw prompt/response plus projected image tokens"
+                )
 
         check_mtp_config(self.model_config, self.engine_config)
 
@@ -249,6 +293,8 @@ class MegatronEngine(BaseEngine):
             }
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
+            if is_kimi_k3:
+                provider_overrides["attention_backend"] = AttnBackend.auto
             if (
                 self.model_config.hf_config.model_type == "deepseek_v4"
                 and not self.model_config.mtp.enable

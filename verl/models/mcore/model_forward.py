@@ -19,6 +19,7 @@ import torch
 from torch.nested._internal.nested_tensor import NestedTensor
 
 from verl.utils.megatron_utils import unwrap_model
+from verl.utils.model_adapters import kimi_k3_logits_to_input_indices
 from verl.workers.config import MtpConfig
 
 from .util import (
@@ -210,6 +211,91 @@ def _convert_to_nested_tensor(v, input_ids_lengths):
     return v
 
 
+def _pad_kimi_k3_jagged_inputs(
+    input_ids: torch.Tensor,
+    pad_token_id: int,
+    forced_max_seqlen: Optional[int],
+    length_alignment: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Right-pad Kimi's raw-token view before visual-token expansion."""
+    if not isinstance(input_ids, NestedTensor):
+        raise TypeError(f"Kimi K3 Megatron expects jagged input_ids, got {type(input_ids).__name__}")
+
+    batch_size = input_ids.shape[0]
+    lengths = [int(length) for length in input_ids.offsets().diff().tolist()]
+    max_seqlen = max(lengths)
+    if forced_max_seqlen is not None:
+        if forced_max_seqlen < max_seqlen:
+            raise ValueError(
+                f"forced_max_seqlen={forced_max_seqlen} is shorter than Kimi K3 input length {max_seqlen}"
+            )
+        max_seqlen = forced_max_seqlen
+    max_seqlen = (max_seqlen + length_alignment - 1) // length_alignment * length_alignment
+
+    dense = input_ids.to_padded_tensor(
+        pad_token_id,
+        output_size=(batch_size, max_seqlen),
+    )
+    positions = torch.arange(max_seqlen, device=dense.device).unsqueeze(0)
+    length_tensor = torch.tensor(lengths, device=dense.device).unsqueeze(1)
+    valid_mask = positions < length_tensor
+    return dense, valid_mask, lengths
+
+
+def _pad_kimi_k3_argument(
+    value: torch.Tensor,
+    lengths: list[int],
+    max_seqlen: int,
+    *,
+    fill_value: int | float,
+    need_roll: bool = False,
+) -> torch.Tensor:
+    """Pad a jagged raw-token argument to the model's dense input shape."""
+    if not isinstance(value, NestedTensor):
+        raise TypeError(f"Kimi K3 expects jagged logits arguments, got {type(value).__name__}")
+    value_lengths = [int(length) for length in value.offsets().diff().tolist()]
+    if value_lengths != lengths:
+        raise ValueError(f"Kimi K3 logits argument lengths {value_lengths} do not match input lengths {lengths}")
+    dense = value.to_padded_tensor(fill_value, output_size=(len(lengths), max_seqlen))
+    if need_roll:
+        dense = torch.roll(dense, shifts=-1, dims=1)
+    return dense
+
+
+def _kimi_k3_dense_to_jagged(value: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+    pieces = [value[index, :length] for index, length in enumerate(lengths)]
+    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
+
+
+def _select_kimi_k3_raw_logits(
+    logits: torch.Tensor,
+    raw_to_expanded_indices: torch.Tensor,
+    expected_sequence_length: int,
+) -> torch.Tensor:
+    """Restore verl's raw-token coordinates from full expanded logits."""
+    if logits.ndim != 3:
+        raise ValueError(f"Kimi K3 expected 3-D logits, got shape {tuple(logits.shape)}")
+    if logits.shape[1] != expected_sequence_length:
+        raise ValueError(
+            "Kimi K3 output sequence length does not match the expanded layout: "
+            f"logits={logits.shape[1]}, expected={expected_sequence_length}"
+        )
+    if raw_to_expanded_indices.shape[0] != logits.shape[0]:
+        raise ValueError(
+            "Kimi K3 logit index batch size does not match model output: "
+            f"indices={tuple(raw_to_expanded_indices.shape)}, logits={tuple(logits.shape)}"
+        )
+    if raw_to_expanded_indices.numel():
+        first = int(raw_to_expanded_indices.min())
+        last = int(raw_to_expanded_indices.max())
+        if first < 0 or last >= logits.shape[1]:
+            raise ValueError(
+                f"Kimi K3 raw-token logit indices [{first}, {last}] exceed output length {logits.shape[1]}"
+            )
+    batch_indices = torch.arange(logits.shape[0], device=logits.device)[:, None]
+    return logits[batch_indices, raw_to_expanded_indices]
+
+
 def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_attention_mask):
     """Build a nested loss_mask aligned to ``input_ids = [prompt; response]`` for MTP.
 
@@ -259,6 +345,116 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
         pieces.append(full)
 
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
+
+
+def kimi_k3_forward_model_engine(
+    model,
+    input_ids,
+    multi_modal_inputs: dict,
+    logits_processor=None,
+    logits_processor_args: dict = None,
+    value_model=False,
+    vision_model=False,
+    pad_token_id=None,
+    data_format: str = "bshd",
+    mtp_enable_train: bool = False,
+    local_cp_size: Optional[int] = None,
+    forced_max_seqlen: Optional[int] = None,
+    cp_layout: str = "contiguous",
+):
+    """Megatron forward contract for Kimi K3's image-expanded sequence.
+
+    verl keeps labels, masks, and temperatures in raw-token coordinates.  The
+    Kimi replaces each media placeholder with projected image features and
+    computes logits in expanded coordinates. This path contracts those logits
+    back to raw-token positions before verl computes log probabilities.
+    """
+    del vision_model, cp_layout
+    if data_format != "bshd":
+        raise ValueError("Kimi K3 Megatron requires BSHD; set actor/ref megatron.use_remove_padding=False")
+    if mtp_enable_train:
+        raise NotImplementedError("Kimi K3 Megatron does not support MTP training")
+    if local_cp_size is not None:
+        raise NotImplementedError("Kimi K3 Megatron does not support verl dynamic context parallelism")
+    if value_model:
+        raise NotImplementedError("Kimi K3 Megatron value models are not supported")
+
+    unwrapped_model = unwrap_model(model)
+    post_process = unwrapped_model.post_process
+    config = unwrapped_model.config
+    if getattr(config, "context_parallel_size", 1) != 1:
+        raise NotImplementedError("Kimi K3 verl integration currently requires context_parallel_size=1")
+    if pad_token_id is None:
+        raise ValueError("Kimi K3 Megatron requires a tokenizer pad_token_id")
+
+    dense_input_ids, raw_valid_mask, input_lengths = _pad_kimi_k3_jagged_inputs(
+        input_ids,
+        int(pad_token_id),
+        forced_max_seqlen,
+        int(config.tensor_model_parallel_size) if config.sequence_parallel else 1,
+    )
+
+    model_kwargs = {"layout_padding_mask": raw_valid_mask}
+    pixel_values = multi_modal_inputs.get("pixel_values")
+    grid_thws = multi_modal_inputs.get("grid_thws")
+    if (pixel_values is None) != (grid_thws is None):
+        raise ValueError("Kimi K3 pixel_values and grid_thws must be provided together")
+    if pixel_values is not None:
+        model_kwargs.update(
+            pixel_values=pixel_values.to(dense_input_ids.device),
+            grid_thws=grid_thws.to(dense_input_ids.device),
+        )
+
+    raw_to_expanded_indices = kimi_k3_logits_to_input_indices(
+        dense_input_ids,
+        multi_modal_inputs,
+        config,
+        padding_mask=raw_valid_mask,
+    )
+    if raw_to_expanded_indices is None:
+        raw_to_expanded_indices = torch.arange(
+            dense_input_ids.shape[1], device=dense_input_ids.device, dtype=torch.long
+        ).unsqueeze(0).expand_as(dense_input_ids)
+
+    output_orig = model(
+        input_ids=dense_input_ids,
+        attention_mask=None,
+        position_ids=None,
+        **model_kwargs,
+    )
+    if post_process:
+        # ColumnParallelLinear(sequence_parallel=True) gathers the sequence-
+        # sharded hidden states before the vocabulary projection, so its logits
+        # already cover the full expanded sequence. Gathering them again would
+        # concatenate different TP vocabulary shards along the sequence axis.
+        expected_sequence_length = int(config.seq_length) if pixel_values is not None else dense_input_ids.shape[1]
+        output_orig = _select_kimi_k3_raw_logits(
+            output_orig,
+            raw_to_expanded_indices,
+            expected_sequence_length,
+        )
+    if post_process and logits_processor is not None:
+        processor_args = {
+            "label": _pad_kimi_k3_argument(
+                logits_processor_args["label"],
+                input_lengths,
+                dense_input_ids.shape[1],
+                fill_value=int(pad_token_id),
+                need_roll=True,
+            ),
+            "temperature": _pad_kimi_k3_argument(
+                logits_processor_args["temperature"],
+                input_lengths,
+                dense_input_ids.shape[1],
+                fill_value=1.0,
+            ),
+        }
+        output_dict = logits_processor(output_orig, **processor_args)
+        output = {name: _kimi_k3_dense_to_jagged(value, input_lengths) for name, value in output_dict.items()}
+    else:
+        output = output_orig
+
+    return output
 
 
 def gptmodel_forward_model_engine(

@@ -22,7 +22,11 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from .model_forward import gptmodel_forward_model_engine, model_forward_gen
+from .model_forward import (
+    gptmodel_forward_model_engine,
+    kimi_k3_forward_model_engine,
+    model_forward_gen,
+)
 from .model_forward_fused import fused_forward_model_gen, fused_forward_model_engine
 
 
@@ -32,6 +36,7 @@ class SupportedVLM(Enum):
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
     QWEN3_5_MOE_VL = "Qwen3_5MoeForConditionalGeneration"
     QWEN3_5_VL = "Qwen3_5ForConditionalGeneration"
+    KIMI_K3 = "KimiK3ForConditionalGeneration"
 
 
 supported_vlm = [member.value for member in SupportedVLM]
@@ -54,6 +59,8 @@ def get_mcore_engine_forward_fn(hf_config) -> Callable:
     Get the forward function for given model architecture.
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
+    if hf_config.architectures[0] == SupportedVLM.KIMI_K3.value:
+        return kimi_k3_forward_model_engine
     return gptmodel_forward_model_engine
 
 
@@ -74,6 +81,8 @@ def get_mcore_forward_fused_model_engine_fn(hf_config) -> Callable:
     Get the fused forward function for no-padding inputs.
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
+    if hf_config.architectures[0] == SupportedVLM.KIMI_K3.value:
+        raise NotImplementedError("Kimi K3 Megatron does not support fused log-prob kernels")
     if hf_config.architectures[0] in supported_vlm:
         return fused_forward_model_engine(True)
     else:

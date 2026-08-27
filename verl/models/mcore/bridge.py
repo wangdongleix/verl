@@ -14,7 +14,7 @@
 # limitations under the License.
 
 try:
-    from megatron.bridge import AutoBridge
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
     from megatron.bridge.training.utils.train_utils import LinearForLastLayer, freeze_moe_router, make_value_model
 except ImportError:
     # `pip install verl[mcore]` or

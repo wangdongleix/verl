@@ -39,7 +39,7 @@ class KimiK3Adapter(ProcessorAdapter):
     _MEDIA_PROMPT_PATTERN = re.compile(
         r"<\|media_begin\|>image \d+x\d+<\|media_content\|><\|media_pad\|><\|media_end\|>"
     )
-    _VLLM_MEDIA_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+    _VLLM_MEDIA_PROMPT = "<|kimi_image_placeholder|>"
 
     @staticmethod
     def _validate_media(video_data, audio_data):
@@ -83,10 +83,10 @@ class KimiK3Adapter(ProcessorAdapter):
         if image_data is None:
             return {}
         return {
-            "vision_chunk": [
-                image
+            "image": [
+                image["image"]
                 if isinstance(image, dict) and image.get("type") == "image"
-                else {"type": "image", "image": image}
+                else image
                 for image in image_data
             ]
         }
@@ -96,6 +96,7 @@ def kimi_k3_logits_to_input_indices(
     input_ids: torch.Tensor,
     multi_modal_inputs: dict,
     config,
+    padding_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Map raw Kimi K3 token positions to positions after image expansion.
 
@@ -117,7 +118,17 @@ def kimi_k3_logits_to_input_indices(
     image_token_id = getattr(config, "media_placeholder_token_id", None)
     if image_token_id is None:
         raise ValueError("Kimi K3 config is missing media_placeholder_token_id")
+    if padding_mask is not None:
+        if padding_mask.shape != input_ids.shape:
+            raise ValueError(
+                "Kimi K3 padding mask must match input_ids: "
+                f"mask={tuple(padding_mask.shape)}, input_ids={tuple(input_ids.shape)}"
+            )
+        padding_mask = padding_mask.to(device=input_ids.device, dtype=torch.bool)
+
     image_mask = input_ids == image_token_id
+    if padding_mask is not None:
+        image_mask &= padding_mask
     image_count = int(image_mask.sum().item())
     if image_count == 0:
         return None
@@ -150,7 +161,17 @@ def kimi_k3_logits_to_input_indices(
     feature_lengths = (heights // kernel_height) * (widths // kernel_width)
     occupations = torch.ones_like(input_ids, dtype=torch.long)
     occupations[image_mask] = feature_lengths
+    if padding_mask is not None:
+        occupations[~padding_mask] = 0
     indices = occupations.cumsum(dim=-1) - 1
+
+    # Megatron receives a right-padded dense view of verl's jagged input and
+    # passes the same explicit mask to KimiK3Model.build_multimodal_layout.
+    # That model always left-aligns the expanded valid tokens, so its mapping is
+    # complete here.  The legacy HF/FSDP path below retains the padding-side
+    # compatibility logic used by KimiK3ForConditionalGeneration.
+    if padding_mask is not None:
+        return indices
 
     # Mirror KimiK3ForConditionalGeneration._merge_input_ids_with_image_features.
     # It left-aligns right-padded batches and right-aligns left/no-padding batches.
@@ -163,7 +184,6 @@ def kimi_k3_logits_to_input_indices(
         image_padding = max_embed_dim - 1 - indices[:, -1]
         indices = indices + image_padding[:, None]
     return indices
-
 
 _PROCESSOR_ADAPTERS = {
     "KimiK3Processor": KimiK3Adapter,

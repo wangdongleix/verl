@@ -74,6 +74,31 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
+_KIMI_K3_RESPONSE_CLOSE = "<|close|> response <|sep|>"
+
+
+def _add_kimi_k3_stop_conditions(
+    sampling_params: dict[str, Any],
+    model_type: Optional[str],
+    end_of_msg_token_id: int | None,
+) -> None:
+    """Stop Kimi-K3 after its first complete assistant response."""
+    if model_type != "kimi_k3":
+        return
+    if end_of_msg_token_id is None:
+        raise ValueError("Kimi K3 config must define eos_token_id")
+
+    stop_token_ids = list(sampling_params.get("stop_token_ids") or [])
+    if end_of_msg_token_id not in stop_token_ids:
+        stop_token_ids.append(end_of_msg_token_id)
+    sampling_params["stop_token_ids"] = stop_token_ids
+
+    stop = sampling_params.get("stop")
+    stop_strings = [stop] if isinstance(stop, str) else list(stop or [])
+    if _KIMI_K3_RESPONSE_CLOSE not in stop_strings:
+        stop_strings.append(_KIMI_K3_RESPONSE_CLOSE)
+    sampling_params["stop"] = stop_strings
+
 
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
@@ -581,6 +606,11 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        _add_kimi_k3_stop_conditions(
+            sampling_params,
+            getattr(self.model_config.hf_config, "model_type", None),
+            getattr(self.model_config.hf_config, "eos_token_id", None),
+        )
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)

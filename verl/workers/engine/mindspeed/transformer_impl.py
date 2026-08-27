@@ -15,10 +15,23 @@
 import logging
 import os
 
-try:
-    from mindspeed.megatron_adaptor import repatch
-except ImportError:
+_use_megatron_adaptor = os.getenv("VERL_USE_MEGATRON_ADAPTOR", "").lower() in {
+    "1",
+    "true",
+    "enabled",
+}
+
+if _use_megatron_adaptor:
+    from ..bootstrap import bootstrap_megatron_runtime
+
+    bootstrap_megatron_runtime()
     repatch = None
+
+else:
+    try:
+        from mindspeed.megatron_adaptor import repatch
+    except ImportError:
+        repatch = None
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils.megatron.router_replay_patch import RouterReplay
