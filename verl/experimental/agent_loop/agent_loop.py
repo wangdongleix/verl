@@ -76,6 +76,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+KIMI_FULL_MODEL_ROUTE_SEMANTICS = "kimi_full_model_rows_v1"
 
 
 class AgentLoopMetrics(BaseModel):
@@ -100,6 +101,8 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
+    routed_experts_source_semantics: Optional[str] = None
+    """Row-axis contract for routed experts, when it is not raw-token based."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
@@ -126,17 +129,26 @@ class AgentLoopOutput(BaseModel):
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
 
         routed_experts = output.pop("routed_experts", None)
+        route_semantics = output.pop("routed_experts_source_semantics", None)
         if routed_experts is not None:
             routed_experts = torch.tensor(routed_experts, dtype=torch.int64)
-            # Router replay indexes this field by absolute token position, so it must
-            # span the whole sequence. The rollout engine records fewer rows than that:
-            # it only sees tokens fed through the model, and multi-turn loops stop
-            # recording at the last generation. Trailing rows stay zero; replay masks
-            # them out instead of consuming them.
-            total_length = output["prompts"].size(0) + output["responses"].size(0)
-            aligned = routed_experts.new_zeros((total_length, *routed_experts.shape[1:]))
-            num_rows = min(routed_experts.size(0), total_length)
-            aligned[:num_rows] = routed_experts[:num_rows]
+            if route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS:
+                if routed_experts.dim() != 3:
+                    raise ValueError(
+                        "Kimi full R3 routes must be [model_rows, layers, payload], "
+                        f"got {tuple(routed_experts.shape)}"
+                    )
+                # Preserve the image-expanded model axis. Unequal row counts
+                # become a jagged TensorDict field during batch collation.
+                aligned = routed_experts.to(torch.uint8)
+            elif route_semantics is None:
+                # Text-only replay indexes routes by absolute raw-token position.
+                total_length = output["prompts"].size(0) + output["responses"].size(0)
+                aligned = routed_experts.new_zeros((total_length, *routed_experts.shape[1:]))
+                num_rows = min(routed_experts.size(0), total_length)
+                aligned[:num_rows] = routed_experts[:num_rows]
+            else:
+                raise ValueError(f"unsupported routed-experts semantics: {route_semantics!r}")
             output["routed_experts"] = aligned
 
         # rm_scores: reward score for each token
@@ -224,6 +236,7 @@ class AgentLoopBase(ABC):
         processor: AutoProcessor,
         dataset_cls: type[RLHFDataset],
         data_config: DictConfigWrap,
+        kimi_full_r3_topk: int = 0,
         **kwargs,
     ):
         self.config = trainer_config.config
@@ -231,6 +244,7 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+        self.kimi_full_r3_topk = int(kimi_full_r3_topk)
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
@@ -520,6 +534,15 @@ class AgentLoopWorker:
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
 
+        hf_config = self.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        model_type = str(getattr(text_config, "model_type", "")).lower()
+        self.kimi_full_r3_topk = (
+            int(getattr(text_config, "num_experts_per_token", 0) or 0)
+            if model_type in {"kimi_k3", "kimi_linear"}
+            else 0
+        )
+
         self.dataset_cls = get_dataset_class(config.data)
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
@@ -702,6 +725,7 @@ class AgentLoopWorker:
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
+                kimi_full_r3_topk=self.kimi_full_r3_topk,
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)

@@ -22,9 +22,6 @@ _use_megatron_adaptor = os.getenv("VERL_USE_MEGATRON_ADAPTOR", "").lower() in {
 }
 
 if _use_megatron_adaptor:
-    from ..bootstrap import bootstrap_megatron_runtime
-
-    bootstrap_megatron_runtime()
     repatch = None
 
 else:

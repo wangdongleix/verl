@@ -86,7 +86,7 @@ def _is_kimi_k3_config(hf_config) -> bool:
 def _register_kimi_k3_runtime() -> None:
     """Bootstrap the Kimi bridge through MS-Bridge's public runtime API."""
     try:
-        from mindspeed_bridge.runtime.auto_register import ensure_kimi_k3_runtime
+        from mindspeed_bridge.runtime.kimi_k3 import ensure_kimi_k3_runtime
     except ImportError as exc:
         raise RuntimeError(
             "Kimi K3 Megatron requires MS-Bridge-KIMI-K3 to be installed and importable"

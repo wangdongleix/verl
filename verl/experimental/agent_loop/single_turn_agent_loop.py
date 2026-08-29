@@ -16,7 +16,12 @@ import os
 from typing import Any
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.agent_loop import (
+    KIMI_FULL_MODEL_ROUTE_SEMANTICS,
+    AgentLoopBase,
+    AgentLoopOutput,
+    register,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -92,16 +97,38 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
 
+        routed_experts = output.routed_experts
+        route_semantics = None
+        if routed_experts is not None and self.kimi_full_r3_topk:
+            if len(response_ids) > self.response_length:
+                raise ValueError(
+                    "Kimi full R3 cannot truncate generated tokens after route capture"
+                )
+            expected_width = self.kimi_full_r3_topk * 3
+            if routed_experts.ndim != 3 or routed_experts.shape[-1] != expected_width:
+                raise ValueError(
+                    "Kimi full R3 packed route shape mismatch: "
+                    f"got={tuple(routed_experts.shape)}, payload_width={expected_width}"
+                )
+            logical_rows = len(prompt_ids) + len(response_ids)
+            if routed_experts.shape[0] < logical_rows - 1:
+                raise ValueError(
+                    "Kimi full R3 capture is shorter than the causal input: "
+                    f"routes={routed_experts.shape[0]}, logical={logical_rows}"
+                )
+            route_semantics = KIMI_FULL_MODEL_ROUTE_SEMANTICS
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
-                else None
+                routed_experts
+                if route_semantics is not None or routed_experts is None
+                else routed_experts[: len(prompt_ids) + self.response_length]
             ),
+            routed_experts_source_semantics=route_semantics,
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,

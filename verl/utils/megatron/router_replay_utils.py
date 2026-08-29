@@ -300,6 +300,80 @@ def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -
     return torch.nested.nested_tensor_from_jagged(mask_values, offsets=input_ids.offsets())
 
 
+def _prepare_kimi_full_r3_model_rows(
+    payload: torch.Tensor,
+    *,
+    max_model_rows: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad executed image-expanded vLLM rows to Megatron's model axis."""
+    if not payload.is_nested:
+        raise TypeError("Kimi full R3 routes must remain a jagged model-row tensor")
+    if max_model_rows <= 0:
+        raise ValueError("Kimi full R3 requires a positive Megatron model sequence length")
+
+    lengths = payload.offsets().diff()
+    if bool((lengths > max_model_rows).any()):
+        raise ValueError(
+            "Kimi full R3 captured more model rows than Megatron can consume: "
+            f"max_capture={int(lengths.max())}, max_model_rows={max_model_rows}"
+        )
+    batch_size = payload.shape[0]
+    dense = payload.to_padded_tensor(
+        0,
+        output_size=(batch_size, max_model_rows, payload.shape[2], payload.shape[3]),
+    )
+    positions = torch.arange(max_model_rows, device=dense.device).unsqueeze(0)
+    mask = positions < lengths.unsqueeze(1)
+
+    # A natural autoregressive rollout samples its final response token but
+    # never feeds that token back through the model. vLLM may also return
+    # unused request-capacity slots after it; all such packed weight lanes are
+    # zero. Exclude only this verified trailing suffix. An internal hole is an
+    # incomplete capture and must fail closed rather than silently fall back
+    # to native routing.
+    expected_width = topk * 3
+    if dense.shape[-1] != expected_width:
+        raise ValueError(
+            f"Kimi full R3 payload width is {dense.shape[-1]}, expected {expected_width}"
+        )
+    row_has_weights = dense[..., topk:].ne(0).any(dim=(-1, -2))
+    captured_with_weights = mask & row_has_weights
+    empty_captured_rows = mask & ~row_has_weights
+    valid_after = captured_with_weights.flip(1).cumsum(dim=1).flip(1) > 0
+    if bool((empty_captured_rows & valid_after).any()):
+        raise ValueError("Kimi full R3 capture contains an empty internal model row")
+    if bool((captured_with_weights.sum(dim=1) == 0).any()):
+        raise ValueError("Kimi full R3 capture contains no executed model rows")
+    mask = captured_with_weights
+
+    # Megatron's router flattens [sequence, batch], not [batch, sequence].
+    dense = dense.permute(1, 0, 2, 3).reshape(1, max_model_rows * batch_size, *dense.shape[2:])
+    mask = mask.transpose(0, 1).reshape(1, max_model_rows * batch_size)
+    return dense.contiguous(), mask.contiguous()
+
+
+def _decode_kimi_full_r3_payload(
+    payload: torch.Tensor,
+    *,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode IDs and exact BF16 values from ``[ids, low-byte, high-byte]``."""
+    expected_width = topk * 3
+    if payload.shape[-1] != expected_width:
+        raise ValueError(
+            f"Kimi full R3 payload width is {payload.shape[-1]}, expected {expected_width}"
+        )
+    ids = payload[..., :topk].to(torch.int64)
+    low = payload[..., topk : 2 * topk].to(torch.int32)
+    high = payload[..., 2 * topk :].to(torch.int32)
+    if low.numel() and bool(((low < 0) | (low > 255) | (high < 0) | (high > 255)).any()):
+        raise ValueError("Kimi full R3 BF16 byte lane is outside [0, 255]")
+    fp32_bits = ((low | (high << 8)) << 16).contiguous()
+    weights = fp32_bits.view(torch.float32)
+    return ids, weights
+
+
 def set_router_replay_data(
     layers_topk_idx,
     attention_mask,
@@ -337,7 +411,22 @@ def set_router_replay_data(
         )
 
         replay_mask_rmpad = None
-        if layers_topk_idx.is_nested:
+        layers_topk_weight_rmpad = None
+        logical_topk = int(getattr(tf_config, "moe_router_topk", 0) or 0)
+        payload_width = int(layers_topk_idx.shape[-1])
+        packed_full_r3 = logical_topk > 0 and payload_width == logical_topk * 3
+
+        if packed_full_r3:
+            layers_topk_idx_rmpad, replay_mask_rmpad = _prepare_kimi_full_r3_model_rows(
+                layers_topk_idx,
+                max_model_rows=int(getattr(tf_config, "seq_length", 0) or 0),
+                topk=logical_topk,
+            )
+            layers_topk_idx_rmpad, layers_topk_weight_rmpad = _decode_kimi_full_r3_payload(
+                layers_topk_idx_rmpad,
+                topk=logical_topk,
+            )
+        elif layers_topk_idx.is_nested:
             layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(
                 layers_topk_idx,
                 pre_process=True,
@@ -361,6 +450,11 @@ def set_router_replay_data(
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
         ).unsqueeze(dim=0)
+        layers_topk_weight_rmpad_split = None
+        if layers_topk_weight_rmpad is not None:
+            layers_topk_weight_rmpad_split = scatter_to_sequence_parallel_region(
+                layers_topk_weight_rmpad.to(device_name).squeeze(dim=0)
+            ).unsqueeze(dim=0)
         replay_mask_rmpad_split = None
         if replay_mask_rmpad is not None:
             replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
@@ -371,6 +465,9 @@ def set_router_replay_data(
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
             dim=0
         )  # layer_num, dynamic_bs_all, topk
+        layers_topk_weight_reshape = None
+        if layers_topk_weight_rmpad_split is not None:
+            layers_topk_weight_reshape = layers_topk_weight_rmpad_split.permute(0, 2, 1, 3).squeeze(dim=0)
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
         offset, end = local_rank_info["start"], local_rank_info["end"]
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
@@ -392,6 +489,11 @@ def set_router_replay_data(
             router.set_target_indices(
                 layers_topk_idx_reshape[idx].to(torch.int64),
                 replay_mask=replay_mask_rmpad_split,
+                topk_weights=(
+                    layers_topk_weight_reshape[idx]
+                    if layers_topk_weight_reshape is not None
+                    else None
+                ),
             )
             router_offset += 1
             moe_idx += 1

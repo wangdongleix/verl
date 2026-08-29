@@ -90,6 +90,10 @@ export VLLM_VERSION=${VLLM_VERSION:-0.26.0}
 export VLLM_ASCEND_ENABLE_FLASHCOMM=${VLLM_ASCEND_ENABLE_FLASHCOMM:-1}
 export VLLM_ASCEND_ENABLE_NZ=${VLLM_ASCEND_ENABLE_NZ:-0}
 export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-1}
+export KIMI_TRAIN_USE_PARTITION_INVARIANT_KDA_FORWARD=1
+export KIMI_VLLM_USE_PARTITION_INVARIANT_KDA=1
+export KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D=1
+export KIMI_KDA_OPROJ_FP32_REDUCE=1
 
 source_roots=(
     "$TRANSFORMERS_SITE"
@@ -108,6 +112,9 @@ source_roots=(
     "$CANN_TBE_SITE"
 )
 joined_pythonpath=$(IFS=:; echo "${source_roots[*]}")
+if [[ -n "${STRICT_PARITY_PYTHONPATH:-}" ]]; then
+    joined_pythonpath="${STRICT_PARITY_PYTHONPATH}:${joined_pythonpath}"
+fi
 export PYTHONPATH="$joined_pythonpath"
 
 python3 - "$MODEL_PATH/config.json" "$VLLM_SOURCE" "$VLLM_ASCEND_SOURCE" "$MODELOPT_SITE" <<'PY'
@@ -244,6 +251,7 @@ ACTOR=(
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=$ACTOR_EP
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ACTOR_ETP
     actor_rollout_ref.actor.megatron.sequence_parallel=True
+    actor_rollout_ref.actor.megatron.router_replay.mode=R3
     actor_rollout_ref.actor.megatron.param_offload=True
     actor_rollout_ref.actor.megatron.optimizer_offload=True
     actor_rollout_ref.actor.megatron.grad_offload=True
@@ -251,6 +259,9 @@ ACTOR=(
     # The current Ascend fused KDA produces non-finite actor logits for this
     # checkpoint. Keep the portable implementation as the correctness default.
     +actor_rollout_ref.actor.megatron.override_transformer_config.kimi_use_fused_kda=${KIMI_USE_FUSED_KDA:-False}
+    # Use the same MindSpeed Triton short convolution as rollout. The native
+    # grouped conv1d path differs by BF16 rounding before KDA recurrence.
+    +actor_rollout_ref.actor.megatron.override_transformer_config.kimi_use_fused_short_conv=True
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
@@ -291,6 +302,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.free_cache_engine=True
     actor_rollout_ref.rollout.load_format=dummy
     actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.enable_rollout_routing_replay=True
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
@@ -317,6 +329,10 @@ RAY=(
     ++ray_kwargs.ray_init.runtime_env.env_vars.MINDSPEED_BRIDGE_AUTOREG_MODE="$MINDSPEED_BRIDGE_AUTOREG_MODE"
     ++ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_MEGATRON_ADAPTOR="$VERL_USE_MEGATRON_ADAPTOR"
     ++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_VERSION="$VLLM_VERSION"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.KIMI_TRAIN_USE_PARTITION_INVARIANT_KDA_FORWARD=\"${KIMI_TRAIN_USE_PARTITION_INVARIANT_KDA_FORWARD}\""
+    "++ray_kwargs.ray_init.runtime_env.env_vars.KIMI_VLLM_USE_PARTITION_INVARIANT_KDA=\"${KIMI_VLLM_USE_PARTITION_INVARIANT_KDA}\""
+    "++ray_kwargs.ray_init.runtime_env.env_vars.KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D=\"${KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D}\""
+    "++ray_kwargs.ray_init.runtime_env.env_vars.KIMI_KDA_OPROJ_FP32_REDUCE=\"${KIMI_KDA_OPROJ_FP32_REDUCE}\""
     ++ray_kwargs.ray_init.runtime_env.env_vars.HCCL_SOCKET_IFNAME="$HCCL_SOCKET_IFNAME"
     ++ray_kwargs.ray_init.runtime_env.env_vars.GLOO_SOCKET_IFNAME="$GLOO_SOCKET_IFNAME"
     ++ray_kwargs.ray_init.runtime_env.env_vars.HCCL_HOST_SOCKET_PORT_RANGE="$HCCL_HOST_SOCKET_PORT_RANGE"

@@ -84,18 +84,34 @@ class RouterReplay:
     def __init__(self):
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx = None  # For replay
+        self.target_topk_weight = None
         self.target_replay_mask = None
         self.recorded_topk_idx = None  # For recording
         self.router_replay_action = None  # Router replay action for this layer
         self.replay_backward_list = []  # List of tensors for backward pass replay
+        self.replay_backward_weight_list = []
         self.replay_backward_mask_list = []
+        self.active_topk_weight = None
+        self.active_replay_mask = None
         RouterReplay.router_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor, replay_mask: torch.Tensor | None = None):
-        """Sets the target topk indices for replay."""
+    def set_target_indices(
+        self,
+        topk_indices: torch.Tensor,
+        replay_mask: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+    ):
+        """Set externally captured expert IDs and optional executed weights."""
+        if topk_weights is not None and topk_weights.shape != topk_indices.shape:
+            raise ValueError(
+                "replayed expert IDs and weights must have identical shapes: "
+                f"ids={tuple(topk_indices.shape)}, weights={tuple(topk_weights.shape)}"
+            )
         self.target_topk_idx = topk_indices
+        self.target_topk_weight = topk_weights
         self.target_replay_mask = replay_mask
         self.replay_backward_list.append(topk_indices)
+        self.replay_backward_weight_list.append(topk_weights)
         self.replay_backward_mask_list.append(replay_mask)
 
     def get_recorded_indices(self):
@@ -108,6 +124,8 @@ class RouterReplay:
 
     def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
         """Select native or replayed experts using the current replay action."""
+        self.active_topk_weight = None
+        self.active_replay_mask = None
         action = self.router_replay_action
         if action == RouterReplayAction.RECORD:
             probs, indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
@@ -116,26 +134,77 @@ class RouterReplay:
 
         if action == RouterReplayAction.REPLAY_FORWARD and self.target_topk_idx is not None:
             indices = self.target_topk_idx
+            weights = self.target_topk_weight
             replay_mask = self.target_replay_mask
         elif action == RouterReplayAction.REPLAY_BACKWARD and self.replay_backward_list:
             indices = self.replay_backward_list.pop(0)
+            weights = self.replay_backward_weight_list.pop(0)
             replay_mask = self.replay_backward_mask_list.pop(0)
         else:
             return default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
-        indices = indices.to(scores.device)
+        indices = indices.to(device=scores.device, dtype=torch.long)
+        if indices.shape != (scores.shape[0], topk):
+            raise ValueError(
+                "replayed route shape does not match the local router: "
+                f"replay={tuple(indices.shape)}, native={(scores.shape[0], topk)}"
+            )
+        if indices.numel() and (indices.min() < 0 or indices.max() >= scores.shape[1]):
+            raise ValueError("replayed route contains an out-of-range expert ID")
         if replay_mask is not None:
+            replay_mask = replay_mask.to(device=scores.device, dtype=torch.bool).reshape(-1)
+            if replay_mask.numel() != scores.shape[0]:
+                raise ValueError(
+                    "replay mask row count does not match the local router: "
+                    f"mask={replay_mask.numel()}, native={scores.shape[0]}"
+                )
             _, native_indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-            indices = torch.where(replay_mask.to(scores.device).bool().unsqueeze(-1), indices, native_indices)
+            indices = torch.where(replay_mask.unsqueeze(-1), indices, native_indices)
+        if weights is not None:
+            if replay_mask is None:
+                raise ValueError("full R3 replay requires an explicit model-row mask")
+            self.active_topk_weight = weights.to(device=scores.device)
+            self.active_replay_mask = replay_mask
         return scores.gather(1, indices), indices
+
+    def apply_replay_weights(self, probs: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+        """Replay executed weights in forward while retaining local gate gradients."""
+        weights = self.active_topk_weight
+        replay_mask = self.active_replay_mask
+        self.active_topk_weight = None
+        self.active_replay_mask = None
+        if weights is None:
+            return probs
+        if weights.shape != probs.shape:
+            raise ValueError(
+                "replayed weight shape does not match router probabilities: "
+                f"replay={tuple(weights.shape)}, native={tuple(probs.shape)}"
+            )
+        weights = weights.to(dtype=probs.dtype)
+        selected = weights[replay_mask]
+        if selected.numel():
+            if not bool(torch.isfinite(selected).all()) or bool((selected < 0).any()):
+                raise ValueError("replayed router weights must be finite and non-negative")
+            if bool((selected.sum(dim=-1) <= 0).any()):
+                raise ValueError("replayed router weights contain a zero-sum row")
+            if scaling_factor:
+                expected = torch.full_like(selected[:, 0], float(scaling_factor))
+                if not bool(torch.isclose(selected.float().sum(-1), expected.float(), atol=0.02, rtol=0).all()):
+                    raise ValueError("replayed router weights violate the normalized sum contract")
+        replayed = weights + (probs - probs.detach())
+        return torch.where(replay_mask.unsqueeze(-1), replayed, probs)
 
     def clear_indices(self):
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
         self.target_topk_idx = None
+        self.target_topk_weight = None
         self.target_replay_mask = None
         self.replay_backward_list = []
+        self.replay_backward_weight_list = []
         self.replay_backward_mask_list = []
+        self.active_topk_weight = None
+        self.active_replay_mask = None
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """Sets the router replay action for this layer."""
@@ -220,6 +289,9 @@ def _patched_topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    if router_replay is not None:
+        probs = router_replay.apply_replay_weights(probs, scaling_factor)
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]

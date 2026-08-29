@@ -47,11 +47,6 @@ def _parse_response(solution_str: str) -> tuple[str | None, bool]:
     return response.strip(), has_response_open
 
 
-def extract_response(solution_str: str) -> str | None:
-    """Return the response channel, excluding answers from the think channel."""
-    return _parse_response(solution_str)[0]
-
-
 def extract_boxed_integer(response: str) -> int | None:
     """Extract the last boxed integer from a response channel."""
     matches = list(_BOXED_INTEGER_RE.finditer(response))
