@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 
 from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
@@ -32,6 +34,20 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.turbo_config)
         self.fsdp_turbo_config.distributed.fsdp_plan.cpu_offload = self.engine_config.offload_policy
+        attn_implementation = getattr(self.fsdp_turbo_config.model, "attn_implementation", "eager")
+        vision_attn_implementation = os.getenv(
+            "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
+            attn_implementation,
+        )
+        for config in (
+            self.model_config.hf_config,
+            getattr(self.model_config.hf_config, "text_config", None),
+        ):
+            if config is not None:
+                config._attn_implementation = attn_implementation
+        vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            vision_config._attn_implementation = vision_attn_implementation
         init_parallel_state(self.fsdp_turbo_config)
         self._parallel_state = get_parallel_state()
         if self._is_ulysses_enabled():

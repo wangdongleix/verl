@@ -14,6 +14,8 @@
 
 import re
 
+import torch
+
 
 class ProcessorAdapter:
     def __init__(self, processor):
@@ -88,6 +90,79 @@ class KimiK3Adapter(ProcessorAdapter):
                 for image in image_data
             ]
         }
+
+
+def kimi_k3_logits_to_input_indices(
+    input_ids: torch.Tensor,
+    multi_modal_inputs: dict,
+    config,
+) -> torch.Tensor | None:
+    """Map raw Kimi K3 token positions to positions after image expansion.
+
+    Kimi K3 replaces each ``media_placeholder_token_id`` with all projected
+    image features before running the language model.  The returned LM logits
+    therefore have the expanded sequence length, whereas verl's labels and
+    response masks retain the original one-placeholder sequence.  Selecting
+    the first ``raw_sequence_length`` logits shifts every token after an image.
+
+    The index for the placeholder itself is the *last* feature position.  Its
+    causal logit is consequently the one that predicts the first text token
+    after the image, matching the original-token label shift used by verl.
+    """
+    if getattr(config, "model_type", None) != "kimi_k3":
+        return None
+    if input_ids.ndim != 2:
+        raise ValueError(f"Kimi K3 logit alignment expects 2-D input_ids, got {tuple(input_ids.shape)}")
+
+    image_token_id = getattr(config, "media_placeholder_token_id", None)
+    if image_token_id is None:
+        raise ValueError("Kimi K3 config is missing media_placeholder_token_id")
+    image_mask = input_ids == image_token_id
+    image_count = int(image_mask.sum().item())
+    if image_count == 0:
+        return None
+
+    grid_thws = multi_modal_inputs.get("grid_thws")
+    if not isinstance(grid_thws, torch.Tensor):
+        raise ValueError("Kimi K3 image inputs require a grid_thws tensor for logit alignment")
+    grid_thws = grid_thws.reshape(-1, 3).to(device=input_ids.device, dtype=torch.long)
+    if grid_thws.shape[0] != image_count:
+        raise ValueError(
+            "Kimi K3 image placeholder/grid count mismatch: "
+            f"placeholders={image_count}, grids={grid_thws.shape[0]}"
+        )
+
+    vision_config = getattr(config, "vision_config", None)
+    merge_kernel_size = getattr(vision_config, "merge_kernel_size", None)
+    merge_type = getattr(vision_config, "merge_type", None)
+    if merge_type != "sd2_tpool" or not merge_kernel_size or len(merge_kernel_size) != 2:
+        raise ValueError(
+            "Unsupported Kimi K3 vision merge configuration for logit alignment: "
+            f"merge_type={merge_type!r}, merge_kernel_size={merge_kernel_size!r}"
+        )
+    kernel_height, kernel_width = (int(value) for value in merge_kernel_size)
+    heights, widths = grid_thws[:, 1], grid_thws[:, 2]
+    if bool(((heights % kernel_height) != 0).any()) or bool(((widths % kernel_width) != 0).any()):
+        raise ValueError("Kimi K3 grid dimensions must be divisible by merge_kernel_size")
+
+    # tpool_patch_merger averages the temporal dimension and spatially merges
+    # kernel_height x kernel_width patches, so t is deliberately absent here.
+    feature_lengths = (heights // kernel_height) * (widths // kernel_width)
+    occupations = torch.ones_like(input_ids, dtype=torch.long)
+    occupations[image_mask] = feature_lengths
+    indices = occupations.cumsum(dim=-1) - 1
+
+    # Mirror KimiK3ForConditionalGeneration._merge_input_ids_with_image_features.
+    # It left-aligns right-padded batches and right-aligns left/no-padding batches.
+    pad_token_id = getattr(config, "pad_token_id", None)
+    if pad_token_id is None:
+        raise ValueError("Kimi K3 config is missing pad_token_id")
+    left_padding = not bool((input_ids[:, -1] == pad_token_id).sum().item())
+    if left_padding:
+        max_embed_dim = occupations.sum(dim=-1).max()
+        image_padding = max_embed_dim - 1 - indices[:, -1]
+        indices = indices + image_padding[:, None]
+    return indices
 
 
 _PROCESSOR_ADAPTERS = {
