@@ -42,6 +42,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
+from verl.utils.model_adapters import get_vllm_adapter
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import (
     build_rollout_dist_profiler,
@@ -144,6 +145,7 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        self._vllm_adapter = get_vllm_adapter(getattr(self.model_config.hf_config, "model_type", None))
         self._validate_configs()
 
         if self.config.full_determinism:
@@ -574,6 +576,10 @@ class vLLMHttpServer:
             )
 
         prompt_ids = normalize_token_ids(prompt_ids)
+        if self._vllm_adapter is not None:
+            prompt_ids = self._vllm_adapter.prepare_vllm_prompt_ids(
+                prompt_ids, self.model_config.tokenizer, image_data
+            )
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -622,13 +628,16 @@ class vLLMHttpServer:
 
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
+        if self._vllm_adapter is not None:
+            multi_modal_data = self._vllm_adapter.build_vllm_multimodal_data(image_data, video_data, audio_data)
+        else:
+            multi_modal_data = {}
+            if image_data is not None:
+                multi_modal_data["image"] = image_data
+            if video_data is not None:
+                multi_modal_data["video"] = video_data
+            if audio_data is not None:
+                multi_modal_data["audio"] = audio_data
 
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
         if mm_processor_kwargs:
