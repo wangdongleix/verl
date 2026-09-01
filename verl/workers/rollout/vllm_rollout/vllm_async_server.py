@@ -227,6 +227,7 @@ class vLLMHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
+        self._rollout_profile_active = False
 
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
         # admitted after the pause is invisible to the drain's liveness check.
@@ -993,23 +994,35 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
         if self._should_profile():
+            profile_root = self.profiler_controller.config.save_path
+            if not profile_root:
+                raise RuntimeError("Rollout profiler save_path must be configured")
+            save_path = os.path.join(
+                profile_root,
+                f"agent_loop_rollout_replica_{self.replica_rank}",
+            )
+            os.makedirs(save_path, exist_ok=True)
+            logger.info("Starting rollout profiler for replica %s at %s", self.replica_rank, save_path)
             await self.engine.start_profile(**kwargs)
+            self._rollout_profile_active = True
 
     async def stop_profile(self):
         if self.node_rank != 0:
             return
-        if self._should_profile():
-            await self.engine.stop_profile()
-            # Relocate the engine's traces into save_path (when relocate_results is set) so the
-            # training worker's single end-of-run upload of the whole save_path picks them up. The
-            # rollout engine does not run the finish command itself: it shares save_path with the
-            # colocated training worker, so uploading here too would send the same directory twice.
-            relocate_rollout_traces(
-                self.profiler_controller.config,
-                self.replica_rank,
-                self.replica_world_size,
-                self.profiler_keep_global_ranks,
-            )
+        if self._rollout_profile_active:
+            try:
+                await self.engine.stop_profile()
+                # Move engine traces under the shared save path before the
+                # training worker performs its single end-of-run upload.
+                relocate_rollout_traces(
+                    self.profiler_controller.config,
+                    self.replica_rank,
+                    self.replica_world_size,
+                    self.profiler_keep_global_ranks,
+                )
+                logger.info("Stopped rollout profiler for replica %s", self.replica_rank)
+            finally:
+                self._rollout_profile_active = False
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""

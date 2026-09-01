@@ -1510,10 +1510,16 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.llm_server_manager.stop_profile()
+                        try:
+                            combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        finally:
+                            # Flush vLLM/torch_npu traces while the rollout
+                            # workers and their NPU contexts are still awake.
+                            try:
+                                if curr_step_profile:
+                                    self.llm_server_manager.stop_profile()
+                            finally:
+                                self.checkpoint_manager.sleep_replicas()
 
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
