@@ -18,6 +18,7 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
+from verl.workers.rollout.r3_utils import KIMI_FULL_MODEL_ROUTE_SEMANTICS
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -71,12 +72,114 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     data["loss_mask"] = data["response_mask"]
 
     routed_experts = data.get("routed_experts", None)
-    if routed_experts is not None and not routed_experts.is_nested:
-        routed_experts_rmpad = index_first_axis(routed_experts.unsqueeze(-1).flatten(0, 1), indices)
-        routed_experts_nested = torch.nested.nested_tensor_from_jagged(
-            routed_experts_rmpad.squeeze(-1), offsets=cu_seqlens
+    routed_expert_weights = data.get("routed_expert_weights", None)
+    route_semantics = tu.get_non_tensor_data(
+        data,
+        "routed_experts_transport_semantics",
+        None,
+    )
+    if routed_experts is None and routed_expert_weights is not None:
+        raise ValueError(
+            "router weights cannot be padded without expert IDs"
         )
+    if (
+        route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS
+        and routed_experts is not None
+        and routed_expert_weights is None
+    ):
+        raise ValueError(
+            "Kimi full R3 padding requires routed_experts and "
+            "routed_expert_weights together"
+        )
+    if routed_expert_weights is not None and (
+        routed_experts.is_nested != routed_expert_weights.is_nested
+    ):
+        raise ValueError(
+            "full R3 expert IDs and weights must use the same dense/jagged layout"
+        )
+    if routed_expert_weights is not None and routed_experts.is_nested:
+        if not torch.equal(
+            routed_experts.offsets(), routed_expert_weights.offsets()
+        ):
+            raise ValueError(
+                "full R3 expert IDs and weights have different jagged offsets"
+            )
+        if routed_experts.values().shape != routed_expert_weights.values().shape:
+            raise ValueError(
+                "full R3 jagged IDs/weights are misaligned: "
+                f"ids={tuple(routed_experts.values().shape)}, "
+                f"weights={tuple(routed_expert_weights.values().shape)}"
+            )
+    if routed_experts is not None and not routed_experts.is_nested:
+        if (
+            routed_expert_weights is not None
+            and routed_experts.shape != routed_expert_weights.shape
+        ):
+            raise ValueError(
+                "full R3 dense IDs/weights are misaligned: "
+                f"ids={tuple(routed_experts.shape)}, "
+                f"weights={tuple(routed_expert_weights.shape)}"
+            )
+        if route_semantics not in {
+            None,
+            KIMI_FULL_MODEL_ROUTE_SEMANTICS,
+        }:
+            raise ValueError(
+                "unsupported routed-experts transport semantics: "
+                f"{route_semantics!r}"
+            )
+        full_model_transport = (
+            route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS
+        )
+        if routed_experts.max() <= 255:
+            routed_experts = routed_experts.to(torch.uint8)
+        if full_model_transport:
+            # Kimi full R3 uses vLLM's image-expanded model-row axis, which is
+            # independent of tokenizer padding. Equal-length dense captures
+            # are still converted to jagged rows under the explicit contract.
+            route_seq_len = routed_experts.shape[1]
+            route_offsets = torch.arange(
+                0,
+                (routed_experts.shape[0] + 1) * route_seq_len,
+                route_seq_len,
+                dtype=torch.int64,
+                device=routed_experts.device,
+            )
+            routed_experts_nested = torch.nested.nested_tensor_from_jagged(
+                routed_experts.flatten(0, 1), offsets=route_offsets
+            )
+            if routed_expert_weights is not None:
+                routed_expert_weights_nested = (
+                    torch.nested.nested_tensor_from_jagged(
+                        routed_expert_weights.flatten(0, 1),
+                        offsets=route_offsets,
+                    )
+                )
+        else:
+            if routed_experts.shape[1] != attention_mask.shape[1]:
+                raise ValueError(
+                    "logical-token routed experts must match attention-mask "
+                    f"length: routes={routed_experts.shape[1]}, "
+                    f"tokens={attention_mask.shape[1]}"
+                )
+            routed_experts_rmpad = index_first_axis(routed_experts.unsqueeze(-1).flatten(0, 1), indices)
+            routed_experts_nested = torch.nested.nested_tensor_from_jagged(
+                routed_experts_rmpad.squeeze(-1), offsets=cu_seqlens
+            )
+            if routed_expert_weights is not None:
+                routed_expert_weights_rmpad = index_first_axis(
+                    routed_expert_weights.unsqueeze(-1).flatten(0, 1),
+                    indices,
+                )
+                routed_expert_weights_nested = (
+                    torch.nested.nested_tensor_from_jagged(
+                        routed_expert_weights_rmpad.squeeze(-1),
+                        offsets=cu_seqlens,
+                    )
+                )
         data["routed_experts"] = routed_experts_nested
+        if routed_expert_weights is not None:
+            data["routed_expert_weights"] = routed_expert_weights_nested
 
     # (bsz, seqlen, topk)
     teacher_logprobs = data.get("teacher_logprobs", None)

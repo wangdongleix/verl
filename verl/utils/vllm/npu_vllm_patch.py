@@ -17,6 +17,8 @@
 
 from functools import wraps
 
+import torch
+
 from verl.utils.device import is_torch_npu_available
 
 
@@ -52,6 +54,17 @@ def _patch_legacy_fused_moe_weight_loader(fused_moe) -> bool:
     wrapped_weight_loader._verl_npu_weight_loader_patched = True
     fused_moe.weight_loader = wrapped_weight_loader
     return True
+
+
+@torch.no_grad()
+def prepare_npu_moe_weights_for_reload(model) -> None:
+    """Canonicalize Ascend MoE parameters before an online actor reload."""
+    model = getattr(model, "runnable", model)
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        prepare = getattr(method, "prepare_weights_for_loading", None)
+        if callable(prepare):
+            prepare(module)
 
 
 def patch_vllm013_rotary_emb():

@@ -17,10 +17,10 @@ import os
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.utils.device import get_device_name, is_npu_available
+from verl.workers.engine.fsdp.kimi_packed_reshard import KIMI_PACKED_LOCAL_MARKER
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
 
 def apply_npu_fsdp_patches(model_config=None):
     """Apply NPU patches for FSDP backend if NPU is available."""
@@ -99,6 +99,28 @@ def unfuse_moe_params(weights, model_type: str | None = None):
     weight sync, so stream those keys without materializing a full dict.
     """
     for name, tensor in weights:
+        if KIMI_PACKED_LOCAL_MARKER in name:
+            _, _, offset_text = name.rpartition(KIMI_PACKED_LOCAL_MARKER)
+            try:
+                int(offset_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid Kimi packed-local expert offset in parameter name: {name}"
+                ) from exc
+
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi packed-local parameter must be 3-D: {name}, shape={tuple(tensor.shape)}"
+                )
+
+            if model_type != "kimi_k3":
+                raise ValueError(
+                    "Kimi packed-local transport is valid only for the Kimi K3 "
+                    f"rollout loader, got model_type={model_type!r}"
+                )
+            yield name, tensor
+            continue
+
         # GPT-OSS checkpoint weights use packed 3D expert tensors directly.
         # Splitting them into per-expert 2D tensors makes vLLM's GPT-OSS loader
         # index a 2D tensor as 3D during TP slicing.

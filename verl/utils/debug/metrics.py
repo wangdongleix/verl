@@ -108,14 +108,20 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_probs_diff_mean": float("nan"),
             "training/rollout_probs_diff_std": float("nan"),
             "training/rollout_actor_probs_pearson_corr": float("nan"),
+            "training/rollout_log_probs_diff_mean": float("nan"),
         }
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+    log_prob_abs_diff = calculate_log_prob_diff(
+        rollout_old_log_probs, actor_old_log_probs, response_mask_bool
+    )
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
+        # Historical key: this is the mean absolute log-probability difference.
+        "training/rollout_log_probs_diff_mean": log_prob_abs_diff.mean().detach().item(),
     }

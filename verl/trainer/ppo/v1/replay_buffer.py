@@ -31,6 +31,21 @@ VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DE
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 
 
+def _is_materializable_trajectory_tag(tag: dict) -> bool:
+    """Whether a trajectory tag has the length metadata training requires.
+
+    TransferQueue stores metadata and data separately.  If a data write fails,
+    a partial metadata record can remain visible.  Such a record must not enter
+    balancing or padding, both of which require a positive ``seq_len``.
+    """
+    seq_len = tag.get("seq_len")
+    return (
+        isinstance(seq_len, (int, np.integer))
+        and not isinstance(seq_len, (bool, np.bool_))
+        and int(seq_len) > 0
+    )
+
+
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
     """Merge one poll iteration's eviction metrics into ``acc`` in place.
 
@@ -261,7 +276,11 @@ class ReplayBuffer:
             del classification_cache[uid]
 
         new_finished_uids = finished_uids - classification_cache.keys()
-        trajectory_keys = [key for key in self.partitions[partition_id] if key.split("_")[0] in new_finished_uids]
+        trajectory_keys = [
+            key
+            for key, tag in self.partitions[partition_id].items()
+            if key.split("_")[0] in new_finished_uids and _is_materializable_trajectory_tag(tag)
+        ]
         metrics_by_uid: dict[str, list[float]] = defaultdict(list)
         missing_metric_uids = new_finished_uids - {key.split("_")[0] for key in trajectory_keys}
 
@@ -312,7 +331,11 @@ class ReplayBuffer:
         dapo_uids, dapo_counts = self._dapo_filtered_keys(partition_id)
         failed_uids = set()
         if self.sync_refill_failed_groups:
-            materializable_uids = {key.split("_")[0] for key in self.partitions[partition_id]}
+            materializable_uids = {
+                key.split("_")[0]
+                for key, tag in self.partitions[partition_id].items()
+                if _is_materializable_trajectory_tag(tag)
+            }
             failed_uids = self.failure_keys[partition_id] - materializable_uids
         return set(), dapo_uids, failed_uids, dapo_counts
 
@@ -379,13 +402,24 @@ class ReplayBuffer:
     ) -> KVBatchMeta:
         tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
 
-        keys, tags = [], []
+        keys, tags, incomplete_keys = [], [], []
         selected = set(selected_prompt_uids)
         for key, tag in partition_snapshot.items():
             uid = key.split("_")[0]
             if uid in selected:
-                keys.append(key)
-                tags.append(tag)
+                if _is_materializable_trajectory_tag(tag):
+                    keys.append(key)
+                    tags.append(tag)
+                else:
+                    incomplete_keys.append(key)
+        if incomplete_keys:
+            logger.warning(
+                "Discarding %d incomplete TransferQueue trajectory record(s) "
+                "without a positive seq_len; first_keys=%s",
+                len(incomplete_keys),
+                incomplete_keys[:5],
+            )
+            tq.kv_clear(partition_id=partition_id, keys=incomplete_keys)
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
@@ -486,7 +520,10 @@ class ReplayBuffer:
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
         selected_uids = set(selected_prompt_uids)
-        if partition_id != "val" and not any(key.split("_")[0] in selected_uids for key in partition_snapshot):
+        if partition_id != "val" and not any(
+            key.split("_")[0] in selected_uids and _is_materializable_trajectory_tag(tag)
+            for key, tag in partition_snapshot.items()
+        ):
             message = "Sync replay buffer selected terminal groups with no materializable trajectories."
             if not self.sync_refill_failed_groups:
                 message += " Enable trainer.v1.sampler.sync_refill_failed_groups to replace failed groups."

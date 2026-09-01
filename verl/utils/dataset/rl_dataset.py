@@ -265,9 +265,20 @@ class RLHFDataset(Dataset):
                         traceback.print_exc()
                         return self.max_prompt_length + 1
 
+            # Hugging Face Datasets treats ``num_proc=1`` as a real child
+            # process and pickles the whole predicate closure.  Transformers
+            # 5 processors may own an SSLContext, which is deliberately not
+            # pickleable.  Use the true in-process path for a single worker;
+            # retain multiprocessing only when the user explicitly asks for
+            # more than one worker.
+            filter_num_proc = (
+                self.num_workers
+                if self.num_workers is not None and self.num_workers > 1
+                else None
+            )
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=self.num_workers,
+                num_proc=filter_num_proc,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
 

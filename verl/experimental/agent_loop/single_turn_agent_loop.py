@@ -16,10 +16,21 @@ import os
 from typing import Any
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+import torch
+
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
+    AgentLoopOutput,
+    register,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.r3_utils import (
+    KIMI_FULL_MODEL_ROUTE_SEMANTICS,
+    is_kimi_full_r3_config,
+    validate_kimi_full_model_routes,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -33,6 +44,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        self._kimi_full_r3 = bool(
+            self.model_config is not None
+            and is_kimi_full_r3_config(self.model_config.hf_config)
+        )
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
@@ -84,14 +99,49 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
         prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
 
+        if output.routed_experts is None and output.routed_expert_weights is not None:
+            raise RuntimeError(
+                "router weights cannot be transported without expert IDs"
+            )
+        if self._kimi_full_r3 and output.routed_experts is not None:
+            if output.routed_expert_weights is None:
+                raise RuntimeError(
+                    "Kimi full R3 rollout returned expert IDs without executed "
+                    "router weights"
+                )
+            if len(response_ids) > self.response_length:
+                raise ValueError(
+                    "Kimi full-model routing replay cannot truncate generated "
+                    "tokens after route capture: "
+                    f"generated={len(response_ids)}, configured={self.response_length}"
+                )
+            validate_kimi_full_model_routes(
+                torch.as_tensor(output.routed_experts),
+                torch.as_tensor(output.routed_expert_weights),
+                self.model_config.hf_config,
+            )
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
+            # Kimi's vLLM route rows are the complete natural-rollout model
+            # axis: every expanded prompt row followed by generated-token
+            # predecessor rows. Preserve all of them for full R3 replay.
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
+                output.routed_experts
+                if self._kimi_full_r3 or output.routed_experts is None
+                else output.routed_experts[: len(prompt_ids) + self.response_length]
+            ),
+            routed_expert_weights=(
+                output.routed_expert_weights
+                if self._kimi_full_r3 or output.routed_expert_weights is None
+                else output.routed_expert_weights[: len(prompt_ids) + self.response_length]
+            ),
+            routed_experts_source_semantics=(
+                KIMI_FULL_MODEL_ROUTE_SEMANTICS
+                if self._kimi_full_r3 and output.routed_experts is not None
                 else None
             ),
             multi_modal_data=multi_modal_data,

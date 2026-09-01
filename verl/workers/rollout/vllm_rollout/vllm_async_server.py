@@ -54,6 +54,11 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.r3_utils import (
+    decode_kimi_full_r3_payload,
+    get_kimi_full_r3_topk,
+    is_kimi_full_r3_config,
+)
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
@@ -83,6 +88,61 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+_KIMI_K3_END_OF_MSG_TOKEN_ID = 163586
+_KIMI_K3_RESPONSE_CLOSE = "<|close|> response <|sep|>"
+
+
+def _disable_expandable_segments_for_vllm() -> None:
+    """Keep vLLM's CaMem memory pool compatible with torch-npu.
+
+    The colocated FSDP actor benefits from expandable segments, but vLLM's
+    CaMemAllocator explicitly rejects that allocator option.  vLLM servers run
+    in separate Ray actors, so remove only that option in the server process
+    before EngineCore and its TP workers inherit the environment.
+    """
+    env_name = "PYTORCH_NPU_ALLOC_CONF"
+    conf = os.environ.get(env_name, "")
+    options = [option.strip() for option in conf.split(",") if option.strip()]
+    retained = [
+        option for option in options if option.replace(" ", "").lower() != "expandable_segments:true"
+    ]
+    if len(retained) == len(options):
+        return
+
+    if retained:
+        os.environ[env_name] = ",".join(retained)
+    else:
+        os.environ.pop(env_name, None)
+    logger.info("Disabled expandable_segments in %s for the vLLM CaMem memory pool", env_name)
+
+
+def _add_kimi_k3_stop_conditions(sampling_params: dict[str, Any], model_type: Optional[str]) -> None:
+    """Stop a Kimi K3 rollout after its first complete assistant response.
+
+    Kimi's chat template terminates a message with ``<|end_of_msg|>`` instead
+    of the tokenizer's ``[EOS]`` token.  vLLM only stops on the configured EOS
+    by default, so a valid answer otherwise keeps decoding into another XTML
+    block and usually runs to ``response_length``.
+    """
+    if model_type != "kimi_k3":
+        return
+
+    stop_token_ids = list(sampling_params.get("stop_token_ids") or [])
+    if _KIMI_K3_END_OF_MSG_TOKEN_ID not in stop_token_ids:
+        stop_token_ids.append(_KIMI_K3_END_OF_MSG_TOKEN_ID)
+    sampling_params["stop_token_ids"] = stop_token_ids
+
+    stop = sampling_params.get("stop")
+    if stop is None:
+        stop_strings: list[str] = []
+    elif isinstance(stop, str):
+        stop_strings = [stop]
+    else:
+        stop_strings = list(stop)
+    if _KIMI_K3_RESPONSE_CLOSE not in stop_strings:
+        stop_strings.append(_KIMI_K3_RESPONSE_CLOSE)
+    sampling_params["stop"] = stop_strings
 
 
 class vLLMHttpServer:
@@ -439,6 +499,14 @@ class vLLMHttpServer:
                     f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
+            # Kimi extends the legacy ID-only vLLM schema with the BF16
+            # weights that actually entered FusedMoE.  Other model families
+            # retain vLLM's original ID-only replay contract.
+            self._kimi_full_r3_topk = None
+            if is_kimi_full_r3_config(self.model_config.hf_config):
+                self._kimi_full_r3_topk = get_kimi_full_r3_topk(
+                    self.model_config.hf_config
+                )
             args.update({"enable_return_routed_experts": True})
 
         if self._disaggregation_role != "null":
@@ -463,7 +531,9 @@ class vLLMHttpServer:
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
-        # 3. launch server
+        # 3. launch server. The actor/ref workers are separate processes and
+        # keep their expandable-segments allocator setting.
+        _disable_expandable_segments_for_vllm()
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:
@@ -617,6 +687,10 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        _add_kimi_k3_stop_conditions(
+            sampling_params,
+            getattr(self.model_config.hf_config, "model_type", None),
+        )
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
@@ -696,6 +770,7 @@ class vLLMHttpServer:
                 token_ids=[],
                 log_probs=None,
                 routed_experts=None,
+                routed_expert_weights=None,
                 stop_reason="aborted",
                 extra_fields=extra_fields,
             )
@@ -714,8 +789,24 @@ class vLLMHttpServer:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
         routed_experts = None
+        routed_expert_weights = None
         if self.config.enable_rollout_routing_replay:
-            routed_experts = final_res.outputs[0].routed_experts
+            routing_payload = final_res.outputs[0].routed_experts
+            expected_topk = getattr(self, "_kimi_full_r3_topk", None)
+            if routing_payload is None and token_ids:
+                raise RuntimeError(
+                    "routing replay was requested but vLLM returned no routing "
+                    f"payload for {len(token_ids)} generated tokens"
+                )
+            if routing_payload is not None and expected_topk is not None:
+                routed_experts, routed_expert_weights = (
+                    decode_kimi_full_r3_payload(
+                        routing_payload,
+                        expected_topk=expected_topk,
+                    )
+                )
+            elif routing_payload is not None:
+                routed_experts = routing_payload
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
@@ -753,6 +844,7 @@ class vLLMHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
+            routed_expert_weights=routed_expert_weights,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
@@ -831,8 +923,6 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self, tags: list[str] | None = None):
-        if self.node_rank != 0:
-            return
 
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
@@ -852,7 +942,7 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if not self.config.free_cache_engine:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -863,15 +953,14 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
-        if self.node_rank == 0:
-            # reset_connector=True drops any attached external KV store
-            # (e.g. MooncakeStoreConnector) whose entries were computed
-            # against the previous model weights. With no connector it
-            # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+        # reset_connector=True drops any attached external KV store
+        # (e.g. MooncakeStoreConnector) whose entries were computed
+        # against the previous model weights. With no connector it
+        # is a no-op success, so we can pass it unconditionally.
+        await self.engine.reset_prefix_cache(reset_connector=True)
 
-            await self.engine.reset_mm_cache()
-            await self.engine.reset_encoder_cache()
+        await self.engine.reset_mm_cache()
+        await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""

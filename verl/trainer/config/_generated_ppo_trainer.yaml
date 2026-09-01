@@ -31,6 +31,8 @@ actor_rollout_ref:
       param_offload: false
       optimizer_offload: false
       offload_policy: false
+      checkpoint_load_mode: legacy_full_state
+      checkpoint_load_strict: true
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false
@@ -237,6 +239,8 @@ actor_rollout_ref:
       param_offload: false
       optimizer_offload: false
       offload_policy: false
+      checkpoint_load_mode: legacy_full_state
+      checkpoint_load_strict: true
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false

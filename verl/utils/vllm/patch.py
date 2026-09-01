@@ -67,13 +67,6 @@ except ImportError:
     pass
 
 try:
-    from vllm_ascend.models.kimi_k3 import AscendKimiK3ForConditionalGeneration
-
-    SUPPORTED_MOE_MODELS.append(AscendKimiK3ForConditionalGeneration)
-except ImportError:
-    pass
-
-try:
     from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
 
     SUPPORTED_MOE_MODELS.append(Qwen3_5MoeForCausalLM)
@@ -117,13 +110,6 @@ def patch_vllm_moe_model_weight_loader(model):
     except ImportError:
         pass
 
-    try:
-        from vllm_ascend.models.kimi_k3 import AscendKimiK3ForConditionalGeneration
-
-        MLP_ATTR_MAPPING[AscendKimiK3ForConditionalGeneration] = "block_sparse_moe"
-    except ImportError:
-        pass
-
     DEFAULT_MLP_ATTR = "mlp"
 
     # Get inner model (either model.model or model.language_model)
@@ -138,8 +124,6 @@ def patch_vllm_moe_model_weight_loader(model):
     # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
     if type(inner_model).__name__ in ("Qwen3MoeLLMForCausalLM", "Qwen3_5MoeForCausalLM"):
         inner_model = inner_model.model  # Reassign inner_model in Qwen3-vl
-    elif type(model).__name__ in ("AscendKimiK3ForConditionalGeneration", ):
-        inner_model = inner_model.model
 
     for layer_idx, layer in enumerate(inner_model.layers):
         mlp_attr = MLP_ATTR_MAPPING.get(original_model_type, DEFAULT_MLP_ATTR)

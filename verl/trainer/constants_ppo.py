@@ -151,4 +151,22 @@ def get_ppo_ray_runtime_env(config=None):
         val = os.environ.get(key)
         if val is not None:
             runtime_env["env_vars"][key] = val
+
+    # These Kimi-K3/FSDP-Turbo settings are consumed inside Ray workers.  The
+    # Ray cluster may already be running before the PPO driver starts, so
+    # inheriting the driver's shell environment is not reliable.  Forward
+    # them explicitly through the runtime environment instead of silently
+    # falling back to dense eager vision attention or the default HCCL mode.
+    for key in (
+        "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
+        "HCCL_OP_EXPANSION_MODE",
+        "HCCL_EXEC_TIMEOUT",
+        "HCCL_CONNECT_TIMEOUT",
+        "HCCL_ASYNC_ERROR_HANDLING",
+        "HCCL_BUFFSIZE",
+        "P2P_HCCL_BUFFSIZE",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

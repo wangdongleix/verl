@@ -12,18 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
 import os
+from contextlib import contextmanager
 
 import torch
 
 from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+from verl.utils.device import get_device_id, get_device_name
 
 from ..base import EngineRegistry
 from .transformer_impl import FSDPEngineWithLMHead
 
+logger = logging.getLogger(__file__)
+
 
 @EngineRegistry.register(model_type="language_model", backend="fsdp_turbo", device=["cuda", "npu"])
 class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
+    def _streaming_local_load_enabled(self):
+        mode = getattr(self.engine_config, "checkpoint_load_mode", "legacy_full_state")
+        if mode not in {"legacy_full_state", "streaming_local"}:
+            raise ValueError(
+                f"Unsupported FSDP-Turbo checkpoint_load_mode={mode!r}; "
+                "expected 'legacy_full_state' or 'streaming_local'."
+            )
+        if mode == "streaming_local":
+            model_type = getattr(self.model_config.hf_config, "model_type", None)
+            if model_type != "kimi_k3":
+                raise ValueError(
+                    "checkpoint_load_mode=streaming_local currently supports only "
+                    f"Kimi-K3, got model_type={model_type!r}."
+                )
+            return True
+        return False
+
     def _init_device_mesh(self):
         super()._init_device_mesh()
         self._init_parallel_state()
@@ -33,7 +56,24 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, _dict_to_dataclass
 
         self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.turbo_config)
-        self.fsdp_turbo_config.distributed.fsdp_plan.cpu_offload = self.engine_config.offload_policy
+        cpu_offload = bool(self.engine_config.offload_policy or self.engine_config.forward_only)
+        fsdp_plan = self.fsdp_turbo_config.distributed.fsdp_plan
+        fsdp_plan.cpu_offload = cpu_offload
+        if cpu_offload and get_device_name() == "npu":
+            # Avoid asynchronous pinned host copies on the NPU offload path.
+            fsdp_plan.pin_memory = False
+        reshard_after_forward = self.engine_config.reshard_after_forward
+        if reshard_after_forward is None:
+            reshard_after_forward = True
+        fsdp_plan.reshard_after_forward = reshard_after_forward
+        logger.info(
+            "FSDP-Turbo parameter policy: cpu_offload=%s pin_memory=%s "
+            "reshard_after_forward=%s forward_only=%s",
+            cpu_offload,
+            fsdp_plan.pin_memory,
+            reshard_after_forward,
+            self.engine_config.forward_only,
+        )
         attn_implementation = getattr(self.fsdp_turbo_config.model, "attn_implementation", "eager")
         vision_attn_implementation = os.getenv(
             "VERL_FSDP_TURBO_VISION_ATTN_IMPLEMENTATION",
@@ -53,18 +93,46 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         if self._is_ulysses_enabled():
             self._process_ulysses_config()
 
-    def _build_module(self):
+    def _build_module(self, load_pretrained=None, force_meta=False):
         # Do not let verl's Qwen VLM monkey patch slice the text model before
         # FSDP-Turbo's post-fusion model patch does the CP split.
         cp_size = self.ulysses_sequence_parallel_size
         self.ulysses_sequence_parallel_size = 1
         try:
-            return super()._build_module()
+            if self._streaming_local_load_enabled():
+                load_pretrained = False
+                force_meta = True
+            return super()._build_module(load_pretrained=load_pretrained, force_meta=force_meta)
         finally:
             self.ulysses_sequence_parallel_size = cp_size
 
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
+
+        if self._streaming_local_load_enabled():
+            # Wrap the meta model first, then materialize only final local shards.
+            module = FSDPTurbo(self.fsdp_turbo_config, module).model
+            if self.engine_config.offload_policy or self.engine_config.forward_only:
+                self._is_offload_param = False
+                self._is_offload_optimizer = False
+                self._uses_fsdp2_cpu_offload_policy = True
+
+            from .streaming_loader import load_kimi_k3_checkpoint_to_local_shards
+
+            materialize_device = (
+                "cpu"
+                if self.engine_config.offload_policy or self.engine_config.forward_only
+                else get_device_id()
+            )
+            load_kimi_k3_checkpoint_to_local_shards(
+                module,
+                self.model_config.local_path,
+                strict=getattr(self.engine_config, "checkpoint_load_strict", True),
+                materialize_device=materialize_device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            return module
 
         full_state = module.state_dict()
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
@@ -118,6 +186,11 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
             is_collect = True
         return is_collect
 
+    @contextmanager
+    def _gradient_sync_context(self, *, is_last_micro_batch: bool):
+        # FSDP-Turbo owns gradient synchronization at its collective boundary.
+        yield
+
     def optimizer_step(self):
         """
         Clip gradients, skip update if non-finite, and step optimizer.
@@ -137,24 +210,34 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
 
         from fsdp_turbo.training.clip_grads import clip_grad_norm
 
-        grad_norm_value = clip_grad_norm(model=self.module, max_norm=self.optimizer_config.clip_grad)
-        grad_norm = torch.tensor(grad_norm_value, device=next(self.module.parameters()).device, dtype=torch.float32)
-
-        if scaler is not None:
+        grad_norm = clip_grad_norm(model=self.module, max_norm=self.optimizer_config.clip_grad)
+        if not math.isfinite(grad_norm):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            marker = (
+                "FSDP-Turbo NONFINITE GRADIENT: "
+                f"rank={rank} grad_norm={grad_norm} optimizer_step=False"
+            )
+            logger.error(marker)
+            self.optimizer.zero_grad()
+            if os.getenv("VERL_FAIL_ON_NONFINITE_GRAD", "1").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                raise FloatingPointError(marker)
+            if scaler is not None:
+                scaler.update()
+        elif scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
             scaler.update()
         else:
-            # if grad_norm is not finite, skip the update
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: grad_norm is not finite: {grad_norm}")
-                self.optimizer.zero_grad()
-            else:
-                self.optimizer.step()
+            self.optimizer.step()
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales
 
             invalidate_all_scales(self.module)
 
-        return grad_norm.item()
+        return grad_norm
