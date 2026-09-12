@@ -43,6 +43,18 @@ class TestMetrics(unittest.TestCase):
         print(metrics)
         assert metrics["training/rollout_probs_diff_valid"] == 1
 
+    def test_log_prob_diff_mean_is_absolute(self):
+        data = DataProto.from_dict(
+            {
+                "rollout_log_probs": torch.tensor([[-1.0, -2.0, -3.0]]),
+                "old_log_probs": torch.tensor([[-1.5, -1.0, -3.5]]),
+                "response_mask": torch.tensor([[1, 1, 0]]),
+                "responses": torch.zeros((1, 3)),
+            }
+        )
+        metrics = calculate_debug_metrics(data)
+        self.assertAlmostEqual(metrics["training/rollout_log_probs_diff_mean"], 0.75)
+
 
 if __name__ == "__main__":
     unittest.main()
