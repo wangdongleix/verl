@@ -52,10 +52,28 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.rollout.r3_utils import is_kimi_full_r3_config
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _restore_module_buffers_to_device(module) -> None:
+    """Restore non-parameter buffers after an explicit FSDP2 CPU offload.
+
+    ``FSDPEngine.to("cpu")`` uses ``module.cpu()`` for FSDP2 forward-only
+    engines.  That also moves ordinary buffers (for example Kimi's vision
+    RoPE ``time_weight``) to CPU, while the next FSDP pre-forward only
+    re-materializes parameters.  Keeping those buffers on CPU makes the
+    following forward mix CPU RoPE tensors with NPU activations.  Move only
+    buffers back; parameter shards remain offloaded.
+    """
+    device = f"{get_device_name()}:{get_torch_device().current_device()}"
+    for buffer in module.buffers():
+        if buffer is None or str(buffer.device) == device:
+            continue
+        buffer.data = buffer.data.to(device=device, non_blocking=True)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -66,6 +84,17 @@ def _with_routing_replay_flag(enabled: bool):
         def wrapper(self, data: TensorDict, *args, **kwargs):
             if self.enable_routing_replay:
                 tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+                if enabled:
+                    routed_experts = data.get("routed_experts", None)
+                    routed_expert_weights = data.get("routed_expert_weights", None)
+                    if routed_experts is None:
+                        raise RuntimeError(
+                            "routing replay is active but the actor batch does not contain routed_experts"
+                        )
+                    if getattr(self, "_kimi_full_r3_requested", False) and routed_expert_weights is None:
+                        raise RuntimeError(
+                            "Kimi full R3 actor dispatch requires both routed_experts and routed_expert_weights"
+                        )
             return func(self, data, *args, **kwargs)
 
         return wrapper
@@ -495,14 +524,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # engine. Both expose `router_replay` on their per-strategy engine
         # config (the field lives on the shared `EngineConfig` base).
         actor_strategy = self.config.actor.strategy
-        if actor_strategy == "megatron":
+        actor_strategy_name = str(getattr(actor_strategy, "value", actor_strategy)).lower()
+        self._rollout_r3_requested = bool(
+            self._is_actor and self.config.rollout.get("enable_rollout_routing_replay", False)
+        )
+        if actor_strategy_name == "megatron":
             rr_mode = self.config.actor.megatron.router_replay.mode
-        elif actor_strategy == "veomni":
+        elif actor_strategy_name == "veomni":
             rr_mode = self.config.actor.veomni.router_replay.mode
+        elif actor_strategy_name in ("fsdp", "fsdp2", "fsdp_turbo"):
+            # R3 records expert ids in the rollout engine and replays them in
+            # actor forwards.  FSDP has no strategy-local router_replay block,
+            # so the rollout switch is its source of truth.  The existing
+            # decorators below still set the flag to False for reference
+            # forwards and True only for actor infer/update calls.
+            rr_mode = "R3" if self._rollout_r3_requested else "disabled"
         else:
             rr_mode = "disabled"
         self.enable_routing_replay = rr_mode != "disabled"
-
+        if self._rollout_r3_requested and not self.enable_routing_replay:
+            raise RuntimeError(
+                "rollout routing replay was requested but actor replay "
+                f"resolved disabled: role={self.role!r}, "
+                f"strategy={actor_strategy_name!r}, rr_mode={rr_mode!r}"
+            )
         # Keep the raw (un-dataclassed) role profiler config so the inner actor
         # TrainingWorker can build a matching DistProfiler in init_model. Its stages then
         # annotate themselves in the (process-global) torch profiler even though start/stop
@@ -537,7 +582,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
-
+        self._kimi_full_r3_requested = bool(
+            self._rollout_r3_requested and is_kimi_full_r3_config(model_config.hf_config)
+        )
+        if self._kimi_full_r3_requested:
+            rollout_name = str(self.config.rollout.get("name", "")).lower()
+            if rollout_name != "vllm":
+                raise RuntimeError(
+                    "Kimi full R3 requires the vLLM rollout backend because "
+                    "the SGLang/generic backend does not capture executed "
+                    f"router weights; got rollout.name={rollout_name!r}"
+                )
         # 1. build reference model
         if "ref" in self.role:
             # TODO: align ref config with actor config
@@ -645,6 +700,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
+        # Free policy-managed FSDP shards before colocated rollout starts.
+        if "rollout" in self.role:
+            for role in ("ref", "actor"):
+                worker = getattr(self, role, None)
+                if worker is not None and getattr(worker.engine, "_uses_fsdp2_cpu_offload_policy", False):
+                    worker.to(device="cpu", model=True, optimizer=(role == "actor"), grad=True)
+            aggressive_empty_cache(force_sync=True)
+
         # 3. build rollout engine
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
@@ -694,7 +757,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
-        return output.cpu() if output is not None else None
+        # The ref engine is forward-only and uses FSDP2 CPUOffloadPolicy.  That
+        # policy releases full parameters after a forward, but keeps the root
+        # local shards materialized on NPU.  Those shards are not needed during
+        # the subsequent actor update and otherwise share the small HBM margin
+        # with the actor's backward all-gathers.  Park the ref shard explicitly
+        # after the CPU result has been materialized.  ``to("cpu")`` also moves
+        # ordinary buffers; restore only those buffers so the next FSDP forward
+        # does not mix CPU RoPE state with NPU activations.
+        output = output.cpu() if output is not None else None
+        if getattr(self.ref.engine, "_uses_fsdp2_cpu_offload_policy", False):
+            self.ref.engine.to(device="cpu", model=True, optimizer=False, grad=False)
+            _restore_module_buffers_to_device(self.ref.engine.module)
+            aggressive_empty_cache(force_sync=True)
+        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -752,6 +828,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+        rollout_layout = {
+            # RolloutConfig normalizes EP=1 to None, while the resharder uses
+            # an explicit 1 so the single-EP case is handled identically.
+            "expert_parallel_size": getattr(self.config.rollout, "expert_parallel_size", None) or 1,
+            "tensor_parallel_size": getattr(self.config.rollout, "tensor_model_parallel_size", None) or 1,
+            "data_parallel_size": getattr(self.config.rollout, "data_parallel_size", None) or 1,
+            "pipeline_model_parallel_size": getattr(self.config.rollout, "pipeline_model_parallel_size", None) or 1,
+        }
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
@@ -760,7 +844,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param(rollout_layout=rollout_layout)
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
 
@@ -783,7 +867,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 2. determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
+            layered_summon=self.layered_summon,
+            base_sync_done=True,
+            rollout_layout=rollout_layout,
         )
 
         do_lora_base_sync = False
@@ -794,7 +880,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
             per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
+                layered_summon=self.layered_summon,
+                base_sync_done=False,
+                rollout_layout=rollout_layout,
             )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps

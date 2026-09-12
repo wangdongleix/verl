@@ -17,6 +17,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -246,3 +247,43 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+
+
+def test_layerwise_reload_owns_weights_across_reused_buckets():
+    pytest.importorskip("vllm.model_executor.model_loader.reload")
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    model = torch.nn.Linear(3, 2)
+
+    def load_weights(weights):
+        for name, value in weights:
+            parameter = getattr(model, name)
+            parameter.weight_loader(parameter, value)
+
+    model.load_weights = load_weights
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.model_runner = _FakeModelRunner(model)
+    record_metadata_for_reloading(model)
+    addresses = [parameter.data_ptr() for parameter in model.parameters()]
+    bucket = torch.empty(6)
+
+    for step in range(1, 6):
+        initialize_layerwise_reload(model)
+        bucket.fill_(step)
+        worker._update_weights(
+            [("weight", bucket.view(2, 3))], peft_config=None, base_sync_done=True, layerwise_reload=True
+        )
+        bucket.fill_(-step)
+        worker._update_weights(
+            [("bias", bucket[:2])], peft_config=None, base_sync_done=True, layerwise_reload=True
+        )
+        bucket.zero_()
+        finalize_layerwise_reload(model, None)
+
+        torch.testing.assert_close(model.weight, torch.full((2, 3), float(step)))
+        torch.testing.assert_close(model.bias, torch.full((2,), float(-step)))
+        assert [parameter.data_ptr() for parameter in model.parameters()] == addresses

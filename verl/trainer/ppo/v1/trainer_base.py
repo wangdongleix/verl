@@ -1251,12 +1251,13 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "rollout_key", "prompts", "responses", "rm_scores", "reward_model"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
             uids = data.pop("uid").tolist()
+            rollout_keys = data.pop("rollout_key").tolist()
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             scores = data["rm_scores"].sum(dim=1).tolist()
@@ -1269,7 +1270,7 @@ class PPOTrainer(ABC):
 
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
-            for key in batch.keys:
+            for key in rollout_keys:
                 parts = key.rsplit("_", 2)
                 if len(parts) == 3:
                     sort_keys.append((parts[0], int(parts[1]), int(parts[2])))
@@ -1282,7 +1283,10 @@ class PPOTrainer(ABC):
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
 
-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict = {
+                "uid": [rollout_keys[i] for i in sorted_indices],
+                "prompt_uid": [uids[i] for i in sorted_indices],
+            }
 
             self._dump_generations(
                 inputs=inputs,
@@ -1589,10 +1593,13 @@ class PPOTrainer(ABC):
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return batch
 
-        # 1. compute log probs
+        # 1. compute log probs. Entropy is an expensive full-vocabulary
+        # reduction; only request it when it is consumed by the actor config.
+        actor_config = self.config.actor_rollout_ref.actor
+        calculate_entropy = actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0
         batch.extra_info.update(
             {
-                "calculate_entropy": True,
+                "calculate_entropy": calculate_entropy,
                 "compute_loss": False,
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             }
@@ -1600,33 +1607,32 @@ class PPOTrainer(ABC):
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
-        fields = ["entropy", "log_probs", "response_mask"]
+        fields = ["log_probs", "response_mask"]
+        if calculate_entropy:
+            fields.append("entropy")
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
-        batch = tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
-        )
+        output_fields = ["old_log_probs"]
+        if calculate_entropy:
+            data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+            output_fields.append("entropy")
+        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*output_fields))
 
         data = DataProto(batch=data.to_padded_tensor())
 
-        # 3. calculate actor entroy metrics
-        actor_config = self.config.actor_rollout_ref.actor
-        entropy_agg = agg_loss(
-            loss_mat=data.batch["entropy"],
-            loss_mask=data.batch["response_mask"],
-            loss_agg_mode=actor_config.loss_agg_mode,
-            loss_scale_factor=actor_config.loss_scale_factor,
-        )
-        old_log_prob_metrics = {
-            "actor/entropy": entropy_agg.detach().item(),
-            # "perf/mfu/actor_infer": old_log_prob_mfu,
-        }
-        metrics.update(old_log_prob_metrics)
+        # 3. calculate actor entropy metrics only when entropy was requested
+        if calculate_entropy:
+            entropy_agg = agg_loss(
+                loss_mat=data.batch["entropy"],
+                loss_mask=data.batch["response_mask"],
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+            )
+            metrics["actor/entropy"] = entropy_agg.detach().item()
 
         # 4. calculate rollout vs actor logprobs diff
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:

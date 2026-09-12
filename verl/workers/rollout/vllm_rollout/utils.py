@@ -249,6 +249,7 @@ class vLLMColocateWorkerExtension:
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
+        layerwise_finalize = None
 
         # The engine came up on dummy weights, whose init zeroes integer buffers on
         # ROCm -- including the expert-parallel routing maps, which no weight stream
@@ -281,6 +282,18 @@ class vLLMColocateWorkerExtension:
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
+        elif peft_config is None:
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+
+            # vLLM 0.26 keeps kernel-formatted weights after initialization.
+            # Restore checkpoint-format metadata before the bucket stream, then
+            # repack once after the final bucket.
+            for model in self._iter_all_models():
+                initialize_layerwise_reload(model)
+            layerwise_finalize = finalize_layerwise_reload
         else:
             # TODO(wuxibin): not need anymore for newer vllm version.
             for model in self._iter_all_models():
@@ -307,6 +320,7 @@ class vLLMColocateWorkerExtension:
                     list(lora_weights.items()),
                     peft_config=peft_config,
                     base_sync_done=base_sync_done,
+                    layerwise_reload=layerwise_finalize is not None,
                 )
                 lora_weights.clear()
                 return
@@ -314,12 +328,16 @@ class vLLMColocateWorkerExtension:
                 weights,
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
+                layerwise_reload=layerwise_finalize is not None,
             )
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
-        if self._is_qat_model:
+        if layerwise_finalize is not None:
+            for model, model_config in self._iter_all_models_with_config():
+                layerwise_finalize(model, model_config)
+        elif self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
             from verl.utils.qat import manual_process_weights_after_loading
 
@@ -362,6 +380,7 @@ class vLLMColocateWorkerExtension:
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
+        layerwise_reload: bool = False,
     ):
         if peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
@@ -376,6 +395,11 @@ class vLLMColocateWorkerExtension:
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+        elif layerwise_reload:
+            # Layerwise loaders may retain inputs until a later bucket completes
+            # the layer. Own each tensor before the IPC receiver reuses its storage.
+            for model in self._iter_all_models():
+                model.load_weights((name, tensor.clone()) for name, tensor in weights)
         else:
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
             # Add the FP8 related logic here as sharding manager has been deprecated.

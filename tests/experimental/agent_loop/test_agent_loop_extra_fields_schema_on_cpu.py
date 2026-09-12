@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -33,6 +34,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.workers.rollout.r3_utils import KIMI_FULL_MODEL_ROUTE_SEMANTICS
 from verl.workers.rollout.replica import TokenOutput
 
 
@@ -189,6 +191,7 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
     worker.llm_client = object()
     worker.tokenizer = _FakeTokenizer()
     worker.processor = None
+    worker.model_config = object()
     worker.hf_model_type = "qwen2_5_vl"
     worker.dataset_cls = RLHFDataset
     worker.tools = []
@@ -350,7 +353,8 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+@pytest.mark.parametrize("full_r3", [False, True])
+async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu(full_r3):
     class _DummyWorker:
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
         _compute_position_ids = AgentLoopWorker._compute_position_ids
@@ -367,6 +371,10 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
             self.mm_processor_kwargs = {}
             self.reward_loop_worker_handles = None
 
+    worker = _DummyWorker()
+    worker.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="kimi_k3", num_hidden_layers=2, num_experts=8, num_experts_per_token=1)
+    )
     routed_experts = np.arange(8, dtype=np.int64).reshape(4, 2, 1)
     routed_experts.setflags(write=False)
     assert not routed_experts.flags.writeable
@@ -376,6 +384,8 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
         response_ids=[11, 12],
         response_mask=[1, 1],
         routed_experts=routed_experts,
+        routed_expert_weights=np.ones((4, 2, 1), dtype=np.float32) if full_r3 else None,
+        routed_experts_source_semantics=KIMI_FULL_MODEL_ROUTE_SEMANTICS if full_r3 else None,
         metrics=AgentLoopMetrics(),
         extra_fields={},
     )
@@ -387,17 +397,23 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
             category=UserWarning,
         )
         internal = await AgentLoopWorker._agent_loop_postprocess(
-            _DummyWorker(),
+            worker,
             output,
             validate=False,
             raw_prompt=[{"role": "user", "content": "hi"}],
         )
 
-    # Rollout is where routed_experts gets its int16 storage dtype, whatever dtype
-    # the backend handed over.
-    expected = torch.tensor(routed_experts.copy()).to(torch.int16).unsqueeze(0)
+    if full_r3:
+        assert internal.routed_experts.is_nested
+        torch.testing.assert_close(
+            internal.routed_experts.values(), torch.tensor(routed_experts.copy()).to(torch.uint8)
+        )
+        torch.testing.assert_close(internal.routed_expert_weights.values(), torch.ones(4, 2, 1))
+        return
+
+    expected = torch.tensor(routed_experts.copy()).unsqueeze(0)
     assert internal.routed_experts is not None
-    assert internal.routed_experts.dtype == torch.int16
+    assert internal.routed_experts.dtype == expected.dtype
     assert internal.routed_experts.shape == (1, 8, 2, 1)
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0

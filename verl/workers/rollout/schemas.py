@@ -24,6 +24,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, Processor
 
 from verl.tools.schemas import OpenAIFunctionToolCall, OpenAIFunctionToolSchema, ToolResponse
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.model_adapters import ProcessorAdapter
 from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 logger = logging.getLogger(__file__)
@@ -255,7 +256,7 @@ class AsyncRolloutRequest(BaseModel):
                     "There is multi_modal_data but you are not using a processor. Multi-modal data will be ignored."
                 )
             model_inputs = processing_class(text=[raw_prompt], return_tensors="pt")
-        elif isinstance(processing_class, ProcessorMixin):
+        elif isinstance(processing_class, ProcessorMixin | ProcessorAdapter):
             images = images if len(images := multi_modal_data.get("image", [])) > 0 else None
             videos = videos if len(videos := multi_modal_data.get("video", [])) > 0 else None
             audio = audio if len(audio := multi_modal_data.get("audio", [])) > 0 else None

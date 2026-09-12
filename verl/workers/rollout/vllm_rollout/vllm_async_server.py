@@ -42,6 +42,8 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
+from verl.utils.model_adapters import add_kimi_k3_stop_conditions as _add_kimi_k3_stop_conditions
+from verl.utils.model_adapters import get_vllm_adapter
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import (
     build_rollout_dist_profiler,
@@ -53,6 +55,11 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.r3_utils import (
+    decode_kimi_full_r3_payload,
+    get_kimi_full_r3_topk,
+    is_kimi_full_r3_config,
+)
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
     get_max_position_embeddings,
@@ -82,6 +89,28 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _disable_expandable_segments_for_vllm() -> None:
+    """Keep vLLM's CaMem memory pool compatible with torch-npu.
+
+    The colocated FSDP actor benefits from expandable segments, but vLLM's
+    CaMemAllocator explicitly rejects that allocator option.  vLLM servers run
+    in separate Ray actors, so remove only that option in the server process
+    before EngineCore and its TP workers inherit the environment.
+    """
+    env_name = "PYTORCH_NPU_ALLOC_CONF"
+    conf = os.environ.get(env_name, "")
+    options = [option.strip() for option in conf.split(",") if option.strip()]
+    retained = [option for option in options if option.replace(" ", "").lower() != "expandable_segments:true"]
+    if len(retained) == len(options):
+        return
+
+    if retained:
+        os.environ[env_name] = ",".join(retained)
+    else:
+        os.environ.pop(env_name, None)
+    logger.info("Disabled expandable_segments in %s for the vLLM CaMem memory pool", env_name)
 
 
 class vLLMHttpServer:
@@ -144,6 +173,7 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        self._vllm_adapter = get_vllm_adapter(getattr(self.model_config.hf_config, "model_type", None))
         self._validate_configs()
 
         if self.config.full_determinism:
@@ -446,6 +476,12 @@ class vLLMHttpServer:
                     f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
+            # Kimi extends the legacy ID-only vLLM schema with the BF16
+            # weights that actually entered FusedMoE.  Other model families
+            # retain vLLM's original ID-only replay contract.
+            self._kimi_full_r3_topk = None
+            if is_kimi_full_r3_config(self.model_config.hf_config):
+                self._kimi_full_r3_topk = get_kimi_full_r3_topk(self.model_config.hf_config)
             args.update({"enable_return_routed_experts": True})
 
         if self._disaggregation_role != "null":
@@ -470,7 +506,9 @@ class vLLMHttpServer:
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
-        # 3. launch server
+        # 3. launch server. The actor/ref workers are separate processes and
+        # keep their expandable-segments allocator setting.
+        _disable_expandable_segments_for_vllm()
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:
@@ -583,6 +621,8 @@ class vLLMHttpServer:
             )
 
         prompt_ids = normalize_token_ids(prompt_ids)
+        if self._vllm_adapter is not None:
+            prompt_ids = self._vllm_adapter.prepare_vllm_prompt_ids(prompt_ids, self.model_config.tokenizer, image_data)
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -620,6 +660,11 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        _add_kimi_k3_stop_conditions(
+            sampling_params,
+            getattr(self.model_config.hf_config, "model_type", None),
+            getattr(self.model_config.hf_config, "eos_token_id", None),
+        )
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
@@ -631,13 +676,16 @@ class vLLMHttpServer:
 
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
+        if self._vllm_adapter is not None:
+            multi_modal_data = self._vllm_adapter.build_vllm_multimodal_data(image_data, video_data, audio_data)
+        else:
+            multi_modal_data = {}
+            if image_data is not None:
+                multi_modal_data["image"] = image_data
+            if video_data is not None:
+                multi_modal_data["video"] = video_data
+            if audio_data is not None:
+                multi_modal_data["audio"] = audio_data
 
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
         if mm_processor_kwargs:
@@ -696,6 +744,7 @@ class vLLMHttpServer:
                 token_ids=[],
                 log_probs=None,
                 routed_experts=None,
+                routed_expert_weights=None,
                 stop_reason="aborted",
                 extra_fields=extra_fields,
             )
@@ -714,8 +763,22 @@ class vLLMHttpServer:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
         routed_experts = None
+        routed_expert_weights = None
         if self.config.enable_rollout_routing_replay:
-            routed_experts = final_res.outputs[0].routed_experts
+            routing_payload = final_res.outputs[0].routed_experts
+            expected_topk = getattr(self, "_kimi_full_r3_topk", None)
+            if routing_payload is None and token_ids:
+                raise RuntimeError(
+                    "routing replay was requested but vLLM returned no routing "
+                    f"payload for {len(token_ids)} generated tokens"
+                )
+            if routing_payload is not None and expected_topk is not None:
+                routed_experts, routed_expert_weights = decode_kimi_full_r3_payload(
+                    routing_payload,
+                    expected_topk=expected_topk,
+                )
+            elif routing_payload is not None:
+                routed_experts = routing_payload
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
@@ -753,6 +816,7 @@ class vLLMHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
+            routed_expert_weights=routed_expert_weights,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
@@ -831,8 +895,6 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self, tags: list[str] | None = None):
-        if self.node_rank != 0:
-            return
 
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
@@ -852,7 +914,7 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if not self.config.free_cache_engine:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -863,15 +925,14 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
-        if self.node_rank == 0:
-            # reset_connector=True drops any attached external KV store
-            # (e.g. MooncakeStoreConnector) whose entries were computed
-            # against the previous model weights. With no connector it
-            # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+        # reset_connector=True drops any attached external KV store
+        # (e.g. MooncakeStoreConnector) whose entries were computed
+        # against the previous model weights. With no connector it
+        # is a no-op success, so we can pass it unconditionally.
+        await self.engine.reset_prefix_cache(reset_connector=True)
 
-            await self.engine.reset_mm_cache()
-            await self.engine.reset_encoder_cache()
+        await self.engine.reset_mm_cache()
+        await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""

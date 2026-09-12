@@ -43,6 +43,8 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
+    routed_expert_weights: Optional[Any] = None
+    """router weights paired elementwise with routed_experts"""
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
