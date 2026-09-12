@@ -26,7 +26,7 @@ from typing import Callable, ContextManager, Optional
 import torch
 import torch.distributed
 from peft import LoraConfig, TaskType, get_peft_model
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
@@ -61,6 +61,7 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.model_adapters import kimi_k3_logits_to_input_indices
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.seqlen_balancing import ceildiv
 from verl.utils.torch_functional import logprobs_from_logits
@@ -72,10 +73,14 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+from verl.workers.rollout.r3_utils import (
+    KIMI_FULL_MODEL_ROUTE_SEMANTICS,
+)
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, pad_packed_inputs, postprocess_batch_func, prepare_micro_batches
+from .kimi_packed_weights import export_kimi_packed_local_param
 from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
@@ -96,6 +101,130 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     if is_unit_temperature:
         return logits
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
+
+
+def _resolve_uniform_route_transport_semantics(value):
+    """Collapse TransferQueue's per-sample metadata to one batch contract."""
+    value = tu.unwrap_non_tensor_data(value)
+    if isinstance(value, NonTensorStack):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        values = [tu.unwrap_non_tensor_data(item) for item in value]
+        if not values:
+            return None
+        first = values[0]
+        if any(item != first for item in values[1:]):
+            raise RuntimeError(
+                f"FSDP Kimi R3 cannot mix routed-experts transport semantics within one microbatch, got {values!r}"
+            )
+        return first
+    return value
+
+
+def _build_kimi_full_model_route_mask(
+    padded_routes: torch.Tensor,
+    route_lengths: torch.Tensor,
+    model_attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Build the jagged source mask for vLLM's complete causal model rows.
+
+    The exact image-expanded alignment is intentionally deferred to the Kimi
+    multimodal merge, where FSDP's final model-row attention mask is known.
+    Here we validate the batch/ragged contract. Exact row-count validation is
+    deferred to the multimodal merge, after image expansion is known.
+    """
+    if padded_routes.dim() != 4:
+        raise ValueError(f"padded_routes must be [batch, route_rows, layers, topk], got {tuple(padded_routes.shape)}")
+    if model_attention_mask.dim() != 2:
+        raise ValueError(f"Kimi full-model R3 requires a 2-D attention mask, got {tuple(model_attention_mask.shape)}")
+    batch_size = padded_routes.shape[0]
+    if model_attention_mask.shape[0] != batch_size or route_lengths.numel() != batch_size:
+        raise ValueError(
+            "Kimi full-model R3 batch mismatch: "
+            f"routes={batch_size}, attention={model_attention_mask.shape[0]}, "
+            f"route_lengths={route_lengths.numel()}"
+        )
+    route_lengths = route_lengths.to(device=padded_routes.device, dtype=torch.long)
+    return torch.arange(padded_routes.shape[1], device=padded_routes.device).unsqueeze(0) < route_lengths.unsqueeze(1)
+
+
+def _is_kimi_packed_expert_param(name: str, param: torch.Tensor) -> bool:
+    return (
+        isinstance(param, DTensor)
+        and param.ndim == 3
+        and name.endswith(
+            (
+                ".block_sparse_moe.experts.gate_up_proj",
+                ".block_sparse_moe.experts.down_proj",
+            )
+        )
+    )
+
+
+def _get_fsdp2_parameter_export(module):
+    """Return live FSDP2 handles, preserving tied aliases for weight sync."""
+    return dict(module.named_parameters(remove_duplicate=False))
+
+
+def _is_weight_source_rank(mesh) -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    if mesh is None:
+        return torch.distributed.get_rank() == 0
+    coordinate = mesh.get_coordinate()
+    return coordinate is None or coordinate[-1] == 0
+
+
+def _load_hf_language_model(
+    auto_class,
+    model_config,
+    torch_dtype,
+    load_pretrained=True,
+):
+    if not load_pretrained:
+        return auto_class.from_config(
+            model_config.hf_config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=model_config.trust_remote_code,
+        )
+    return auto_class.from_pretrained(
+        pretrained_model_name_or_path=model_config.local_path,
+        torch_dtype=torch_dtype,
+        config=model_config.hf_config,
+        trust_remote_code=model_config.trust_remote_code,
+    )
+
+
+def _select_raw_token_logits(logits: torch.Tensor, indices: torch.Tensor | None) -> torch.Tensor:
+    """Contract image-expanded logits back to the raw input-token sequence."""
+    if indices is None:
+        return logits
+    if logits.ndim != 3 or indices.ndim != 2 or logits.shape[0] != indices.shape[0]:
+        raise ValueError(
+            f"Invalid multimodal logit alignment shapes: logits={tuple(logits.shape)}, indices={tuple(indices.shape)}"
+        )
+    indices = indices.to(device=logits.device, dtype=torch.long)
+    expanded_length = int(indices.max().item()) + 1
+    if logits.shape[1] != expanded_length:
+        raise ValueError(
+            "Multimodal logit length does not match the reconstructed expanded sequence: "
+            f"logits={logits.shape[1]}, reconstructed={expanded_length}"
+        )
+    batch_indices = torch.arange(logits.shape[0], device=logits.device)[:, None]
+    return logits[batch_indices, indices]
+
+
+def _move_multimodal_inputs_to_device(value, device):
+    # Move tensor leaves from non-tensor multimodal replay data to the model device.
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, list):
+        return [_move_multimodal_inputs_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_multimodal_inputs_to_device(item, device) for item in value)
+    if isinstance(value, dict):
+        return {key: _move_multimodal_inputs_to_device(item, device) for key, item in value.items()}
+    return value
 
 
 class FSDPEngine(BaseEngine):
@@ -246,7 +375,7 @@ class FSDPEngine(BaseEngine):
 
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-    def _build_module(self):
+    def _build_module(self, load_pretrained=None, force_meta=False):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
 
@@ -258,21 +387,29 @@ class FSDPEngine(BaseEngine):
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
-        )
+        if force_meta:
+            # Streaming FSDP-Turbo loading materializes only the final local
+            # DTensor shard.  No rank may construct the full CPU model.
+            from accelerate import init_empty_weights
+
+            init_context = init_empty_weights
+        else:
+            init_context = get_init_weight_context_manager(
+                use_meta_tensor=not self.model_config.hf_config.tie_word_embeddings, mesh=self.device_mesh
+            )
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
-
-                module = auto_class.from_pretrained(
-                    pretrained_model_name_or_path=self.model_config.local_path,
+                if load_pretrained is None:
+                    load_pretrained = _is_weight_source_rank(self.device_mesh)
+                module = _load_hf_language_model(
+                    auto_class=auto_class,
+                    model_config=self.model_config,
                     torch_dtype=torch_dtype,
-                    config=self.model_config.hf_config,
-                    trust_remote_code=self.model_config.trust_remote_code,
+                    load_pretrained=load_pretrained,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
@@ -454,7 +591,12 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.offload_policy or self.engine_config.forward_only:
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
-                offload_policy = CPUOffloadPolicy(pin_memory=True)
+                # torch_npu cannot reliably complete the asynchronous pinned-CPU
+                # destination used by FSDP2 foreach_reduce().  It reports a null
+                # destination during the first actor backward even when HBM is
+                # available.  Keep CPU offload, but use synchronous pageable host
+                # copies on NPU; CUDA retains the pinned-copy fast path.
+                offload_policy = CPUOffloadPolicy(pin_memory=get_device_name() != "npu")
                 self._uses_fsdp2_cpu_offload_policy = True
 
             fsdp_kwargs = {
@@ -844,7 +986,13 @@ class FSDPEngine(BaseEngine):
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
         if self.engine_config.forward_only:
-            # force cpu_offload
+            # FSDP1's CPUOffload handles forward-only parameters itself, but
+            # FSDP2/FSDP-Turbo's CPUOffloadPolicy does not move the initial
+            # materialized shard when an explicit to("cpu") is requested.
+            # Keep the policy for normal execution while honoring this manual
+            # residency transition so colocated vLLM can reclaim the NPU.
+            if device == "cpu" and model:
+                offload_fsdp_model_to_cpu(self.module)
             return
 
         device_name = get_device_name()
@@ -923,7 +1071,8 @@ class FSDPEngine(BaseEngine):
         _needs_staging = fsdp_version(self.module) == 1
         if _needs_staging and not self._uses_fsdp2_cpu_offload_policy:
             load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
+        use_live_fsdp2_params = fsdp_version(self.module) == 2 and self._uses_fsdp2_cpu_offload_policy
+        params = _get_fsdp2_parameter_export(self.module) if use_live_fsdp2_params else self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
         if _needs_staging and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
@@ -939,7 +1088,11 @@ class FSDPEngine(BaseEngine):
                 if p.is_floating_point():
                     p = p.to(torch.bfloat16, non_blocking=True)
                 local = p.to_local() if hasattr(p, "to_local") else p
-                yield name, local.reshape(-1), spec
+                # ``named_parameters`` preserves autograd-connected live
+                # handles.  The old state_dict path detached them implicitly;
+                # detach only after device staging so CPUOffloadPolicy never
+                # sees the invalid CPU-wrapper/NPU-storage combination.
+                yield name, local.reshape(-1).detach(), spec
 
         return _gen(), None
 
@@ -971,6 +1124,8 @@ class FSDPEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        kimi_rollout_layout = kwargs.pop("rollout_layout", None)
+        kimi_model = self.model_config.hf_config.model_type == "kimi_k3"
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -983,6 +1138,9 @@ class FSDPEngine(BaseEngine):
         # (adapter merge does real weight math on the module).
         _is_peft = hasattr(getattr(self.module, "_fsdp_wrapped_module", self.module), "peft_config")
         _skip_staging = fsdp_version(self.module) == 2 and not _is_peft
+        use_live_fsdp2_params = (
+            fsdp_version(self.module) == 2 and (self._uses_fsdp2_cpu_offload_policy or kimi_model) and not _is_peft
+        )
         if not self._uses_fsdp2_cpu_offload_policy and not _skip_staging:
             load_fsdp_model_to_gpu(self.module)
 
@@ -1009,7 +1167,18 @@ class FSDPEngine(BaseEngine):
                 # Materializing after exit silently sends base weights without adapters.
                 return self._merged_lora_per_tensor_param(), None
         else:
-            params = self.module.state_dict()
+            # Kimi routed experts are already packed and Shard(0)-distributed
+            # over the EP mesh.  Keep those physical DTensors in the online
+            # state dict; rewriting them to per-expert w1/w2/w3 here triggers
+            # a full EP all-gather for every layer before rollout can discard
+            # all non-local experts again.
+            if use_live_fsdp2_params:
+                params = _get_fsdp2_parameter_export(self.module)
+            else:
+                # Packed Kimi experts now use nn.Module's physical state-dict
+                # ABI unconditionally. External w1/w2/w3 conversion is an
+                # explicit rank-0 HF-checkpoint post-process only.
+                params = self.module.state_dict()
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
@@ -1021,14 +1190,31 @@ class FSDPEngine(BaseEngine):
         if peft_config is not None and base_sync_done:
             per_tensor_param = params.items()
         else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
-                )
-                for name, param in params.items()
-            )
+            device = get_device_id()
+
+            def iter_rollout_params():
+                for name, param in params.items():
+                    if _is_kimi_packed_expert_param(name, param):
+                        marked_name, local_param = export_kimi_packed_local_param(
+                            name, param, device, kimi_rollout_layout
+                        )
+                        # ``state_dict(keep_vars=False)`` used to provide a
+                        # detached tensor.  Preserve that transport contract
+                        # after the packed-local DTensor has been staged.
+                        yield marked_name, local_param.detach()
+                    else:
+                        if isinstance(param, DTensor):
+                            # Detach the materialized result, not the live
+                            # CPU-offloaded DTensor handle.
+                            export_param = param.to(device, non_blocking=True).full_tensor().detach()
+                        else:
+                            # Unwrapped parameters are not subject to FSDP2's
+                            # DTensor staging.  Match state_dict's default
+                            # keep_vars=False behavior for the transport.
+                            export_param = param.detach()
+                        yield name, export_param
+
+            per_tensor_param = iter_rollout_params()
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 
         if self._qat_enabled:
@@ -1107,12 +1293,17 @@ class EngineEvalModeCtx(BaseEngineCtx):
         set_ulysses_sequence_parallel_group(self.prev_sp_group)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.engine.engine_config.fsdp_size > 1:
-            if fsdp_version(self.engine.module) == 1:
-                self.engine.module._handle.reshard(True)
-            elif fsdp_version(self.engine.module) == 2:
-                self.engine.module.reshard()
+        # Reshard every FSDP unit before leaving eval. FSDPModule.reshard() is
+        # explicitly non-recursive, so calling it only on the root leaves nested
+        # all-gather storage alive and carries the old-logprob forward peak into
+        # the following actor backward. Traverse children first, then the root.
+        version = fsdp_version(self.engine.module)
+        if version == 1 and self.engine.engine_config.fsdp_size > 1:
+            self.engine.module._handle.reshard(True)
+        elif version == 2:
+            for module in reversed(list(self.engine.module.modules())):
+                if isinstance(module, FSDPModule):
+                    module.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
 
@@ -1161,9 +1352,42 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
-        multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        enable_routing_replay = tu.get_non_tensor_data(data=micro_batch, key="enable_routing_replay", default=False)
+        routed_experts = micro_batch.get("routed_experts", None) if enable_routing_replay else None
+        routed_expert_weights = micro_batch.get("routed_expert_weights", None) if enable_routing_replay else None
+        if enable_routing_replay and (routed_experts is None or routed_expert_weights is None):
+            raise RuntimeError(
+                "FSDP full R3 replay is enabled for this actor forward, but "
+                "the batch does not contain both routed_experts and "
+                "routed_expert_weights"
+            )
+        if routed_experts is not None and use_remove_padding:
+            raise NotImplementedError(
+                "Kimi-K3 FSDP R3 replay currently requires model.use_remove_padding=False so "
+                "multimodal model-row routes stay independently aligned"
+            )
+        if routed_experts is not None:
+            if routed_experts.is_nested != routed_expert_weights.is_nested:
+                raise RuntimeError("FSDP full R3 IDs and weights use different dense/jagged layouts")
+            route_semantics = _resolve_uniform_route_transport_semantics(
+                tu.get_non_tensor_data(
+                    data=micro_batch,
+                    key="routed_experts_transport_semantics",
+                    default=None,
+                )
+            )
+            if route_semantics != KIMI_FULL_MODEL_ROUTE_SEMANTICS:
+                raise RuntimeError(
+                    "FSDP Kimi R3 requires explicit natural-rollout full-model "
+                    "transport semantics, got "
+                    f"{route_semantics!r}"
+                )
+        multi_modal_inputs = _move_multimodal_inputs_to_device(
+            extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", [])),
+            input_ids.device,
+        )
         pass_packed_cu_seqlens = getattr(self, "pass_packed_cu_seqlens", False)
 
         if not isinstance(temperature, torch.Tensor):
@@ -1304,6 +1528,85 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     "position_ids": position_ids,
                 }
 
+                if routed_experts is not None:
+                    if routed_experts.is_nested:
+                        route_lengths = routed_experts.offsets().diff()
+                        route_values = routed_experts.values()
+                        weight_values = routed_expert_weights.values()
+                        if not torch.equal(
+                            routed_experts.offsets(),
+                            routed_expert_weights.offsets(),
+                        ):
+                            raise ValueError("nested full R3 IDs and weights have different offsets")
+                        if route_values.dim() != 3:
+                            raise ValueError(
+                                "nested routed_experts values must be [total_rows, layers, topk], "
+                                f"got {tuple(route_values.shape)}"
+                            )
+                        if weight_values.shape != route_values.shape:
+                            raise ValueError(
+                                "nested full R3 IDs/weights are misaligned: "
+                                f"ids={tuple(route_values.shape)}, "
+                                f"weights={tuple(weight_values.shape)}"
+                            )
+                        if not weight_values.is_floating_point():
+                            raise TypeError(f"nested full R3 weights must be floating point, got {weight_values.dtype}")
+                        max_route_len = int(route_lengths.max().item())
+                        routed_experts_padded = torch.nested.to_padded_tensor(
+                            routed_experts,
+                            padding=0,
+                            output_size=(
+                                batch_size,
+                                max_route_len,
+                                route_values.shape[-2],
+                                route_values.shape[-1],
+                            ),
+                        )
+                        routed_expert_weights_padded = torch.nested.to_padded_tensor(
+                            routed_expert_weights,
+                            padding=0.0,
+                            output_size=(
+                                batch_size,
+                                max_route_len,
+                                weight_values.shape[-2],
+                                weight_values.shape[-1],
+                            ),
+                        )
+                    else:
+                        if routed_experts.dim() != 4:
+                            raise ValueError(
+                                "routed_experts must be [batch, model_rows, layers, topk], "
+                                f"got {tuple(routed_experts.shape)}"
+                            )
+                        if routed_expert_weights.shape != routed_experts.shape:
+                            raise ValueError(
+                                "dense full R3 IDs/weights are misaligned: "
+                                f"ids={tuple(routed_experts.shape)}, "
+                                f"weights={tuple(routed_expert_weights.shape)}"
+                            )
+                        if not routed_expert_weights.is_floating_point():
+                            raise TypeError(
+                                f"dense full R3 weights must be floating point, got {routed_expert_weights.dtype}"
+                            )
+                        routed_experts_padded = routed_experts
+                        routed_expert_weights_padded = routed_expert_weights
+                        route_lengths = torch.full(
+                            (batch_size,),
+                            routed_experts.shape[1],
+                            dtype=torch.long,
+                            device=routed_experts.device,
+                        )
+
+                    replay_mask = _build_kimi_full_model_route_mask(
+                        routed_experts_padded,
+                        route_lengths,
+                        attention_mask,
+                    )
+                    model_inputs["routed_experts"] = routed_experts_padded.to(torch.long)
+                    model_inputs["routed_expert_weights"] = routed_expert_weights_padded.to(torch.bfloat16)
+                    model_inputs["router_replay_mask"] = replay_mask
+                    model_inputs["r3_full_model_rows"] = True
+
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1322,6 +1625,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
+
+        logits_to_input_indices = kimi_k3_logits_to_input_indices(
+            model_inputs["input_ids"], multi_modal_inputs, self.model_config.hf_config
+        )
+        if logits_to_input_indices is not None:
+            if use_fused_kernels:
+                raise NotImplementedError("Kimi K3 image-expanded logits are not supported by fused log-prob kernels")
+            if self.use_ulysses_sp:
+                raise NotImplementedError("Kimi K3 image-expanded logit alignment is not implemented with Ulysses SP")
+            output_args["logits_to_input_indices"] = logits_to_input_indices
 
         return model_inputs, output_args
 
@@ -1375,10 +1688,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             v = self._gather_and_unpad_packed(v, output_args["pad_size"])
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits = output.logits  # (bsz, response_length, vocab_size)
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
-                if isinstance(logits_rmpad, DTensor):
-                    logits_rmpad = logits_rmpad.full_tensor()
+                if isinstance(logits, DTensor):
+                    logits = logits.full_tensor()
+                logits = _select_raw_token_logits(logits, output_args.get("logits_to_input_indices"))
+                logits_rmpad = logits.squeeze(0)  # (total_nnz, vocab_size)
                 logits_rmpad = _scale_logits_by_temperature(
                     logits_rmpad,
                     temperature_rmpad.unsqueeze(-1),
@@ -1425,6 +1740,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
+                        force_fp32=logits_processor_func is None,
                     )
 
             # gather across the ulysses sp group and drop the packed-sequence padding
@@ -1476,6 +1792,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
+                logits = _select_raw_token_logits(logits, output_args.get("logits_to_input_indices"))
                 logits = _scale_logits_by_temperature(
                     logits,
                     temperature,
@@ -1515,8 +1832,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                     log_probs = None
                     if not distillation_only:
-                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
-
+                        log_probs = logprobs_from_logits(
+                            logits=logits_rmpad,
+                            labels=input_ids_rmpad_rolled,
+                            force_fp32=logits_processor_func is None,
+                        )
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     if not distillation_only:
                         log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
