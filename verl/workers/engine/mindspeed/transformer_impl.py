@@ -15,10 +15,20 @@
 import logging
 import os
 
-try:
-    from mindspeed.megatron_adaptor import repatch
-except ImportError:
+_use_megatron_adaptor = os.getenv("VERL_USE_MEGATRON_ADAPTOR", "").lower() in {
+    "1",
+    "true",
+    "enabled",
+}
+
+if _use_megatron_adaptor:
     repatch = None
+
+else:
+    try:
+        from mindspeed.megatron_adaptor import repatch
+    except ImportError:
+        repatch = None
 
 from verl.trainer.config import CheckpointConfig
 from verl.workers.config import (

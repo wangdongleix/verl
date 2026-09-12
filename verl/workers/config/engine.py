@@ -181,6 +181,8 @@ class McoreEngineConfig(EngineConfig):
 
     # sequence_parallel is not listed as a frozen field for auto-correction purpose
     _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel"}
+    # Release disposable gradient buffers while actor parameters stay resident.
+    grad_offload: bool = False
     # mcore parallelism
     tensor_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1

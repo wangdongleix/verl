@@ -67,8 +67,10 @@ from verl.utils.megatron_utils import (
     check_mtp_config,
     get_megatron_module_device,
     get_megatron_mtp_loss,
+    load_megatron_grad_to_gpu,
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
+    offload_megatron_grad_to_cpu,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
     patch_engine_mtp,
@@ -161,6 +163,20 @@ def _attach_dcp_recorded_routes(losses_reduced: list[dict], layers_topk_idx: tor
         )
 
 
+def _is_kimi_k3_config(hf_config) -> bool:
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return getattr(hf_config, "model_type", None) == "kimi_k3" or "KimiK3ForConditionalGeneration" in architectures
+
+
+def _register_kimi_k3_runtime() -> None:
+    """Bootstrap the Kimi bridge through MS-Bridge's public runtime API."""
+    try:
+        from mindspeed_bridge.runtime.kimi_k3 import ensure_kimi_k3_runtime
+    except ImportError as exc:
+        raise RuntimeError("Kimi K3 Megatron requires MS-Bridge-KIMI-K3 to be installed and importable") from exc
+    ensure_kimi_k3_runtime()
+
+
 class MegatronEngine(BaseEngine):
     # mcore keeps model-parallel-local params resident and moves large host
     # buffers every step; pinning the whole delta snapshot set on top of that
@@ -182,6 +198,7 @@ class MegatronEngine(BaseEngine):
         optimizer_config: McoreOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        is_kimi_k3 = _is_kimi_k3_config(model_config.hf_config)
         super().__init__()
 
         self.model_config = model_config
@@ -191,10 +208,16 @@ class MegatronEngine(BaseEngine):
         assert self.engine_config.use_mbridge, "use_mbridge must be True"
         _check_dcp_unsupported_features(self.engine_config, self.model_config)
         self._init_device_mesh()
+        if is_kimi_k3:
+            # The task-selected MegatronAdaptor is installed before this module
+            # is imported. Keep the model plugin lazy until the engine topology
+            # is initialized, but before provider/bridge construction.
+            _register_kimi_k3_runtime()
 
         set_random_seed(seed=self.engine_config.seed)
 
         self._is_offload_param = self.engine_config.param_offload
+        self._is_offload_grad = self.engine_config.grad_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
 
         self.mode = None
@@ -285,7 +308,26 @@ class MegatronEngine(BaseEngine):
         from verl.utils.torch_dtypes import PrecisionType
 
         self.is_value_model = self.model_config.model_type == "value_model"
+        is_kimi_k3 = _is_kimi_k3_config(self.model_config.hf_config)
         self.share_embeddings_and_output_weights = self.model_config.share_embeddings_and_output_weights
+
+        if is_kimi_k3:
+            if self.engine_config.vanilla_mbridge:
+                raise ValueError("Kimi K3 requires Megatron-Bridge; set vanilla_mbridge=False")
+            if self.engine_config.use_remove_padding:
+                raise ValueError("Kimi K3 Megatron requires use_remove_padding=False (BSHD)")
+            if self.engine_config.dynamic_context_parallel:
+                raise ValueError("Kimi K3 Megatron does not support dynamic_context_parallel")
+            if self.engine_config.context_parallel_size != 1:
+                raise ValueError("Kimi K3 verl integration currently requires context_parallel_size=1")
+            if self.engine_config.use_fused_kernels:
+                raise ValueError("Kimi K3 Megatron does not support fused log-prob kernels")
+            if "seq_length" not in self.engine_config.override_transformer_config:
+                raise ValueError(
+                    "Kimi K3 Megatron requires an explicit static expanded sequence length: "
+                    "set override_transformer_config.seq_length to a value large enough for "
+                    "the raw prompt/response plus projected image tokens"
+                )
 
         check_mtp_config(self.model_config, self.engine_config)
 
@@ -374,6 +416,9 @@ class MegatronEngine(BaseEngine):
             # the provider here rather than via override_transformer_config.
             if self.is_value_model and hasattr(provider, "share_embeddings_and_output_weights"):
                 provider_overrides["share_embeddings_and_output_weights"] = False
+
+            if is_kimi_k3:
+                provider_overrides["attention_backend"] = AttnBackend.auto
             if (
                 self.model_config.hf_config.model_type == "deepseek_v4"
                 and not self.model_config.mtp.enable
@@ -496,7 +541,12 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
+        # ``use_dist_checkpointing`` also selects the format used by the
+        # checkpoint manager for subsequent training saves.  A fresh run can
+        # therefore request sharded saves while still bootstrapping from the
+        # HuggingFace path in ``model.local_path``.  Only take the direct
+        # MCore-load branch when an initial dist-checkpoint path was supplied.
+        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path is not None:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )
@@ -653,6 +703,8 @@ class MegatronEngine(BaseEngine):
             optimizer=self._is_offload_optimizer,
             grad=self._is_offload_param,
         )
+        if self._is_offload_grad and not self._is_offload_param:
+            self._set_grad_storage("cpu")
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
@@ -693,9 +745,10 @@ class MegatronEngine(BaseEngine):
         Returns:
             grad_norm (float): The norm of the gradients before clipping or update.
         """
-        # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
-        # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
-        if getattr(self, "_distillation_use_topk_active", False):
+        # Distillation and grad offload are memory-reclamation modes. Release
+        # inactive allocator blocks before HCCL creates its grad-norm workspace.
+        if getattr(self, "_distillation_use_topk_active", False) or self._is_offload_grad:
+            get_torch_device().synchronize()
             get_torch_device().empty_cache()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
@@ -728,6 +781,7 @@ class MegatronEngine(BaseEngine):
             device: Target device identifier.
             model: If True, move the model.
             optimizer: If True, move the optimizer states.
+            grad: If True, move or recreate gradient storage.
         """
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
@@ -744,6 +798,16 @@ class MegatronEngine(BaseEngine):
                 offload_megatron_model_to_cpu(self.module)
             if optimizer and self.optimizer is not None:
                 offload_megatron_optimizer(self.optimizer)
+        else:
+            raise ValueError(f"Invalid device type: {device}")
+
+    def _set_grad_storage(self, device: str) -> None:
+        """Stage Megatron DDP gradient storage independently of parameters."""
+        device_name = get_device_name()
+        if device == device_name:
+            load_megatron_grad_to_gpu(self.module)
+        elif device == "cpu":
+            offload_megatron_grad_to_cpu(self.module)
         else:
             raise ValueError(f"Invalid device type: {device}")
 
@@ -955,15 +1019,21 @@ class MegatronEngine(BaseEngine):
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.module,
-            num_microbatches=n_micro_batch,
-            seq_length=1,  # the communication shape is obtained via p2p comm
-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
-            forward_only=forward_only,
-        )
+        # Megatron's pipeline schedule skips backward for forward-only calls,
+        # but it does not disable autograd itself.  Old/ref log-prob therefore
+        # retained a useless graph and could not take inference-only operator
+        # paths.  Keep training unchanged while matching the no-grad contract
+        # already used by the FSDP and AutoModel engines.
+        with torch.set_grad_enabled(not forward_only):
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.module,
+                num_microbatches=n_micro_batch,
+                seq_length=1,  # the communication shape is obtained via p2p comm
+                micro_batch_size=1,  # the communication shape is obtained via p2p comm
+                forward_only=forward_only,
+            )
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
@@ -1148,6 +1218,12 @@ class EngineTrainModeCtx(BaseEngineCtx):
     def __enter__(self):
         assert isinstance(self.engine, MegatronEngine)
         super().__enter__()
+        # train_mini_batch opens an outer context and train_batch opens a nested
+        # context with disable_auto_offload=True.  Stage the flat DDP gradient
+        # storage only at the outer boundary; doing it in both contexts leaves
+        # the outer zero_grad() pointing at storage released by the inner one.
+        if self.engine._is_offload_grad and not self.engine._is_offload_param and not self.disable_auto_offload:
+            self.engine._set_grad_storage(get_device_name())
         # mcore module is a list of model chunk in each vpp stage
         for module in self.engine.module:
             module.train()
@@ -1156,6 +1232,8 @@ class EngineTrainModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, MegatronEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
+        if self.engine._is_offload_grad and not self.engine._is_offload_param and not self.disable_auto_offload:
+            self.engine._set_grad_storage("cpu")
         super().__exit__(exc_type, exc_value, traceback)
 
 
@@ -1295,21 +1373,43 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             set_model_router_replay_action(unwrapped_model, RouterReplayAction.REPLAY_FORWARD)
 
+        router_replay_prepare = None
         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
             layers_topk_idx = model_inputs["routed_experts"]
             replay_mask = None
-            if self.engine_config.router_replay.mode == "R3":
+            if self.engine_config.router_replay.mode == "R3" and _is_kimi_k3_config(self.model_config.hf_config):
+                from verl.workers.rollout.r3_utils import pack_kimi_full_r3_for_megatron
+
+                layers_topk_idx = pack_kimi_full_r3_for_megatron(layers_topk_idx, batch.get("routed_expert_weights"))
+            elif self.engine_config.router_replay.mode == "R3":
                 layers_topk_idx = align_r3_router_replay_data(layers_topk_idx, input_ids)
                 replay_mask = build_r3_replay_mask(input_ids, batch["response_mask"])
-            set_router_replay_data(
-                layers_topk_idx,
-                None,
-                self.tf_config,
-                vp_rank,
-                replay_mask=replay_mask,
-                local_cp_size=local_cp_size,
-                model=unwrapped_model,
-            )
+            if _is_kimi_k3_config(self.model_config.hf_config) and getattr(
+                self.tf_config, "kimi_dynamic_multimodal_length", False
+            ):
+                # The exact image-expanded bucket is only known inside Kimi's
+                # forward adapter. Defer replay preparation until that adapter
+                # has computed the same runtime sequence length as the model.
+                router_replay_prepare = partial(
+                    set_router_replay_data,
+                    layers_topk_idx,
+                    None,
+                    self.tf_config,
+                    vp_rank,
+                    replay_mask=replay_mask,
+                    local_cp_size=local_cp_size,
+                    model=unwrapped_model,
+                )
+            else:
+                set_router_replay_data(
+                    layers_topk_idx,
+                    None,
+                    self.tf_config,
+                    vp_rank,
+                    replay_mask=replay_mask,
+                    local_cp_size=local_cp_size,
+                    model=unwrapped_model,
+                )
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()
@@ -1379,6 +1479,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 routed_num_tokens = tu.get_non_tensor_data(batch, key="routed_num_tokens", default=0)
                 if batch_num_tokens > 0:
                     mtp_loss_normalization_factor = routed_num_tokens / batch_num_tokens
+            kimi_forward_kwargs = {}
+            if router_replay_prepare is not None:
+                kimi_forward_kwargs["router_replay_prepare"] = router_replay_prepare
 
             output = forward_fn(
                 model,
@@ -1396,6 +1499,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
                 pad_to_length_bucket=pad_to_length_bucket,
                 cp_layout=cp_layout,
+                **kimi_forward_kwargs,
             )
 
         # Router replay: record routing decisions for R2 mode
