@@ -1,0 +1,113 @@
+From 9e7ed734b810a474db9e0d5924d4c93a4ef908b2 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:41 +0800
+Subject: [ray, env] fix: isolate optional Mooncake worker imports
+
+---
+ tests/trainer/test_constants_ppo_on_cpu.py | 25 ++++++++++++++++++++++
+ verl/__init__.py                           |  4 ++++
+ verl/trainer/constants_ppo.py              |  2 ++
+ verl_worker_setup/__init__.py              | 21 ++++++++++++++++++
+ 4 files changed, 52 insertions(+)
+ create mode 100644 verl_worker_setup/__init__.py
+
+diff --git a/tests/trainer/test_constants_ppo_on_cpu.py b/tests/trainer/test_constants_ppo_on_cpu.py
+index f142b6c..aa25b57 100644
+--- a/tests/trainer/test_constants_ppo_on_cpu.py
++++ b/tests/trainer/test_constants_ppo_on_cpu.py
+@@ -13,8 +13,11 @@
+ # limitations under the License.
+ 
+ import os
++import subprocess
++import sys
+ from unittest.mock import patch
+ 
++import pytest
+ from omegaconf import OmegaConf
+ 
+ from verl.trainer.constants_ppo import NVTX_INJECTION_ENV, get_ppo_ray_runtime_env
+@@ -49,3 +52,25 @@ def test_nvtx_injection_override_can_be_opted_out():
+         env_vars = get_ppo_ray_runtime_env(_config("torch"))["env_vars"]
+ 
+     assert NVTX_INJECTION_ENV not in env_vars
++
++
++def test_standalone_transfer_queue_worker_initializes_optional_import_guard(monkeypatch):
++    pytest.importorskip("transfer_queue")
++    monkeypatch.delenv("VERL_TRANSFER_QUEUE_ENABLE_MOONCAKE", raising=False)
++    hook = get_ppo_ray_runtime_env()["worker_process_setup_hook"]
++    code = f"""
++import sys
++from ray._private.runtime_env.setup_hook import load_and_execute_setup_hook
++assert "torch" not in sys.modules
++error = load_and_execute_setup_hook({hook!r})
++assert error is None, error
++assert "verl" not in sys.modules
++assert "torch" not in sys.modules
++assert "torch_npu" not in sys.modules
++import transfer_queue
++import sys
++assert sys.modules["mooncake.store"] is None
++assert sys.modules["mooncake.engine"] is None
++"""
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
++    assert result.returncode == 0, result.stdout + result.stderr
+diff --git a/verl/__init__.py b/verl/__init__.py
+index d118583..30b1e72 100644
+--- a/verl/__init__.py
++++ b/verl/__init__.py
+@@ -29,6 +29,10 @@ from packaging.version import parse as parse_version
+ # redundant; disable it. `setdefault` keeps it overridable (set "1" to re-enable).
+ os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+ 
++from verl_worker_setup import configure_transfer_queue_worker  # noqa: E402
++
++configure_transfer_queue_worker()
++
+ from .protocol import DataProto  # noqa: E402
+ from .utils.device import is_npu_available  # noqa: E402
+ from .utils.import_utils import import_external_libs  # noqa: E402
+diff --git a/verl/trainer/constants_ppo.py b/verl/trainer/constants_ppo.py
+index f62a38f..2f34d80 100644
+--- a/verl/trainer/constants_ppo.py
++++ b/verl/trainer/constants_ppo.py
+@@ -113,6 +113,8 @@ def get_ppo_ray_runtime_env(config=None):
+     )
+ 
+     runtime_env = {
++        # Standalone TransferQueue actors can import their native dependencies before verl.
++        "worker_process_setup_hook": "verl_worker_setup.configure_transfer_queue_worker",
+         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
+         **({"working_dir": None} if working_dir is None else {}),
+     }
+diff --git a/verl_worker_setup/__init__.py b/verl_worker_setup/__init__.py
+new file mode 100644
+index 0000000..a9b3fb5
+--- /dev/null
++++ b/verl_worker_setup/__init__.py
+@@ -0,0 +1,21 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++# SPDX-License-Identifier: Apache-2.0
++"""Ray startup hooks must not import device runtimes before accelerator assignment."""
++
++import os
++import sys
++
++
++# TransferQueue 0.1.8 eagerly imports the optional Mooncake native binding even
++# when the configured storage backend is SimpleStorage.  The Mooncake wheel in
++# the Ascend runtime corrupts the glibc heap during interpreter teardown, so a
++# successful training step otherwise exits with SIGABRT (134).  Make the
++# optional bindings unavailable before TransferQueue and checkpoint engines
++# import them. Users
++# that actually configure Mooncake can opt back in explicitly after installing
++# a compatible wheel.
++def configure_transfer_queue_worker() -> None:
++    """Apply the optional native-backend guard before standalone TQ actors import."""
++    if os.getenv("VERL_TRANSFER_QUEUE_ENABLE_MOONCAKE", "0").lower() not in {"1", "true", "yes"}:
++        sys.modules.setdefault("mooncake.store", None)
++        sys.modules.setdefault("mooncake.engine", None)
+-- 
+2.43.0
+
