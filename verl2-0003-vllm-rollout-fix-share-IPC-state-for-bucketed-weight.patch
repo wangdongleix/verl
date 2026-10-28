@@ -1,0 +1,105 @@
+From 584f1193129e4afe33d7eb0d1e5c31608c14cdd4 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:41 +0800
+Subject: [vllm, rollout] fix: share IPC state for bucketed weight transfer
+
+---
+ ...est_bucketed_weight_transfer_ipc_on_cpu.py | 31 ++++++++++++++++
+ .../vllm_rollout/bucketed_weight_transfer.py  | 37 +++++++++++++++++--
+ 2 files changed, 65 insertions(+), 3 deletions(-)
+ create mode 100644 tests/special_distributed/test_bucketed_weight_transfer_ipc_on_cpu.py
+
+diff --git a/tests/special_distributed/test_bucketed_weight_transfer_ipc_on_cpu.py b/tests/special_distributed/test_bucketed_weight_transfer_ipc_on_cpu.py
+new file mode 100644
+index 0000000..6915683
+--- /dev/null
++++ b/tests/special_distributed/test_bucketed_weight_transfer_ipc_on_cpu.py
+@@ -0,0 +1,31 @@
++"""CPU-only regression tests for vLLM weight-transfer IPC dispatch."""
++
++import torch
++from torch.multiprocessing.reductions import reduce_tensor
++
++from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer as transfer
++
++
++def test_rebuild_cpu_handle_does_not_inject_accelerator_device(monkeypatch):
++    source = torch.arange(4, dtype=torch.float32)
++    handle = reduce_tensor(source)
++    assert len(handle[1]) < 7
++
++    monkeypatch.setattr(transfer, "get_device_name", lambda: "cpu")
++    rebuilt = transfer.rebuild_ipc(handle, device_id=0)
++
++    assert rebuilt.device.type == "cpu"
++    torch.testing.assert_close(rebuilt, source)
++
++
++def test_rebuild_accelerator_handle_uses_named_rebuilder(monkeypatch):
++    captured = {}
++
++    def rebuild_npu_tensor(*args):
++        captured["args"] = args
++        return torch.ones(1)
++
++    monkeypatch.setattr(transfer, "get_device_name", lambda: "cpu")
++    transfer.rebuild_ipc((rebuild_npu_tensor, (0, 1, 2, 3, 4, 5, 6)), device_id=9)
++
++    assert captured["args"][6] == 9
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index 4440851..f3168fb 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -40,15 +40,46 @@ class TensorMetadata(TypedDict):
+     handle: tuple
+ 
+ 
++_ACCELERATOR_REBUILD_FUNCTIONS = frozenset(
++    {
++        "rebuild_cuda_tensor",
++        "rebuild_npu_tensor",
++        # Compatibility with older torch/torch_npu spellings.
++        "rebuild_tensor_cuda",
++        "rebuild_tensor_npu",
++    }
++)
++
++
+ # copy from https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
+ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
+     func, args = handle
+     list_args = list(args)
+-    if device_id is not None:
+-        # the key is to change device id to the current device id
+-        # in case two processes have different CUDA_VISIBLE_DEVICES
++    func_name = getattr(func, "__name__", type(func).__name__)
++    if device_id is not None and func_name in _ACCELERATOR_REBUILD_FUNCTIONS:
++        if len(list_args) <= 6:
++            raise RuntimeError(
++                f"{func_name} IPC handle has {len(list_args)} arguments; "
++                "expected an accelerator device id at argument 6"
++            )
++        # Accelerator rebuilders carry the producer device at argument 6.
++        # Rewrite it when sender and receiver have different local visibility.
+         list_args[6] = device_id
++    elif device_id is not None and func_name == "rebuild_tensor":
++        # CPU reduce_tensor() handles intentionally have no device-id slot.
++        logger.debug("Rebuilding CPU IPC tensor on receiver before accelerator copy")
+     buffer = func(*list_args)
++    # vLLM weight loaders consume device tensors.  A CPU IPC handle is rebuilt
++    # on the receiver first, then copied to the local accelerator; this keeps
++    # CPU-offloaded large parameters compatible with the existing IPC protocol
++    # without forcing the actor to stage the whole tensor on NPU beforehand.
++    if (
++        device_id is not None
++        and isinstance(buffer, torch.Tensor)
++        and buffer.device.type == "cpu"
++        and get_device_name() != "cpu"
++    ):
++        buffer = buffer.to(device=f"{get_device_name()}:{device_id}", non_blocking=True)
+     return buffer
+ 
+ 
+-- 
+2.43.0
+
