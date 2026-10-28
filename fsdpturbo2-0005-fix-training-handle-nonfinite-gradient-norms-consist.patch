@@ -1,0 +1,81 @@
+From 9e310d0c528730e46081f7d8d05fff978beeaa2f Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: fix(training): handle nonfinite gradient norms consistently
+
+---
+ fsdp_turbo/training/clip_grads.py           |  5 ++--
+ tests/training/test_clip_grads_nonfinite.py | 31 +++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+ create mode 100644 tests/training/test_clip_grads_nonfinite.py
+
+diff --git a/fsdp_turbo/training/clip_grads.py b/fsdp_turbo/training/clip_grads.py
+index c1c6b60..3275cfd 100644
+--- a/fsdp_turbo/training/clip_grads.py
++++ b/fsdp_turbo/training/clip_grads.py
+@@ -14,6 +14,7 @@ sharding group(s) via ``all_reduce``.
+ """
+ 
+ from collections import defaultdict
++import math
+ from typing import Optional, Union
+ 
+ import torch
+@@ -172,7 +173,7 @@ def clip_grad_by_norm(
+ ) -> None:
+     """Clip gradients in-place so that their total norm <= ``max_norm``.
+ 
+-    This is a **no-op** when ``total_norm <= max_norm``.
++    This is a **no-op** when ``total_norm`` is non-finite or already below the limit.
+     DTensor gradients are clipped on their local shards directly
+     (the clip coefficient is the same on every rank after all-reduce).
+ 
+@@ -194,7 +195,7 @@ def clip_grad_by_norm(
+         keep_on_device: Re-point host gradients at their clipped device copies
+             so AdamWSwap consumes them without a host round-trip.
+     """
+-    if total_norm == 0.0 or max_norm <= 0.0:
++    if not math.isfinite(total_norm) or total_norm == 0.0 or max_norm <= 0.0:
+         return
+ 
+     clip_coeff = max_norm / (total_norm + 1e-6)
+diff --git a/tests/training/test_clip_grads_nonfinite.py b/tests/training/test_clip_grads_nonfinite.py
+new file mode 100644
+index 0000000..03b271e
+--- /dev/null
++++ b/tests/training/test_clip_grads_nonfinite.py
+@@ -0,0 +1,31 @@
++import math
++
++import pytest
++import torch
++from fsdp_turbo.training.clip_grads import clip_grad_by_norm
++
++
++@pytest.fixture(autouse=True)
++def _cpu_norm_device(monkeypatch):
++    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: torch.device("cpu"))
++
++
++@pytest.mark.parametrize("total_norm", [math.nan, math.inf, -math.inf])
++def test_nonfinite_norm_does_not_poison_finite_gradients(total_norm):
++    parameter = torch.nn.Parameter(torch.ones(4))
++    parameter.grad = torch.tensor([1.0, -2.0, 3.0, -4.0])
++    original = parameter.grad.clone()
++
++    clip_grad_by_norm([parameter], max_norm=1.0, total_norm=total_norm)
++
++    torch.testing.assert_close(parameter.grad, original)
++    assert torch.isfinite(parameter.grad).all()
++
++
++def test_finite_norm_is_still_clipped():
++    parameter = torch.nn.Parameter(torch.ones(2))
++    parameter.grad = torch.tensor([3.0, 4.0])
++
++    clip_grad_by_norm([parameter], max_norm=1.0, total_norm=5.0)
++
++    torch.testing.assert_close(parameter.grad, torch.tensor([0.6, 0.8]), rtol=1e-5, atol=1e-6)
+-- 
+2.43.0
+
