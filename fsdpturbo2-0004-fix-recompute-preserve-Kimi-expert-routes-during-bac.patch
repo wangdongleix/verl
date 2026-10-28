@@ -1,1 +1,87 @@
+From 07635e3d5a440de77e44d67057062ce0dae1a712 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: fix(recompute): preserve Kimi expert routes during backward
+
+---
+ fsdp_turbo/memory/recompute/recompute.py  | 18 ++++++++++++++--
+ tests/unit_tests/memory/test_recompute.py | 25 +++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/fsdp_turbo/memory/recompute/recompute.py b/fsdp_turbo/memory/recompute/recompute.py
+index 7257333..1a48219 100644
+--- a/fsdp_turbo/memory/recompute/recompute.py
++++ b/fsdp_turbo/memory/recompute/recompute.py
+@@ -1,8 +1,9 @@
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+ import logging
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ 
+-from torch.utils.checkpoint import checkpoint
++import torch
++from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
+ 
+ from fsdp_turbo.utils.log import print_rank
+ from fsdp_turbo.utils.str_match import module_name_match
+@@ -40,6 +41,19 @@ def recompute_wrapper(module, function):
+             kwargs['past_key_values'] = None
+ 
+         def context_fn():
++            if (getattr(getattr(module, 'config', None), 'model_type', None) == 'kimi_linear'
++                    and hasattr(module, 'block_sparse_moe')):
++                # Reuse this forward's discrete routes when recomputing Kimi MoE layers.
++                forward_context, replay_context = create_selective_checkpoint_contexts(
++                    [torch.ops.aten.topk.default]
++                )
++
++                @contextmanager
++                def recompute_context():
++                    with replay_context, mxfp8_recompute_context(module):
++                        yield
++
++                return forward_context, recompute_context()
+             return nullcontext(), mxfp8_recompute_context(module)
+ 
+         return checkpoint(function, *args, use_reentrant=False, context_fn=context_fn, **kwargs)
+diff --git a/tests/unit_tests/memory/test_recompute.py b/tests/unit_tests/memory/test_recompute.py
+index e91b026..600fe5f 100644
+--- a/tests/unit_tests/memory/test_recompute.py
++++ b/tests/unit_tests/memory/test_recompute.py
+@@ -1,4 +1,7 @@
+ from unittest.mock import Mock, patch
++from types import SimpleNamespace
++
++import torch
+ 
+ from fsdp_turbo.memory.recompute.recompute import recompute_wrapper
+ 
+@@ -18,3 +21,25 @@ def test_recompute_wrapper_installs_mxfp8_replay_context():
+     forward_context, replay_context = kwargs["context_fn"]()
+     assert forward_context is not None
+     assert replay_context is not None
++
++
++def test_kimi_recompute_preserves_forward_routes_and_gradients():
++    module = torch.nn.Module()
++    module.config = SimpleNamespace(model_type='kimi_linear')
++    module.block_sparse_moe = torch.nn.Identity()
++    routes = []
++
++    def forward(x):
++        scores = torch.tensor([4., 3., 2., 1.] if not routes else [1., 2., 3., 4.])
++        indices = torch.topk(scores, 2).indices
++        routes.append(indices.clone())
++        return x[indices].square().sum()
++
++    x = torch.tensor([1., 2., 3., 4.], requires_grad=True)
++    with patch("torch.utils.checkpoint.DefaultDeviceType._default_device_type", "cpu"):
++        recompute_wrapper(module, forward)(x).backward()
++
++    assert len(routes) == 2
++    assert torch.equal(routes[0], torch.tensor([0, 1]))
++    assert torch.equal(routes[1], routes[0])
++    torch.testing.assert_close(x.grad, torch.tensor([2., 4., 0., 0.]))
+-- 
+2.43.0
 
