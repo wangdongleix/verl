@@ -1,0 +1,372 @@
+From bc12d12f04ef78b1a09049100c05d1d263473199 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: feat(efsdp): configure expert parameter shard dimensions
+
+---
+ docs/zh/features/expert_parallel.md           | 33 +++++++++
+ docs/zh/features/fully_shard_parallel.md      |  4 ++
+ docs/zh/training/user_guide.md                | 25 +++++++
+ .../expert_fully_shard_parallel.py            | 40 +++++++----
+ .../expert_parallel/expert_parallel.py        | 22 ++++--
+ .../fully_shard_parallel.py                   |  1 +
+ fsdp_turbo/fsdp_turbo_config.py               | 24 +++++++
+ .../expert_parallel/test_efsdp_placements.py  | 72 +++++++++++++++++++
+ 8 files changed, 201 insertions(+), 20 deletions(-)
+ create mode 100644 tests/unit_tests/distributed/expert_parallel/test_efsdp_placements.py
+
+diff --git a/docs/zh/features/expert_parallel.md b/docs/zh/features/expert_parallel.md
+index e955216..7922e88 100644
+--- a/docs/zh/features/expert_parallel.md
++++ b/docs/zh/features/expert_parallel.md
+@@ -83,6 +83,19 @@ FSDPTurbo的EP路径要求experts模块持有**3D张量参数**，而非ModuleLi
+ - **专家负载均衡**：训练中可观察路由分布（top-k选择的专家频率），若出现严重不均，可考虑调整模型侧路由温度，或使用`fixed_router`（调试手段：以固定均匀路由替代实际路由，避免负载不均带来的性能与精度问题，仅在`expert_parallel_size > 1`时生效）。
+ - **EFSDP**：当专家参数量较大时，开启`apply_efsdp_modules`对专家参数进一步做FSDP2全分片，降低单卡显存占用。
+ 
++Kimi K3 保留输入优先的 packed 权重：`gate_up_proj` 为
++`[experts, routed_hidden_size, 2 * moe_intermediate_size]`，`down_proj` 为
++`[experts, moe_intermediate_size, routed_hidden_size]`。通过配置
++`efsdp_shard_placements: [[gate_up_proj, 2], [down_proj, 1]]` 指定分片维度，
++公共入口据此生成传给 `fully_shard` 的回调。
++两者被切分的维度都必须整除 eFSDP 并行度。对于 routed hidden=3584、
++intermediate=3072，可使用 eFSDP=3/12/24，不需要转置持久参数。
++该模型分片规则不支持要求 dim-0 的低精度 all-gather，不能同时开启。
++
++切分维度只改变存储分布，计算前仍恢复当前 EP rank 的完整专家权重。
++训练到推理的权重同步必须按 DTensor 的专家、行、列偏移重分片，不能把
++列分片当作完整行传输，也不能直接加载旧配置的本地优化器分片。
++
+ ## 负载均衡接口
+ 
+ 负载均衡的初始化、路由重排、重复专家权重通信和梯度累加统一位于
+@@ -111,3 +124,23 @@ down_weights = balance.prepare_down(down_weights)
+ 重复专家梯度使用原有 executor 通信与累加接口，在每次 forward 的临时权重视图上回收，
+ 然后传给原参数；不会反复向持久参数注册 hook。无 token 的 rank 也参与这一步。
+ 重计算使用 forward 缓存的均衡方案与 AllGather 路由，不重新统计或通信。
++
++## eFSDP 参数分片配置
++
++`distributed.ep_plan.efsdp_shard_placements` 接收 `(参数名, 维度)` 列表。
++YAML/JSON用二元素数组，配置初始化时转为元组：
++
++```yaml
++distributed:
++  ep_plan:
++    efsdp_shard_placements:
++      - [gate_up_proj, 2]
++      - [down_proj, 1]
++```
++
++参数名相对于每个被eFSDP包装的专家模块，ModuleList则相对于每个成员，
++可写成 `projection.weight`。维度从0开始；Kimi配置保持gate/up切列、down切行。
++未配置的参数沿用二维及以上切dim1、一维切dim0；低精度all-gather仅支持dim0。
++重复名称、负数和非整数维度在配置初始化时报错；不存在的参数、维度越界及
++共享参数冲突在包装模型时报错。模型不再提供 `efsdp_shard_placement` 回调；
++外部自定义启动配置需要显式传入这两项。
+diff --git a/docs/zh/features/fully_shard_parallel.md b/docs/zh/features/fully_shard_parallel.md
+index e529ae9..6580d3b 100644
+--- a/docs/zh/features/fully_shard_parallel.md
++++ b/docs/zh/features/fully_shard_parallel.md
+@@ -84,6 +84,10 @@ fsdp_plan:
+ 
+ ### 选择性分片
+ 
++`fsdp_plan.reshard_after_forward` 设置默认的前向后参数生命周期，默认 `true`；
++各 `apply_modules` 条目可覆盖它。`false` 保留完整参数以省去反向 all-gather，
++同时增加峰值显存。整数值沿用 PyTorch FSDP2 的子组重分片语义。
++
+ - `apply_modules`：仅对指定模块做FSDP2分片，支持`model.layers.{*}`层级通配符。
+ - `ignored_modules`：排除指定模块（如冻结的视觉编码器）。
+ 
+diff --git a/docs/zh/training/user_guide.md b/docs/zh/training/user_guide.md
+index 1219251..25aded8 100644
+--- a/docs/zh/training/user_guide.md
++++ b/docs/zh/training/user_guide.md
+@@ -65,3 +65,28 @@ FSDPTurbo与HuggingFace Transformers原生训练的主要差异：
+ EP 通信方式通过 `distributed.ep_plan.dispatcher` 选择（默认 `all2all`）；融合算子通过
+ `use_fused_ops` 控制（默认 `true`）。
+ 无效 dispatcher 在配置初始化时直接报错，详细用法见 [专家并行](../features/expert_parallel.md)。
++
++`model.attn_implementation` 指定模型加载所用的注意力实现，默认 `eager`；
++Kimi NPU 训练可设为 `flash_attention_2`。KDA/短卷积算子按其公共算子接口分发。
++`distributed.fsdp_plan.reshard_after_forward` 默认 `true`，可通过具体模块条目覆盖，
++用法见 [全分片数据并行](../features/fully_shard_parallel.md)。
++
++## eFSDP 参数分片配置
++
++`distributed.ep_plan.efsdp_shard_placements` 接收 `(参数名, 维度)` 列表。
++YAML/JSON用二元素数组，配置初始化时转为元组：
++
++```yaml
++distributed:
++  ep_plan:
++    efsdp_shard_placements:
++      - [gate_up_proj, 2]
++      - [down_proj, 1]
++```
++
++参数名相对于每个被eFSDP包装的专家模块，ModuleList则相对于每个成员，
++可写成 `projection.weight`。维度从0开始；Kimi配置保持gate/up切列、down切行。
++未配置的参数沿用二维及以上切dim1、一维切dim0；低精度all-gather仅支持dim0。
++重复名称、负数和非整数维度在配置初始化时报错；不存在的参数、维度越界及
++共享参数冲突在包装模型时报错。模型不再提供 `efsdp_shard_placement` 回调；
++外部自定义启动配置需要显式传入这两项。
+diff --git a/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py b/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
+index 111b6c7..7735aa6 100644
+--- a/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
++++ b/fsdp_turbo/distributed/expert_parallel/expert_fully_shard_parallel.py
+@@ -29,17 +29,11 @@ def expert_fully_shard_modules(
+     efsdp_hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
+     offload_policy = get_offload_policy(fsdp_plan)
+ 
+-    # LP-AG gathers weight+scale together (torch copy-out needs dim-0); otherwise keep the historical dim-1 placement for 2D+.
+-    def shard_placement_fn(x):
+-        if enable_lp_all_gather:
+-            return Shard(0)
+-        return Shard(1) if x.dim() > 1 else Shard(0)
+-
+     config = {
+         'mesh': efsdp_mesh,
+         'mp_policy': get_mixprecision_policy(fsdp_plan),
+         'offload_policy': offload_policy,
+-        'shard_placement_fn': shard_placement_fn,
++        'reshard_after_forward': fsdp_plan.reshard_after_forward,
+     }
+ 
+     apply_hccl_premul_sum_patch()
+@@ -49,17 +43,35 @@ def expert_fully_shard_modules(
+     gradient_divide_factor = ep_plan.gradient_divide_factor
+     for experts in efsdp_modules:
+         hook_module = find_hook_module(experts, efsdp_hook_modules)
+-        if isinstance(experts, torch.nn.ModuleList):
+-            for expert in experts:
+-                fully_shard_fn(expert, hook_module=hook_module, **config)
+-                set_gradient_divide_factor(expert, gradient_divide_factor)
+-        else:
+-            fully_shard_fn(experts, hook_module=hook_module, **config)
+-            set_gradient_divide_factor(experts, gradient_divide_factor)
++        for expert in experts if isinstance(experts, torch.nn.ModuleList) else (experts,):
++            placement_fn = _make_efsdp_shard_placement(expert, ep_plan.efsdp_shard_placements, enable_lp_all_gather)
++            fully_shard_fn(expert, hook_module=hook_module, **{**config, 'shard_placement_fn': placement_fn})
++            set_gradient_divide_factor(expert, gradient_divide_factor)
+ 
+     return model
+ 
+ 
++def _make_efsdp_shard_placement(expert, placements, enable_lp_all_gather):
++    # Parameter identity is resolved after EP has installed its DTensors.
++    # Shape checks belong here because configuration initialization has no model.
++    dimensions = {}
++    for name, dim in placements:
++        parameter = expert.get_parameter(name)
++        if dim >= parameter.ndim:
++            raise ValueError(f"eFSDP dimension {dim} is out of range for {name} with shape {tuple(parameter.shape)}")
++        if enable_lp_all_gather and dim != 0:
++            raise ValueError("Low-precision all-gather requires dim-0 eFSDP sharding")
++        if id(parameter) in dimensions and dimensions[id(parameter)] != dim:
++            raise ValueError(f"Conflicting eFSDP dimensions for shared parameter {name}")
++        dimensions[id(parameter)] = dim
++
++    def shard_placement_fn(parameter: torch.nn.Parameter) -> Shard:
++        default_dim = 0 if enable_lp_all_gather or parameter.ndim < 2 else 1
++        return Shard(dimensions.get(id(parameter), default_dim))
++
++    return shard_placement_fn
++
++
+ def get_efsdp_modules(modules: torch.nn.Module, plan: EPPlanConfig):
+     efsdp_modules = []
+     for plan_name in plan.apply_efsdp_modules:
+diff --git a/fsdp_turbo/distributed/expert_parallel/expert_parallel.py b/fsdp_turbo/distributed/expert_parallel/expert_parallel.py
+index 16f8564..12bde7e 100644
+--- a/fsdp_turbo/distributed/expert_parallel/expert_parallel.py
++++ b/fsdp_turbo/distributed/expert_parallel/expert_parallel.py
+@@ -21,6 +21,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
+     normalize_expert_args,
+ )
+ from fsdp_turbo.fsdp_turbo_config import EPPlanConfig
++from fsdp_turbo.utils.device import get_accelerator_name
+ from fsdp_turbo.utils.log import print_rank
+ from fsdp_turbo.utils.str_match import module_name_match
+ 
+@@ -92,16 +93,25 @@ def prepare_distribute_output_fn(module, outputs, device_mesh):
+ 
+ 
+ def distribute_expert_weight(module_name, module, ep_mesh):
+-    placements = [Shard(0)]
++    placements = (Shard(0),)
+     for name, param in module.named_parameters(recurse=False):
++        if isinstance(param, DTensor):
++            if param.device_mesh != ep_mesh or param.placements != placements:
++                raise RuntimeError(
++                    f"EP parameter '{module_name}.{name}' already uses a different "
++                    "DTensor mesh or placement. Do not apply TP and EP to the same parameter."
++                )
++            continue
+         local_shape, global_offset = compute_local_shape_and_global_offset(param.shape, ep_mesh, placements)
+-        slices = [slice(offset, offset + size) for offset, size in zip(global_offset, local_shape)]
+-        dist_param = torch.nn.Parameter(DTensor.from_local(param[tuple(slices)].detach().clone(), ep_mesh, placements))
++        slices = tuple(slice(offset, offset + size) for offset, size in zip(global_offset, local_shape))
++        device = torch.device(torch.accelerator.current_accelerator().type, torch.accelerator.current_device_index())
++        if param.is_meta:
++            local_param = torch.empty(tuple(local_shape), dtype=param.dtype, device=device)
++        else:
++            local_param = param[slices].detach().clone().to(device=device)
++        dist_param = torch.nn.Parameter(DTensor.from_local(local_param, ep_mesh, placements))
+         module.register_parameter(name, dist_param)
+ 
+-    for name, children_module in module.named_children():
+-        distribute_expert_weight(name, children_module, ep_mesh)
+-
+ 
+ def distribute_experts_module(module: torch.nn.Module, ep_mesh: DeviceMesh):
+     return distribute_module(
+diff --git a/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py b/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
+index 39a1150..a51b6f2 100644
+--- a/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
++++ b/fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py
+@@ -26,6 +26,7 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh,
+         'ignored_params': ignored_params,
+         'mp_policy': mp_policy,
+         'offload_policy': offload_policy,
++        'reshard_after_forward': fsdp_plan.reshard_after_forward,
+     }
+ 
+     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
+diff --git a/fsdp_turbo/fsdp_turbo_config.py b/fsdp_turbo/fsdp_turbo_config.py
+index 59707db..8a71809 100644
+--- a/fsdp_turbo/fsdp_turbo_config.py
++++ b/fsdp_turbo/fsdp_turbo_config.py
+@@ -27,6 +27,7 @@ class ModelConfig:
+     load_pretrained_weights: bool = False
+     pretrained_strict: bool = True
+     pretrained_engram_rows_per_chunk: int = 65_536
++    attn_implementation: str = "eager"
+     # Optional demo/debug knob for building a shallower language model.
+     num_hidden_layers: Optional[int] = None
+     engram_storage_backend: Optional[Literal["host_offload", "elastic_buffer"]] = None
+@@ -171,6 +172,9 @@ class FSDPPlanConfig:
+     cpu_offload: bool = False
+     pin_memory: bool = True
+ 
++    # Parameter lifecycle after forward; individual apply_modules entries may override it.
++    reshard_after_forward: bool | int | None = True
++
+     # prefetch settings
+     num_to_forward_prefetch: Optional[int] = 0
+     num_to_backward_prefetch: Optional[int] = 0
+@@ -211,6 +215,8 @@ class EPPlanConfig:
+     dispatcher: Union[Literal["all2all", "allgather", "mc2", "domino", "chunkmoe"], Callable, str] = "all2all"
+     fixed_router: bool = False
+     apply_efsdp_modules: List[str] = field(default_factory=list)
++    # (parameter name relative to each expert module, zero-based shard dimension).
++    efsdp_shard_placements: List[tuple[str, int]] = field(default_factory=list)
+     # Gradient divide factor for expert HSDP. When unset (None) it is
+     # computed in the config validation as ep * edp * efsdp.
+     gradient_divide_factor: Optional[float] = None
+@@ -710,6 +716,24 @@ class FSDPTurboConfig:
+             raise ValueError(
+                 "model.use_fused_clipped_swiglu requires DeepSeek-V4.1's custom_native_eager_forward EP dispatcher."
+             )
++        placements = self.distributed.ep_plan.efsdp_shard_placements
++        if not isinstance(placements, (list, tuple)):
++            raise ValueError("ep_plan.efsdp_shard_placements must be a list of (parameter name, dimension) pairs")
++        names = set()
++        for entry in placements:
++            if (
++                not isinstance(entry, (list, tuple)) or len(entry) != 2
++                or not isinstance(entry[0], str) or not entry[0]
++                or type(entry[1]) is not int or entry[1] < 0
++            ):
++                raise ValueError(
++                    "Each efsdp_shard_placements entry must contain a nonempty "
++                    "parameter name and nonnegative integer dimension"
++                )
++            if entry[0] in names:
++                raise ValueError(f"Duplicate eFSDP parameter: {entry[0]}")
++            names.add(entry[0])
++        self.distributed.ep_plan.efsdp_shard_placements = [tuple(entry) for entry in placements]
+         if self.distributed.ep_plan.gradient_divide_factor is None:
+             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
+             # sets WORLD_SIZE; fall back to 1 for non-distributed runs.
+diff --git a/tests/unit_tests/distributed/expert_parallel/test_efsdp_placements.py b/tests/unit_tests/distributed/expert_parallel/test_efsdp_placements.py
+new file mode 100644
+index 0000000..81f2eb0
+--- /dev/null
++++ b/tests/unit_tests/distributed/expert_parallel/test_efsdp_placements.py
+@@ -0,0 +1,72 @@
++"""Configuration-driven expert FSDP placement regression tests."""
++import pytest
++import torch
++
++from fsdp_turbo.fsdp_turbo_config import DistributedConfig, EPPlanConfig, FSDPTurboConfig, load_config_from_yaml
++from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import _make_efsdp_shard_placement
++
++
++def make_experts():
++    module = torch.nn.Module()
++    module.register_parameter("gate_up_proj", torch.nn.Parameter(torch.empty(2, 8, 12)))
++    module.register_parameter("down_proj", torch.nn.Parameter(torch.empty(2, 6, 8)))
++    module.register_parameter("bias", torch.nn.Parameter(torch.empty(8)))
++    return module
++
++
++def test_yaml_pairs_are_normalized_and_select_parameter_dimensions(tmp_path):
++    path = tmp_path / "config.yaml"
++    path.write_text("distributed:\n  ep_plan:\n    apply_modules: []\n    efsdp_shard_placements:\n      - [gate_up_proj, 2]\n      - [down_proj, 1]\n")
++    config = load_config_from_yaml(path)
++    plan = config.distributed.ep_plan
++    assert plan.efsdp_shard_placements == [("gate_up_proj", 2), ("down_proj", 1)]
++    experts = make_experts()
++    callback = _make_efsdp_shard_placement(experts, plan.efsdp_shard_placements, False)
++    assert callback(experts.gate_up_proj).dim == 2
++    assert callback(experts.down_proj).dim == 1
++    assert callback(experts.bias).dim == 0
++
++
++def test_configuration_can_swap_dimensions_without_model_changes():
++    experts = make_experts()
++    first = _make_efsdp_shard_placement(experts, [("gate_up_proj", 1), ("down_proj", 2)], False)
++    other = make_experts()
++    second = _make_efsdp_shard_placement(other, [("gate_up_proj", 2)], False)
++    assert first(experts.gate_up_proj).dim == 1
++    assert first(experts.down_proj).dim == 2
++    assert second(other.gate_up_proj).dim == 2
++    assert second(other.down_proj).dim == 1
++
++
++def test_defaults_and_low_precision_all_gather():
++    experts = make_experts()
++    callback = _make_efsdp_shard_placement(experts, [], False)
++    assert callback(experts.gate_up_proj).dim == 1
++    callback = _make_efsdp_shard_placement(experts, [("gate_up_proj", 0)], True)
++    assert callback(experts.gate_up_proj).dim == callback(experts.down_proj).dim == 0
++    with pytest.raises(ValueError, match="dim-0"):
++        _make_efsdp_shard_placement(experts, [("gate_up_proj", 2)], True)
++
++
++@pytest.mark.parametrize("placements", [None, {}, ["gate_up_proj"], [["gate_up_proj"]],
++    [["", 1]], [[4, 1]], [["gate_up_proj", -1]], [["gate_up_proj", True]],
++    [["gate_up_proj", 1.5]], [["gate_up_proj", 2, 3]],
++    [["gate_up_proj", 1], ["gate_up_proj", 2]]])
++def test_invalid_config_rejected_at_initialization(placements):
++    with pytest.raises(ValueError):
++        FSDPTurboConfig(distributed=DistributedConfig(ep_plan=EPPlanConfig(efsdp_shard_placements=placements)))
++
++
++def test_unknown_parameter_and_out_of_range_dimension():
++    experts = make_experts()
++    with pytest.raises(AttributeError):
++        _make_efsdp_shard_placement(experts, [("typo", 1)], False)
++    with pytest.raises(ValueError, match="out of range"):
++        _make_efsdp_shard_placement(experts, [("gate_up_proj", 3)], False)
++
++
++def test_shared_parameter_cannot_have_conflicting_dimensions():
++    experts = make_experts()
++    experts.alias = experts.gate_up_proj
++    with pytest.raises(ValueError, match="Conflicting"):
++        _make_efsdp_shard_placement(experts, [("gate_up_proj", 2), ("alias", 1)], False)
+-- 
+2.43.0
+
