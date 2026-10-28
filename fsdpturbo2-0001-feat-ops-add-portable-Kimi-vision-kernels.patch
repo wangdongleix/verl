@@ -1,0 +1,409 @@
+From b19fd5c3dc26335b0f57fefd0756de464b4cf82d Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: feat(ops): add portable Kimi vision kernels
+
+---
+ fsdp_turbo/ops/cpu/__init__.py                |  10 ++
+ fsdp_turbo/ops/cpu/vision.py                  |  69 +++++++++++
+ fsdp_turbo/ops/npu/__init__.py                |  10 ++
+ fsdp_turbo/ops/npu/vision.py                  | 112 ++++++++++++++++++
+ fsdp_turbo/ops/vision.py                      |  60 ++++++++++
+ .../unit_tests/models/test_kimi_projector.py  |  71 +++++++++++
+ 6 files changed, 332 insertions(+)
+ create mode 100644 fsdp_turbo/ops/cpu/vision.py
+ create mode 100644 fsdp_turbo/ops/npu/vision.py
+ create mode 100644 fsdp_turbo/ops/vision.py
+ create mode 100644 tests/unit_tests/models/test_kimi_projector.py
+
+diff --git a/fsdp_turbo/ops/cpu/__init__.py b/fsdp_turbo/ops/cpu/__init__.py
+index 2b67393..bf16a1e 100644
+--- a/fsdp_turbo/ops/cpu/__init__.py
++++ b/fsdp_turbo/ops/cpu/__init__.py
+@@ -23,6 +23,12 @@ from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch
+ from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
+ from fsdp_turbo.ops.cpu.flash_attn import flash_attention_cpu
+ from fsdp_turbo.ops.cpu.rotary_mul import rotary_mul_cpu
++from fsdp_turbo.ops.cpu.vision import (
++    canonical_nd_cpu,
++    rotary_interleaved_cpu,
++    try_fused_vision_attention_cpu,
++    vision_attention_cpu,
++)
+ 
+ __all__ = [
+     'cce_loss_cpu',
+@@ -51,4 +57,8 @@ __all__ = [
+     'situ_glu_cpu',
+     'flash_attention_cpu',
+     'rotary_mul_cpu',
++    'canonical_nd_cpu',
++    'rotary_interleaved_cpu',
++    'try_fused_vision_attention_cpu',
++    'vision_attention_cpu',
+ ]
+diff --git a/fsdp_turbo/ops/cpu/vision.py b/fsdp_turbo/ops/cpu/vision.py
+new file mode 100644
+index 0000000..1c48f33
+--- /dev/null
++++ b/fsdp_turbo/ops/cpu/vision.py
+@@ -0,0 +1,69 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0 (the "License");
++
++from collections.abc import Sequence
++
++import torch
++import torch.nn.functional as F
++
++from fsdp_turbo.ops.registry import register_op
++
++
++@register_op("canonical_nd", "cpu")
++def canonical_nd_cpu(tensor: torch.Tensor) -> torch.Tensor:
++    """Keep CPU tensors in their existing dense storage."""
++    return tensor
++
++
++@register_op("try_fused_vision_attention", "cpu")
++def try_fused_vision_attention_cpu(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor | None:
++    """Use the caller's portable attention path when no fused kernel exists."""
++    return
++
++
++@register_op("vision_attention", "cpu")
++def vision_attention_cpu(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    q_cu_seqlens: torch.Tensor | Sequence[int],
++    k_cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor:
++    """Apply independent non-causal attention to each packed image."""
++    query_ends = list(q_cu_seqlens)
++    key_ends = list(k_cu_seqlens)
++    if query_ends and query_ends[0] == 0:
++        query_ends = query_ends[1:]
++    if key_ends and key_ends[0] == 0:
++        key_ends = key_ends[1:]
++    if len(query_ends) != len(key_ends):
++        raise ValueError("Query and key sequence counts must match")
++    outputs = []
++    query_start = key_start = 0
++    for query_end, key_end in zip(query_ends, key_ends):
++        query_end, key_end = int(query_end), int(key_end)
++        outputs.append(
++            F.scaled_dot_product_attention(
++                q[query_start:query_end].transpose(0, 1),
++                k[key_start:key_end].transpose(0, 1),
++                v[key_start:key_end].transpose(0, 1),
++                scale=scale,
++            ).transpose(0, 1)
++        )
++        query_start, key_start = query_end, key_end
++    return torch.cat(outputs, dim=0)
++
++
++@register_op("rotary_interleaved", "cpu")
++def rotary_interleaved_cpu(inputs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++    """Rotate adjacent feature pairs using the supplied sine and cosine."""
++    pairs = inputs.reshape(*inputs.shape[:-1], -1, 2)
++    rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).reshape_as(inputs)
++    return inputs * cos + rotated * sin
+diff --git a/fsdp_turbo/ops/npu/__init__.py b/fsdp_turbo/ops/npu/__init__.py
+index b90a855..8fbae4d 100644
+--- a/fsdp_turbo/ops/npu/__init__.py
++++ b/fsdp_turbo/ops/npu/__init__.py
+@@ -37,6 +37,12 @@ from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attenti
+ from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
+ from fsdp_turbo.ops.npu.flash_attn import flash_attention_npu
+ from fsdp_turbo.ops.npu.rotary_mul import rotary_mul_npu
++from fsdp_turbo.ops.npu.vision import (
++    canonical_nd_npu,
++    rotary_interleaved_npu,
++    try_fused_vision_attention_npu,
++    vision_attention_npu,
++)
+ 
+ __all__ = [
+     'cce_loss_npu',
+@@ -75,4 +81,8 @@ __all__ = [
+     'hf32_linear_npu',
+     'flash_attention_npu',
+     'rotary_mul_npu',
++    'canonical_nd_npu',
++    'rotary_interleaved_npu',
++    'try_fused_vision_attention_npu',
++    'vision_attention_npu',
+ ]
+diff --git a/fsdp_turbo/ops/npu/vision.py b/fsdp_turbo/ops/npu/vision.py
+new file mode 100644
+index 0000000..23d228f
+--- /dev/null
++++ b/fsdp_turbo/ops/npu/vision.py
+@@ -0,0 +1,112 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0 (the "License");
++
++from collections.abc import Sequence
++
++import torch
++import torch.nn.functional as F
++import torch_npu
++
++from fsdp_turbo.ops.registry import register_op
++
++
++class _NpuCanonicalND(torch.autograd.Function):
++    """Canonicalize NPU storage format while preserving autograd."""
++
++    @staticmethod
++    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
++        ctx.original_format = torch_npu.get_npu_format(tensor)
++        return torch_npu.npu_format_cast(tensor, 2)
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
++        return (torch_npu.npu_format_cast(grad_output, ctx.original_format),)
++
++
++@register_op("canonical_nd", "npu")
++def canonical_nd_npu(tensor: torch.Tensor) -> torch.Tensor:
++    """Convert NPU storage to ND while preserving gradients."""
++    if tensor.device.type != "npu":
++        return tensor
++    if torch.is_grad_enabled() and tensor.requires_grad:
++        return _NpuCanonicalND.apply(tensor)
++    return torch_npu.npu_format_cast(tensor, 2)
++
++
++@register_op("try_fused_vision_attention", "npu")
++def try_fused_vision_attention_npu(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor | None:
++    """Match vLLM-Ascend vision attention during no-grad forwards."""
++    if q.device.type != "npu" or torch.is_grad_enabled():
++        return None
++
++    if isinstance(cu_seqlens, torch.Tensor):
++        seq_ends = cu_seqlens.detach().cpu().reshape(-1).tolist()
++    else:
++        seq_ends = [int(value) for value in cu_seqlens]
++    if seq_ends and seq_ends[0] == 0:
++        seq_ends = seq_ends[1:]
++    if not seq_ends or seq_ends[-1] != q.shape[0]:
++        return None
++
++    original_head_dim = q.shape[-1]
++    if 64 < original_head_dim < 128:
++        pad_len = 128 - original_head_dim
++        q = F.pad(q, (0, pad_len), value=0)
++        k = F.pad(k, (0, pad_len), value=0)
++        v = F.pad(v, (0, pad_len), value=0)
++
++    output, _ = torch_npu.npu_fused_infer_attention_score(
++        query=q.contiguous(),
++        key=k.contiguous(),
++        value=v.contiguous(),
++        atten_mask=None,
++        block_table=None,
++        input_layout="TND",
++        block_size=128,
++        actual_seq_lengths=seq_ends,
++        actual_seq_lengths_kv=seq_ends,
++        num_key_value_heads=q.shape[1],
++        num_heads=q.shape[1],
++        scale=scale,
++        sparse_mode=0,
++        pre_tokens=2147483647,
++        next_tokens=2147483647,
++    )
++    if original_head_dim != q.shape[-1]:
++        output = output[..., :original_head_dim]
++    return output.flatten(start_dim=-2)
++
++
++@register_op("vision_attention", "npu")
++def vision_attention_npu(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    q_cu_seqlens: torch.Tensor | Sequence[int],
++    k_cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor:
++    """Apply Ascend fused non-causal attention to packed image sequences."""
++    return torch_npu.npu_fusion_attention(
++        q,
++        k,
++        v,
++        head_num=q.shape[1],
++        pse=None,
++        scale=scale,
++        input_layout="TND",
++        actual_seq_qlen=q_cu_seqlens,
++        actual_seq_kvlen=k_cu_seqlens,
++    )[0]
++
++
++@register_op("rotary_interleaved", "npu")
++def rotary_interleaved_npu(inputs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++    """Apply the Ascend interleaved rotary kernel to adjacent feature pairs."""
++    return torch_npu.npu_rotary_mul(inputs, cos, sin, rotary_mode="interleave")
+diff --git a/fsdp_turbo/ops/vision.py b/fsdp_turbo/ops/vision.py
+new file mode 100644
+index 0000000..381bf3f
+--- /dev/null
++++ b/fsdp_turbo/ops/vision.py
+@@ -0,0 +1,60 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0 (the "License");
++
++from collections.abc import Sequence
++
++import torch
++
++from fsdp_turbo.ops.registry import dispatch_op
++
++
++def canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
++    """Return canonical storage while preserving gradients."""
++    return dispatch_op("canonical_nd", tensor, device_type=tensor.device.type)
++
++
++def try_fused_vision_attention(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor | None:
++    """Return fused no-grad attention, or None for the portable caller path."""
++    return dispatch_op(
++        "try_fused_vision_attention",
++        q,
++        k,
++        v,
++        cu_seqlens,
++        scale,
++        device_type=q.device.type,
++    )
++
++
++def vision_attention(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    q_cu_seqlens: torch.Tensor | Sequence[int],
++    k_cu_seqlens: torch.Tensor | Sequence[int],
++    scale: float,
++) -> torch.Tensor:
++    """Compute non-causal attention over packed vision sequences."""
++    return dispatch_op(
++        "vision_attention",
++        q,
++        k,
++        v,
++        q_cu_seqlens,
++        k_cu_seqlens,
++        scale,
++        device_type=q.device.type,
++    )
++
++
++def rotary_interleaved(inputs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++    """Apply rotary embeddings to adjacent feature pairs."""
++    return dispatch_op(
++        "rotary_interleaved", inputs, cos, sin, device_type=inputs.device.type
++    )
+diff --git a/tests/unit_tests/models/test_kimi_projector.py b/tests/unit_tests/models/test_kimi_projector.py
+new file mode 100644
+index 0000000..c56d3d1
+--- /dev/null
++++ b/tests/unit_tests/models/test_kimi_projector.py
+@@ -0,0 +1,71 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0 (the "License");
++
++import ast
++import math
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn.functional as F
++from transformers import PretrainedConfig
++
++# This Hugging Face model file imports configuration modules supplied by the
++# checkpoint. Exercise its self-contained projector classes without a checkpoint.
++source = Path(__file__).resolve().parents[3] / "fsdp_turbo/models/kimi/modeling_kimi_k3.py"
++definitions = [
++    node for node in ast.parse(source.read_text()).body
++    if isinstance(node, ast.ClassDef) and node.name in {"PatchMergerMLPV2", "ProjectorConfig", "VisionTowerConfig"}
++]
++namespace = {"torch": torch, "nn": torch.nn, "math": math, "KimiK3Config": SimpleNamespace}
++namespace["PretrainedConfig"] = PretrainedConfig
++exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102 - compile only local projector definitions
++PatchMergerMLPV2 = namespace["PatchMergerMLPV2"]
++ProjectorConfig = namespace["ProjectorConfig"]
++
++
++@pytest.mark.parametrize("checkpoint_mode", ["bilinear", "bicubic"])
++def test_vision_interpolation_matches_reference(checkpoint_mode):
++    config = SimpleNamespace(
++        patch_size=14, init_pos_emb_height=2, init_pos_emb_width=2, init_pos_emb_time=1,
++        pos_emb_type="learnable", vt_num_attention_heads=1, vt_num_hidden_layers=1,
++        vt_hidden_size=4, vt_intermediate_size=8, merge_kernel_size=(2, 2),
++        merge_type="spatial", _attn_implementation="eager",
++        pos_emb_interpolation_mode=checkpoint_mode,
++    )
++    assert namespace["VisionTowerConfig"](config).pos_emb_interpolation_mode == "bicubic"
++
++
++@pytest.mark.parametrize("use_rotation", [False, True])
++@pytest.mark.parametrize("ragged", [False, True])
++def test_projector_checkpoint_rotation_and_backward(use_rotation, ragged):
++    config = ProjectorConfig(SimpleNamespace(
++        mm_projector_type="patchmergerv2", mm_hidden_size=2, text_hidden_size=8,
++        merge_kernel_size=(2, 2), projector_hidden_act="gelu",
++        projector_ln_eps=1e-6, use_rot_proj=use_rotation,
++    ))
++    model = PatchMergerMLPV2(config)
++    state = model.state_dict()
++    rotation = torch.eye(8).roll(1, dims=0)
++    if use_rotation:
++        state["rot_proj.weight"] = rotation
++    else:
++        assert "rot_proj.weight" not in state
++    model.load_state_dict(state, strict=True)
++
++    features = torch.randn(3, 4, 2, requires_grad=True)
++    inputs = [features[:1], features[1:]] if ragged else features.unsqueeze(0)
++    output = model(inputs)
++    actual = torch.cat(output) if ragged else output.squeeze(0)
++    expected = model.post_norm(model.proj(features.flatten(1)))
++    if use_rotation:
++        expected = F.linear(expected, rotation)
++    torch.testing.assert_close(actual, expected)
++    actual.square().sum().backward()
++    assert features.grad is not None and torch.isfinite(features.grad).all()
++    if use_rotation:
++        assert model.rot_proj.weight.grad is not None
++        assert torch.isfinite(model.rot_proj.weight.grad).all()
++        assert model.rot_proj.weight.grad.abs().sum() > 0
++        assert torch.equal(model.state_dict()["rot_proj.weight"], rotation)
+-- 
+2.43.0
+
