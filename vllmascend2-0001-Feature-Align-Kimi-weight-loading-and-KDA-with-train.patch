@@ -1,0 +1,955 @@
+From de4bc27001ddc2dd8b2fcfeef76bfad91265df71 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: [Feature] Align Kimi weight loading and KDA with training
+
+---
+ tests/ut/models/test_kimi_k3_eplb.py          |  31 +++-
+ tests/ut/models/test_kimi_training_weights.py | 116 ++++++++++++
+ tests/ut/ops/test_kimi_kda.py                 |  16 +-
+ .../test_kimi_training_projection_reload.py   |  69 +++++++
+ tests/ut/ops/test_kimi_training_router.py     |  48 +++++
+ tests/ut/test_ascend_config.py                |  25 +++
+ vllm_ascend/ascend_config.py                  |   5 +
+ vllm_ascend/models/kimi_k3.py                 | 114 +++++++++++-
+ .../fused_moe/router/kimi_training_router.py  |  29 +++
+ vllm_ascend/ops/kimi_kda.py                   | 174 ++++++++++++++++--
+ 10 files changed, 593 insertions(+), 34 deletions(-)
+ create mode 100644 tests/ut/models/test_kimi_training_weights.py
+ create mode 100644 tests/ut/ops/test_kimi_training_projection_reload.py
+ create mode 100644 tests/ut/ops/test_kimi_training_router.py
+ create mode 100644 vllm_ascend/ops/fused_moe/router/kimi_training_router.py
+
+diff --git a/tests/ut/models/test_kimi_k3_eplb.py b/tests/ut/models/test_kimi_k3_eplb.py
+index 11c47580b..c4faa5be0 100644
+--- a/tests/ut/models/test_kimi_k3_eplb.py
++++ b/tests/ut/models/test_kimi_k3_eplb.py
+@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
+ import pytest
+ import torch
+ from torch import nn
++from vllm.config import AuxOutputConfig
+ from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.models import utils as model_utils
+ from vllm.model_executor.models.interfaces import is_mixture_of_experts
+@@ -15,6 +16,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
+ 
+ from vllm_ascend.models import kimi_k3 as k3_module
+ from vllm_ascend.models import kimi_k3_mtp as mtp_module
++from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+ from vllm_ascend.patch.platform import patch_eplb
+ 
+ 
+@@ -406,7 +408,8 @@ def test_eplb_expert_remapping_preserves_weight_metadata():
+ 
+ 
+ @pytest.mark.parametrize("enable_eplb", [False, True])
+-def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb):
++@pytest.mark.parametrize("capture_routing", [False, True])
++def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routing):
+     config = SimpleNamespace(
+         hidden_size=4,
+         moe_intermediate_size=8,
+@@ -430,15 +433,39 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb):
+         num_experts=264 if enable_eplb else 256,
+         num_local_experts=33 if enable_eplb else 256,
+     )
++    runner.router = AscendGroupedTopKRouter(
++        top_k=2,
++        global_num_experts=256,
++        num_expert_group=1,
++        topk_group=1,
++        use_grouped_topk=False,
++        scoring_func="sigmoid",
++    )
++    runner.routed_experts = nn.Module()
++    runner.routed_experts.router = runner.router
++    original_router = runner.router
+     factory = MagicMock(return_value=runner)
+     monkeypatch.setattr(k3_module, "FusedMoEFactory", factory)
+     monkeypatch.setattr(
+         k3_module, "GateLinear", lambda input_size, output_size, **kwargs: nn.Linear(input_size, output_size)
+     )
+ 
+-    moe = k3_module.AscendKimiMoE(config=config, vllm_config=SimpleNamespace(parallel_config=parallel))
++    moe = k3_module.AscendKimiMoE(
++        config=config,
++        vllm_config=SimpleNamespace(
++            parallel_config=parallel,
++            aux_output_config=AuxOutputConfig(enable_return_routed_experts=capture_routing),
++            additional_config={},
++        ),
++    )
+ 
+     assert factory.call_args.kwargs["enable_eplb"] == enable_eplb
+     assert factory.call_args.kwargs["num_redundant_experts"] == (8 if enable_eplb else 0)
+     assert moe.n_physical_experts == runner.moe_config.num_experts
+     assert moe.n_local_physical_experts == runner.moe_config.num_local_experts
++    assert isinstance(runner.router, k3_module.KimiTrainingRouter) == capture_routing
++    assert runner.routed_experts.router is runner.router
++    if capture_routing:
++        assert runner.router.router is original_router
++    else:
++        assert runner.router is original_router
+diff --git a/tests/ut/models/test_kimi_training_weights.py b/tests/ut/models/test_kimi_training_weights.py
+new file mode 100644
+index 000000000..3497306c9
+--- /dev/null
++++ b/tests/ut/models/test_kimi_training_weights.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++import torch
++import torch.nn.functional as F
++from torch import nn
++from vllm.v1.worker.utils import clear_layer_kv_caches
++
++from vllm_ascend.models import kimi_k3
++from vllm_ascend.models.kimi_k3 import AscendKimiMLAAttention, KimiTrainingPatchEmbed, _load_packed_expert_weight
++
++
++@pytest.mark.parametrize("with_standard_weight", [False, True])
++def test_packed_buckets_skip_empty_upstream_load_and_preserve_mixed_stream(with_standard_weight):
++    model = kimi_k3.AscendKimiLinearModel.__new__(kimi_k3.AscendKimiLinearModel)
++    nn.Module.__init__(model)
++    model.config = SimpleNamespace(num_experts=2, is_moe=True)
++    model.n_redundant_experts = 0
++    model.named_parameters = MagicMock(side_effect=AssertionError("unnecessary full-model traversal"))
++    packed = ("layers.0.block_sparse_moe.experts.gate_up_proj.__verl_packed_local__.0", torch.ones(2, 4, 6))
++    standard = ("layers.0.self_attn.q_proj.weight", torch.ones(4, 4), {"loaded_shard_id": 0})
++    weights = [packed, standard, packed] if with_standard_weight else [packed]
++    received = []
++
++    def upstream_load(self, stream):
++        received.extend(stream)
++        return {row[0] for row in received}
++
++    with (
++        patch.object(kimi_k3, "_load_packed_expert_weight", return_value="packed_target") as packed_load,
++        patch.object(
++            kimi_k3.UpstreamKimiLinearModel, "load_weights", autospec=True, side_effect=upstream_load
++        ) as upstream,
++    ):
++        loaded = model.load_weights(iter(weights))
++
++    assert packed_load.call_count == (2 if with_standard_weight else 1)
++    assert upstream.call_count == int(with_standard_weight)
++    assert packed_load.call_args.args[2] == model.get_parameter
++    assert received == ([standard] if with_standard_weight else [])
++    assert loaded == ({"packed_target", standard[0]} if with_standard_weight else {"packed_target"})
++    model.named_parameters.assert_not_called()
++
++
++@pytest.mark.parametrize("tensor_cache", [True, False])
++def test_kimi_mla_shutdown_clears_underlying_cache(tensor_cache):
++    layer = AscendKimiMLAAttention.__new__(AscendKimiMLAAttention)
++    nn.Module.__init__(layer)
++    cache = torch.ones(4) if tensor_cache else [torch.ones(4)]
++    inner = SimpleNamespace(kv_cache=cache, impl=SimpleNamespace(_k_scale_cache=cache, _v_scale_cache=cache))
++    layer.mla_attn = SimpleNamespace(mla_attn=inner)
++
++    clear_layer_kv_caches([layer])
++
++    assert layer.kv_cache is inner.kv_cache
++    assert len(inner.kv_cache) == 0
++    assert isinstance(inner.kv_cache, torch.Tensor) == tensor_cache
++    assert inner.impl._k_scale_cache is None
++    assert inner.impl._v_scale_cache is None
++
++
++@pytest.mark.parametrize("gate_up", [True, False])
++def test_packed_local_reload_preserves_expert_ids_axes_and_storage(gate_up):
++    source = torch.arange(2 * 7 * 6, dtype=torch.float32).reshape(2, 7, 6)
++    target = nn.Parameter(torch.empty(2, 6, 7), requires_grad=False)
++    calls = []
++
++    def load(param, shard, name, *, expert_id, shard_id, return_success):
++        calls.append((expert_id, shard_id))
++        index = expert_id - 256
++        begin = 0 if shard_id in ("w1", "w2") else 3
++        param[index, begin : begin + shard.shape[0]].copy_(shard)
++        return True
++
++    target.weight_loader = load
++    prefix = "layers.1.block_sparse_moe.experts."
++    source_name = prefix + ("gate_up_proj" if gate_up else "down_proj")
++    target_name = prefix + "routed_experts." + ("w13_weight" if gate_up else "w2_weight")
++    pointer = target.data_ptr()
++    for version in (0, 1):
++        weight = source + version * 1000
++        assert (
++            _load_packed_expert_weight(
++                source_name + ".__verl_packed_local__.256",
++                weight,
++                {target_name: target}.__getitem__,
++                896,
++            )
++            == target_name
++        )
++        torch.testing.assert_close(target, weight.transpose(1, 2), rtol=0, atol=0)
++        assert target.data_ptr() == pointer
++    assert {expert for expert, _ in calls} == {256, 257}
++
++
++def test_patch_projection_matches_actor_fp32_linear_and_retains_names():
++    projection = nn.Conv2d(3, 4, kernel_size=2, stride=2, bias=False).to(torch.bfloat16)
++    original = nn.Module()
++    original.proj = projection
++    original.input_norm = lambda value, dtype: value.to(dtype)
++    original.pos_emb = lambda value, grid: value
++    patch = KimiTrainingPatchEmbed(original)
++    x = torch.randn(5, 3, 2, 2).to(torch.bfloat16)
++    expected = F.linear(x.flatten(1).float(), projection.weight.flatten(1).float()).to(torch.bfloat16)
++    torch.testing.assert_close(patch(x, [[1, 1, 5]]), expected, rtol=0, atol=0)
++    assert dict(patch.named_parameters())["proj.weight"] is projection.weight
++
++
++def test_ascend_kimi_requires_processor_side_image_normalization():
++    from vllm_ascend.models.kimi_k3 import AscendKimiK3ForConditionalGeneration
++
++    # A uint8 processor path requires a device normalization layer. The Ascend
++    # tower instead consumes the same normalized patches as the training model.
++    assert AscendKimiK3ForConditionalGeneration.supports_mm_device_do_normalize is False
+diff --git a/tests/ut/ops/test_kimi_kda.py b/tests/ut/ops/test_kimi_kda.py
+index a32a9ed22..0acaf33e5 100644
+--- a/tests/ut/ops/test_kimi_kda.py
++++ b/tests/ut/ops/test_kimi_kda.py
+@@ -83,7 +83,8 @@ def test_kda_output_norm_uses_checkpoint_epsilon():
+         model_config=SimpleNamespace(
+             multimodal_config=None,
+             enable_prompt_embeds=False,
+-        )
++        ),
++        additional_config={},
+     )
+     with patch(
+         "vllm_ascend.ops.kimi_kda.KimiK3DeltaAttention.__init__",
+@@ -488,16 +489,19 @@ def test_kda_conv_weight_is_packed_once_in_kernel_layout():
+     attention.conv1d = nn.Module()
+     source = torch.arange(18 * 4, dtype=torch.float32).reshape(18, 1, 4)
+     attention.conv1d.weight = nn.Parameter(source)
+-    attention.register_parameter(
++    attention.register_buffer(
+         _PACKED_CONV_WEIGHT_NAME,
+-        nn.Parameter(torch.empty(4, 18, dtype=torch.bfloat16), requires_grad=False),
++        torch.empty(4, 18, dtype=torch.bfloat16),
++        persistent=False,
+     )
+-    original = attention.get_parameter(_PACKED_CONV_WEIGHT_NAME)
++    original = attention.get_buffer(_PACKED_CONV_WEIGHT_NAME)
+     original_ptr = original.data_ptr()
+ 
+     attention._pack_conv_weights()
+ 
+-    packed = attention.get_parameter(_PACKED_CONV_WEIGHT_NAME)
++    packed = attention.get_buffer(_PACKED_CONV_WEIGHT_NAME)
++    assert _PACKED_CONV_WEIGHT_NAME not in dict(attention.named_parameters())
++    assert _PACKED_CONV_WEIGHT_NAME not in attention.state_dict()
+     assert packed.data_ptr() == original_ptr
+     assert packed.dtype == torch.bfloat16
+     assert packed.is_contiguous()
+@@ -546,7 +550,7 @@ def test_kda_forward_preserves_live_rows_with_nan_padding(mode):
+         head_dim=2,
+         num_spec=3,
+         kv_cache=(torch.zeros(1), state),
+-        get_parameter=lambda name: torch.empty(1),
++        get_buffer=lambda name: torch.empty(1),
+         _run_causal_conv1d=lambda x, *args, **kwargs: x,
+         _run_recurrent=recurrent,
+         o_norm=SimpleNamespace(forward_oot=norm_into),
+diff --git a/tests/ut/ops/test_kimi_training_projection_reload.py b/tests/ut/ops/test_kimi_training_projection_reload.py
+new file mode 100644
+index 000000000..3d855dc77
+--- /dev/null
++++ b/tests/ut/ops/test_kimi_training_projection_reload.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++from unittest.mock import patch
++
++import pytest
++import torch
++from torch import nn
++from vllm.model_executor.model_loader.reload import layerwise
++
++import vllm_ascend.patch.worker.patch_layerwise_reload  # noqa: F401
++from vllm_ascend.ops.kimi_kda import _KimiTrainingInputProjection, _KimiTrainingOutputProjection
++
++
++@pytest.mark.parametrize("reduce_results", [False, True])
++def test_output_projection_reduces_once_with_sequence_parallel(reduce_results):
++    layer = _KimiTrainingOutputProjection.__new__(_KimiTrainingOutputProjection)
++    nn.Module.__init__(layer)
++    layer.tp_size = 8
++    layer.reduce_results = reduce_results
++    layer.weight = nn.Parameter(torch.ones(4, 2, dtype=torch.bfloat16), requires_grad=False)
++    hidden_states = torch.ones(8, 2, dtype=torch.bfloat16)
++    with patch(
++        "vllm_ascend.ops.kimi_kda.tensor_model_parallel_all_reduce", side_effect=lambda value: value * 8
++    ) as all_reduce:
++        output, bias = layer(hidden_states)
++    assert all_reduce.call_count == int(reduce_results)
++    assert bias is None
++    # Eight identical rank contributions: the decoder performs reduce-scatter
++    # only when the projection leaves its local partial result unreduced.
++    reduced = output if reduce_results else (output * 8).chunk(8)[0]
++    torch.testing.assert_close(reduced, torch.full_like(reduced, 16), rtol=0, atol=0)
++
++
++def test_padded_tp_projection_finishes_each_reload_without_model_flush():
++    tp_size, tp_rank, hidden_size, padding = 8, 3, 8, 15
++    checkpoint_sizes = [16, 16, 16, 16, 8, 8]
++    with (
++        patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=tp_size),
++        patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=tp_rank),
++        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=tp_rank),
++        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=tp_size),
++    ):
++        layer = _KimiTrainingInputProjection(
++            hidden_size,
++            checkpoint_sizes + [padding * tp_size],
++            replicated_shard_id=4,
++            tp_size=tp_size,
++            padding_size=padding,
++            bias=False,
++            params_dtype=torch.float32,
++        )
++    layerwise.record_metadata_for_reloading(layer)
++    pointer = layer.weight.data_ptr()
++    for version in (0, 1):
++        layerwise.initialize_layerwise_reload(layer)
++        expected = []
++        for shard_id, rows in enumerate(checkpoint_sizes):
++            source = torch.arange(rows * hidden_size, dtype=torch.float32).view(rows, hidden_size)
++            source += version * 1000 + shard_id * 100
++            local_rows = rows if shard_id == 4 else rows // tp_size
++            offset = 0 if shard_id == 4 else tp_rank * local_rows
++            expected.append(source[offset : offset + local_rows].clone())
++            layer.weight.weight_loader(layer.weight, source, shard_id)
++            source.fill_(-999)  # The IPC bucket may be reused immediately.
++        info = layerwise.get_layerwise_info(layer)
++        assert not info.loaded_weights
++        assert not info.can_load()
++        assert layer.weight.data_ptr() == pointer
++        expected.append(torch.zeros(padding, hidden_size))
++        torch.testing.assert_close(layer.weight, torch.cat(expected), rtol=0, atol=0)
+diff --git a/tests/ut/ops/test_kimi_training_router.py b/tests/ut/ops/test_kimi_training_router.py
+new file mode 100644
+index 000000000..b1ab5b60d
+--- /dev/null
++++ b/tests/ut/ops/test_kimi_training_router.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
++from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
++from vllm_ascend.patch.kimi_full_r3_schema import get_kimi_full_r3_shape
++from vllm_ascend.patch.worker.patch_routed_experts_capture import _pack_kimi_full_r3
++
++
++def test_capture_preserves_executed_weights_and_large_expert_ids():
++    router = KimiTrainingRouter(
++        AscendGroupedTopKRouter(
++            top_k=2,
++            global_num_experts=896,
++            num_expert_group=1,
++            topk_group=1,
++            use_grouped_topk=True,
++            scoring_func="sigmoid",
++        )
++    )
++    capture = Mock()
++    router.set_capture_fn(capture)
++    logits = torch.full((3, 896), -20.0)
++    logits[:, 256], logits[:, 895] = 1.0, 2.0
++    weights, ids = router._select_experts(torch.zeros(3, 4), logits)
++    assert weights.dtype == torch.bfloat16
++    assert set(ids[0].tolist()) == {256, 895}
++    capture.assert_called_once_with(ids, weights)
++    payload = _pack_kimi_full_r3(ids, weights).to(torch.uint16).to(torch.int32)
++    torch.testing.assert_close(payload[:, :2], ids)
++    restored = torch.stack((payload[:, 2:4], payload[:, 4:]), dim=-1).to(torch.uint8)
++    restored = restored.contiguous().view(torch.bfloat16).reshape_as(weights)
++    torch.testing.assert_close(restored, weights, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("model_type,width", [("kimi_k3", 48), ("other_moe", 16)])
++def test_scheduler_and_worker_share_model_specific_wire_shape(model_type, width):
++    model = SimpleNamespace(
++        get_total_num_hidden_layers=lambda: 93,
++        get_num_experts=lambda: 896,
++        get_num_experts_per_tok=lambda: 16,
++        hf_config=SimpleNamespace(model_type=model_type),
++    )
++    assert get_kimi_full_r3_shape(SimpleNamespace(model_config=model)) == (93, 896, width)
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index ece242dd7..b2f9912fb 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -406,6 +406,31 @@ class TestAscendConfig(TestBase):
+         self.assertIn("kda_prefill_backend", warned_text)
+         self.assertIn("flashkda", warned_text)
+ 
++    @_clean_up_ascend_config
++    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
++    def test_kimi_training_config_survives_factory_validation(self, mock_fix_incompatible_config):
++        test_vllm_config = VllmConfig()
++        test_vllm_config.additional_config = {
++            "kimi_training_backend": "fsdpturbo",
++            "kimi_training_causal_conv1d": True,
++            "kimi_kda_oproj_fp32_reduce": True,
++            "rl_config": {"sleep_mode_extra_cleanup": False},
++        }
++        ascend_config = init_ascend_config(test_vllm_config)
++        self.assertEqual(ascend_config.kimi_training_backend, "fsdpturbo")
++        self.assertTrue(ascend_config.kimi_training_causal_conv1d)
++        self.assertTrue(ascend_config.kimi_kda_oproj_fp32_reduce)
++        self.assertFalse(ascend_config.rl_config.sleep_mode_extra_cleanup)
++        self.assertEqual(test_vllm_config.additional_config["kimi_training_backend"], "fsdpturbo")
++
++    @_clean_up_ascend_config
++    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
++    def test_kimi_training_config_rejects_invalid_backend(self, mock_fix_incompatible_config):
++        test_vllm_config = VllmConfig()
++        test_vllm_config.additional_config = {"kimi_training_backend": "unknown"}
++        with self.assertRaises(ValueError):
++            init_ascend_config(test_vllm_config)
++
+     @_clean_up_ascend_config
+     @patch("vllm_ascend.ascend_config.logger")
+     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index d17452b4a..64c6984a5 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -563,6 +563,11 @@ class AscendConfig:
+     model_config = ConfigDict(extra="forbid")
+ 
+     # ---- user-input switches: bool/int/list/str, auto type validation ----
++    # Kimi rollout alignment with the selected training engine. None preserves
++    # the ordinary inference path; the two numeric options are opt-in.
++    kimi_training_backend: Literal["fsdpturbo", "megatron"] | None = None
++    kimi_training_causal_conv1d: bool = False
++    kimi_kda_oproj_fp32_reduce: bool = False
+     enable_cpu_binding: bool = True
+     multistream_dsv4_dsa_overlap: bool = True
+     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
+diff --git a/vllm_ascend/models/kimi_k3.py b/vllm_ascend/models/kimi_k3.py
+index 727d87ebc..fcdccfd25 100644
+--- a/vllm_ascend/models/kimi_k3.py
++++ b/vllm_ascend/models/kimi_k3.py
+@@ -11,9 +11,11 @@ import math
+ from bisect import bisect_left
+ from collections.abc import Callable, Iterable, Sequence
+ from copy import copy
++from itertools import chain
+ from typing import Any, TypeVar, cast
+ 
+ import torch
++import torch.nn.functional as F
+ import vllm.envs as envs
+ from torch import nn
+ from vllm.config import CacheConfig, VllmConfig
+@@ -88,6 +90,7 @@ from vllm.utils.math_utils import cdiv
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.utils import mark_fused_preprocess_weights
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
++from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
+ from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
+ from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
+ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+@@ -190,6 +193,43 @@ class AscendKimiMLP(KimiMLP):
+ 
+ 
+ _WeightT = TypeVar("_WeightT", bound=tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]])
++_VERL_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
++
++
++def _load_packed_expert_weight(
++    name: str, weight: torch.Tensor, get_parameter: Callable[[str], nn.Parameter], num_experts: int
++) -> str:
++    """Load trainer input-major experts through the authoritative EP loader."""
++    expert_start = None
++    if _VERL_PACKED_LOCAL_MARKER in name:
++        name, start = name.rsplit(_VERL_PACKED_LOCAL_MARKER, 1)
++        expert_start = int(start)
++    first_expert = expert_start if expert_start is not None else 0
++    if weight.ndim != 3 or first_expert < 0 or first_expert + weight.shape[0] > num_experts:
++        raise ValueError(f"Invalid Kimi packed expert range or shape: {name}, {tuple(weight.shape)}")
++    gate_up = name.endswith(".gate_up_proj")
++    target = name.rsplit(".experts.", 1)[0] + ".experts.routed_experts."
++    target += "w13_weight" if gate_up else "w2_weight"
++    param = get_parameter(target)
++    if gate_up and weight.shape[-1] % 2:
++        raise ValueError(f"Packed Kimi gate/up width must be even: {name}")
++    half = weight.shape[-1] // 2
++    for index, expert_weight in enumerate(weight):
++        shards = (
++            (("w1", expert_weight[:, :half]), ("w3", expert_weight[:, half:])) if gate_up else (("w2", expert_weight),)
++        )
++        for shard_id, shard in shards:
++            loaded = param.weight_loader(
++                param,
++                shard.t().contiguous(),
++                f"{name}.weight",
++                expert_id=first_expert + index,
++                shard_id=shard_id,
++                return_success=expert_start is not None,
++            )
++            if expert_start is not None and not loaded:
++                raise RuntimeError(f"vLLM rejected trainer packed-local expert {first_expert + index}: {name}")
++    return target
+ 
+ 
+ def load_eplb_expert_weights(
+@@ -366,6 +406,12 @@ class AscendKimiMoE(nn.Module):
+             enable_eplb=parallel_config.enable_eplb,
+             num_redundant_experts=num_redundant_experts,
+         )
++        if vllm_config.aux_output_config.enable_return_routed_experts or (vllm_config.additional_config or {}).get(
++            "kimi_training_backend"
++        ):
++            router = KimiTrainingRouter(self.experts.router)
++            self.experts.router = router
++            self.experts.routed_experts.router = router
+ 
+         # Use the factory's validated counts, including its effective EP size.
+         moe_config = self.experts.moe_config
+@@ -480,6 +526,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
+     def kv_cache(self):
+         return self._attention_layer.kv_cache
+ 
++    @kv_cache.setter
++    def kv_cache(self, value):
++        self._attention_layer.kv_cache = value
++
+     @property
+     def kv_cache_dtype(self):
+         return self._attention_layer.kv_cache_dtype
+@@ -881,8 +931,8 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
+         self,
+         weights: Iterable[tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]],
+     ) -> set[str]:
+-        """Reuse upstream loading with Ascend KDA gates and EPLB replicas."""
+-        params_dict = dict(self.named_parameters())
++        """Reuse upstream loading with packed trainer experts and Ascend gates."""
++        packed_loaded_params: set[str] = set()
+         gate_mapping = (
+             (".b_proj.weight", ".fused_bfg_proj.weight", 0),
+             (".f_a_proj.weight", ".fused_bfg_proj.f_a_weight", None),
+@@ -893,11 +943,21 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
+         def remap_mixed_gate_weights():
+             for args in weights:
+                 name, loaded_weight = args[:2]
++                physical_name = name.split(_VERL_PACKED_LOCAL_MARKER, 1)[0]
++                if physical_name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
++                    packed_loaded_params.add(
++                        _load_packed_expert_weight(name, loaded_weight, self.get_parameter, self.config.num_experts)
++                    )
++                    continue
+                 for source, target, shard_id in gate_mapping:
+                     if source not in name:
+                         continue
+                     mapped_name = name.replace(source, target)
+-                    if mapped_name in params_dict:
++                    try:
++                        self.get_parameter(mapped_name)
++                    except AttributeError:
++                        continue
++                    else:
+                         kwargs = dict(args[2]) if len(args) > 2 else {}
+                         kwargs["loaded_shard_id"] = shard_id
+                         yield mapped_name, loaded_weight, kwargs
+@@ -905,9 +965,17 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
+                 else:
+                     yield args
+ 
+-        return super().load_weights(
+-            load_eplb_expert_weights(self, remap_mixed_gate_weights(), self.n_redundant_experts)
++        # Packed trainer buckets can be consumed entirely above. Peek before
++        # invoking the upstream loader, which otherwise traverses every layer
++        # to build expert mappings and parameter dictionaries for an empty stream.
++        remaining = iter(remap_mixed_gate_weights())
++        first = next(remaining, None)
++        if first is None:
++            return packed_loaded_params
++        loaded_params = super().load_weights(
++            load_eplb_expert_weights(self, chain((first,), remaining), self.n_redundant_experts)
+         )
++        return loaded_params | packed_loaded_params
+ 
+     def forward(
+         self,
+@@ -1180,6 +1248,24 @@ class AscendKimiK3MultiModalProjector(KimiK25MultiModalProjector):
+         return hidden_states
+ 
+ 
++class KimiTrainingPatchEmbed(nn.Module):
++    """Retain vision checkpoint names with the actor's FP32 patch projection."""
++
++    def __init__(self, patch_embed: nn.Module) -> None:
++        super().__init__()
++        self.proj = patch_embed.proj
++        self.input_norm = patch_embed.input_norm
++        self.pos_emb = patch_embed.pos_emb
++
++    def forward(self, x, grid_thws, *, pos_embeds=None):
++        x = self.input_norm(x.flatten(1), self.proj.weight.dtype)
++        with torch.autocast(device_type=x.device.type, enabled=False):
++            bias = self.proj.bias.float() if self.proj.bias is not None else None
++            output = F.linear(x.float(), self.proj.weight.flatten(1).float(), bias)
++        output = output.to(self.proj.weight.dtype)
++        return output + pos_embeds if pos_embeds is not None else self.pos_emb(output, grid_thws)
++
++
+ @MULTIMODAL_REGISTRY.register_processor(
+     KimiK3MultiModalProcessor,
+     info=KimiK3ProcessingInfo,
+@@ -1188,6 +1274,11 @@ class AscendKimiK3MultiModalProjector(KimiK25MultiModalProjector):
+ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneration):
+     """Upstream Kimi K3 multimodal wrapper with Ascend text/projector layers."""
+ 
++    # This constructor uses checkpoint-normalized pixels and IdentityInputNorm.
++    # Do not inherit the upstream device-normalization capability: its separate
++    # constructor installs build_mm_input_norm, while this path does not.
++    supports_mm_device_do_normalize = False
++
+     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+         nn.Module.__init__(self)
+         model_config = vllm_config.model_config
+@@ -1202,13 +1293,19 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
+         self.hidden_size = self.config.text_config.hidden_size
+         self.device = current_platform.current_device()
+         vision_quant_config = self._maybe_ignore_quant_config(self.quant_config)
++        training_backend = (vllm_config.additional_config or {}).get("kimi_training_backend")
++        vision_config = copy(self.config.vision_config)
++        if training_backend is not None:
++            vision_config.pos_emb_interpolation_mode = "bicubic"
+ 
+         with self._mark_tower_model(vllm_config, "image"):
+             self.vision_tower = MoonViT3dPretrainedModel(
+-                self.config.vision_config,
++                vision_config,
+                 quant_config=vision_quant_config,
+                 prefix=maybe_prefix(prefix, "vision_tower"),
+             )
++            if training_backend is not None and vision_quant_config is None:
++                self.vision_tower.patch_embed = KimiTrainingPatchEmbed(self.vision_tower.patch_embed)
+             if vision_quant_config is not None:
+                 self.vision_tower = self.vision_tower.to(device=self.device)
+             else:
+@@ -1222,7 +1319,10 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
+                 use_data_parallel=self.use_data_parallel,
+                 quant_config=vision_quant_config,
+                 prefix=maybe_prefix(prefix, "mm_projector"),
+-                enable_rotation=get_rotation_path(vllm_config) is not None,
++                enable_rotation=(
++                    getattr(self.config.vision_config, "use_rot_proj", False)
++                    or get_rotation_path(vllm_config) is not None
++                ),
+                 # vLLM main made `out_hidden_size` a required argument; v0.31.0
+                 # resolves the output size internally from the vision config.
+                 **({} if vllm_version_is("0.31.0") else {"out_hidden_size": self.hidden_size}),
+diff --git a/vllm_ascend/ops/fused_moe/router/kimi_training_router.py b/vllm_ascend/ops/fused_moe/router/kimi_training_router.py
+new file mode 100644
+index 000000000..3c03d4632
+--- /dev/null
++++ b/vllm_ascend/ops/fused_moe/router/kimi_training_router.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Preserve the executed Kimi routing weights for training replay."""
++
++import torch
++from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
++
++
++class KimiTrainingRouter(BaseRouter):
++    """Reuse Ascend selection and capture logical IDs with executed weights."""
++
++    def __init__(self, router: BaseRouter) -> None:
++        super().__init__(router.top_k, router.global_num_experts, router.eplb_state)
++        self.router = router
++
++    @property
++    def routing_method_type(self):
++        return self.router.routing_method_type
++
++    def _compute_routing(self, hidden_states, router_logits, indices_type, *, input_ids=None):
++        return self.router._compute_routing(hidden_states, router_logits, indices_type, input_ids=input_ids)
++
++    def _select_experts(self, hidden_states, router_logits, topk_indices_dtype=None, *, input_ids=None):
++        self._validate_eplb_state()
++        weights, ids = self._compute_routing(hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids)
++        weights = weights.to(torch.bfloat16)
++        if self.capture_fn is not None:
++            self.capture_fn(ids, weights)
++        ids = self._apply_eplb_mapping(ids)
++        return weights, self._convert_indices_dtype(ids, topk_indices_dtype)
+diff --git a/vllm_ascend/ops/kimi_kda.py b/vllm_ascend/ops/kimi_kda.py
+index 752ab2005..62ffc2247 100644
+--- a/vllm_ascend/ops/kimi_kda.py
++++ b/vllm_ascend/ops/kimi_kda.py
+@@ -10,18 +10,21 @@ replaced here with the Ascend metadata builder and AscendC operators.
+ from functools import wraps
+ 
+ import torch
++import torch.nn.functional as F
+ import torch_npu
+ from einops import rearrange
+ from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
+ from torch import nn
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.distributed import tensor_model_parallel_all_reduce
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
++    RowParallelLinear,
+ )
+-from vllm.model_executor.utils import replace_parameter
+ from vllm.models.kimi_k3.nvidia.kda import (
+     KimiK3DeltaAttention,
++    _KimiGDNMergedColumnParallelLinear,
+ )
+ from vllm.v1.attention.backend import AttentionBackend
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+@@ -49,6 +52,45 @@ _F_PROJ_SHARD_ID = 1
+ _KDA_BFG_STREAM: torch.npu.Stream | None = None
+ 
+ 
++class _KimiTrainingInputProjection(_KimiGDNMergedColumnParallelLinear):
++    """Keep packed loading while evaluating the actor's separate projections."""
++
++    def __init__(self, *args, padding_size: int = 0, **kwargs) -> None:
++        self._padding_size = padding_size
++        super().__init__(*args, **kwargs)
++        # Padding has no checkpoint shard. Counting it as loadable leaves every
++        # layer's full TP input shards buffered until the final model flush.
++        self.weight.weight_loader_numel = self.weight.numel() - padding_size * self.weight.shape[1]
++        self._zero_padding(self.weight)
++
++    def _zero_padding(self, param: torch.Tensor) -> None:
++        if self._padding_size:
++            param.data[-self._padding_size :].zero_()
++
++    def weight_loader(self, param, loaded_weight, loaded_shard_id=None) -> None:
++        super().weight_loader(param, loaded_weight, loaded_shard_id)
++        self._zero_padding(param)
++
++    def weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None) -> None:
++        super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
++        self._zero_padding(param)
++
++    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
++        sizes = [size // self.tp_size for size in self.output_sizes]
++        weights = self.weight.split(sizes, dim=0)
++        return torch.cat([F.linear(hidden_states, weight) for weight in weights], dim=-1), None
++
++
++class _KimiTrainingOutputProjection(RowParallelLinear):
++    """Reduce KDA output shards in FP32 before the BF16 output cast."""
++
++    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
++        output = F.linear(hidden_states.float(), self.weight.float())
++        if self.reduce_results and self.tp_size > 1:
++            output = tensor_model_parallel_all_reduce(output)
++        return output.to(hidden_states.dtype), None
++
++
+ def _kda_bfg_stream() -> torch.npu.Stream:
+     global _KDA_BFG_STREAM
+     if _KDA_BFG_STREAM is None:
+@@ -195,6 +237,38 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+         super().__init__(config, vllm_config, prefix)
+         self.uses_mixed_projection = uses_mixed_projection
+         self._ascend_kda_state_copy = None
++        additional_config = vllm_config.additional_config or {}
++        self.training_backend = additional_config.get("kimi_training_backend", "megatron")
++        if self.training_backend not in ("fsdpturbo", "megatron"):
++            raise ValueError("kimi_training_backend must be fsdpturbo or megatron")
++        self.use_training_causal_conv1d = additional_config.get("kimi_training_causal_conv1d", False)
++        if additional_config.get("kimi_training_backend") is not None and quant_config is None:
++            output_sizes = [self.projection_size] * 4 + [self.head_dim, self.num_heads]
++            if self.in_proj_padding:
++                output_sizes.append(self.in_proj_padding * self.tp_size)
++            self.in_proj_qkvgfab = _KimiTrainingInputProjection(
++                self.hidden_size,
++                output_sizes,
++                replicated_shard_id=4,
++                tp_size=self.tp_size,
++                padding_size=self.in_proj_padding,
++                bias=False,
++                quant_config=None,
++                prefix=f"{prefix}.in_proj_qkvgfab",
++            )
++            if self.in_proj_padding:
++                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
++        if additional_config.get("kimi_kda_oproj_fp32_reduce", False):
++            if quant_config is not None:
++                raise ValueError("KDA FP32 output reduction requires unquantized weights")
++            self.o_proj = _KimiTrainingOutputProjection(
++                self.projection_size,
++                self.hidden_size,
++                input_is_parallel=True,
++                bias=False,
++                quant_config=None,
++                prefix=f"{prefix}.o_proj",
++            )
+         if uses_mixed_projection:
+             # vLLM 0.27 packs all KDA input projections into one linear.  A
+             # QuaRot checkpoint instead stores q/k/v as W8A8 and keeps B/F/G
+@@ -229,17 +303,15 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+         # vLLM keeps the checkpoint-compatible FP32 [3C, 1, W] weight, while
+         # fla_npu causal_conv1d consumes an activation-dtype [W, 3C]
+         # tensor. Materialize that kernel layout once after weight loading.
+-        self.register_parameter(
++        self.register_buffer(
+             _PACKED_CONV_WEIGHT_NAME,
+-            nn.Parameter(
+-                torch.empty(
+-                    self.conv_size,
+-                    3 * self.local_projection_size,
+-                    dtype=self.model_config.dtype,
+-                    device=self.conv1d.weight.device,
+-                ),
+-                requires_grad=False,
++            torch.empty(
++                self.conv_size,
++                3 * self.local_projection_size,
++                dtype=self.model_config.dtype,
++                device=self.conv1d.weight.device,
+             ),
++            persistent=False,
+         )
+         original_process_weights = self.conv1d.quant_method.process_weights_after_loading
+ 
+@@ -379,8 +451,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+             bias=None,
+         )
+ 
+-    @staticmethod
+     def _run_causal_conv1d(
++        self,
+         mixed_qkv: torch.Tensor,
+         conv_weights_t: torch.Tensor,
+         conv_state: torch.Tensor,
+@@ -393,6 +465,18 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+         num_accepted_tokens: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         cache_indices = _normalize_causal_cache_indices(cache_indices)
++        if self.use_training_causal_conv1d:
++            if num_accepted_tokens is not None:
++                raise ValueError("Training-identical Kimi convolution does not support speculative decode")
++            return self._run_training_causal_conv1d(
++                mixed_qkv,
++                conv_weights_t,
++                conv_state,
++                query_start_loc,
++                cache_indices,
++                initial_state_mode,
++                run_mode=run_mode,
++            )
+         if run_mode == 0:
+             return causal_conv1d_fn(
+                 mixed_qkv,
+@@ -424,23 +508,75 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+             out=output,
+         )
+ 
++    def _run_training_causal_conv1d(
++        self,
++        mixed_qkv: torch.Tensor,
++        weights: torch.Tensor,
++        conv_state: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        cache_indices: torch.Tensor,
++        initial_state_mode: torch.Tensor | None,
++        *,
++        run_mode: int,
++    ) -> torch.Tensor:
++        """Use the actor convolution and translate only the cache interface."""
++        if self.training_backend == "fsdpturbo":
++            from fsdp_turbo.ops.causal_conv1d import causal_conv1d
++        else:
++            from mindspeed_ops.api.triton.convolution import causal_conv1d
++
++        num_sequences = query_start_loc.numel() - 1
++        history = conv_state.shape[1]
++        if cache_indices.numel() != num_sequences or history != weights.shape[0] - 1:
++            raise ValueError("Training-identical Kimi convolution cache metadata mismatch")
++        valid = (cache_indices != PAD_SLOT_ID) & (cache_indices != 0)
++        safe_indices = torch.where(valid, cache_indices, cache_indices[:1].clamp_min(0))
++        active_state = conv_state[safe_indices].transpose(1, 2).contiguous()
++        if initial_state_mode is not None:
++            initial_state_mode = initial_state_mode.reshape(-1).bool()
++            active_state = torch.where(
++                (initial_state_mode & valid)[:, None, None], active_state, torch.zeros_like(active_state)
++            )
++            use_initial_state = run_mode != 0 or bool(initial_state_mode.any().item())
++        else:
++            use_initial_state = True
++        actor_state = F.pad(active_state, (1, 0))
++        single_token_decode = run_mode != 0 and mixed_qkv.shape[0] == num_sequences
++        cu_seqlens = None if single_token_decode else query_start_loc.to(mixed_qkv.device, dtype=torch.int32)
++        outputs, states = [], []
++        width = mixed_qkv.shape[-1] // 3
++        for part in range(3):
++            begin, end = part * width, (part + 1) * width
++            output, state = causal_conv1d(
++                x=mixed_qkv[:, begin:end].unsqueeze(1 if single_token_decode else 0),
++                weight=weights[:, begin:end].contiguous(),
++                initial_state=actor_state[:, begin:end].contiguous() if use_initial_state else None,
++                activation="silu",
++                cu_seqlens=cu_seqlens,
++                output_final_state=True,
++            )
++            outputs.append(output)
++            states.append(state)
++        updated = torch.cat(states, dim=1)[..., -history:].transpose(1, 2).contiguous().to(conv_state.dtype)
++        # Graph-padding rows alias the first real request and write its same value.
++        updated = torch.where(valid[:, None, None], updated, updated[:1].expand_as(updated))
++        conv_state.index_copy_(0, safe_indices, updated)
++        return torch.cat(outputs, dim=-1).squeeze(1 if single_token_decode else 0)
++
+     @torch.no_grad()
+     def _pack_conv_weights(self) -> None:
+         if self.conv1d.weight.is_meta:
+             return
+-        packed_param = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
++        packed_param = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
+         packed_weight = (
+             self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+             .transpose(0, 1)
+             .to(device=packed_param.device, dtype=packed_param.dtype)
+             .contiguous()
+         )
+-        replace_parameter(
+-            self,
+-            _PACKED_CONV_WEIGHT_NAME,
+-            packed_weight,
+-            prefer_copy=True,
+-        )
++        # This is derived kernel state, not an additional checkpoint weight.
++        # Preserve the buffer captured by decode graphs across every reload.
++        packed_param.copy_(packed_weight)
+ 
+     def _run_recurrent(
+         self,
+@@ -560,7 +696,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
+         )
+ 
+         conv_state, recurrent_state = self.kv_cache
+-        conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
++        conv_weights_t = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
+         spec_masks = attn_metadata.spec_sequence_masks
+         spec_token_indices = attn_metadata.spec_token_indx
+         non_spec_token_indices = attn_metadata.non_spec_token_indx
+-- 
+2.43.0
+
