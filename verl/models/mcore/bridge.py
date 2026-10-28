@@ -14,7 +14,7 @@
 # limitations under the License.
 
 try:
-    from megatron.bridge import AutoBridge
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 except ImportError:
     print("Megatron-Bridge package not found. Please install Megatron-Bridge with `pip install megatron-bridge`")
     raise

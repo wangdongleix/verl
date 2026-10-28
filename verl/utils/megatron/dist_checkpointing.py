@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import megatron.core
 import torch
 from megatron.core import dist_checkpointing, mpu
@@ -26,6 +28,47 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from packaging import version
 
 
+def _preload_tensors_for_sync_save(write_buckets, non_blocking=True):
+    """Stage device tensors while reusing CPU tensors for a synchronous save.
+
+    MegatronAdaptor's async-safe preloader clones every CPU tensor so training
+    cannot mutate optimizer state while a background writer is running.  A
+    synchronous checkpoint blocks the training worker until all writer threads
+    have joined, so that clone is unnecessary and can nearly double host memory
+    when the optimizer itself is CPU-offloaded.
+    """
+    result = []
+    for file_name, storage_key, (bytes_data, tensor_data) in write_buckets:
+        staged_tensors = []
+        for item, tensor in tensor_data:
+            staged = tensor if tensor.is_cpu else tensor.to("cpu", non_blocking=non_blocking)
+            staged_tensors.append((item, staged))
+        result.append((file_name, storage_key, (bytes_data, staged_tensors)))
+    if non_blocking:
+        torch.cuda.synchronize()
+    return result
+
+
+class _MemoryEfficientSyncSaveStrategy(TorchDistSaveShardedStrategy):
+    """Reuse CPU tensors only while executing a synchronous save request."""
+
+    def save(self, sharded_state_dict, checkpoint_dir):
+        request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
+        preload = request.preload_fn
+        if preload is not None:
+            if not isinstance(preload, functools.partial) or not preload.args:
+                raise RuntimeError("Unexpected Megatron checkpoint preload callback")
+            non_blocking = preload.args[1] if len(preload.args) > 1 else True
+            request = request._replace(
+                preload_fn=functools.partial(
+                    _preload_tensors_for_sync_save,
+                    preload.args[0],
+                    non_blocking,
+                )
+            )
+        request.execute_sync()
+
+
 def save_dist_checkpointing(
     sharded_state_dict,
     ckpt_path,
@@ -34,7 +77,7 @@ def save_dist_checkpointing(
 ):
     validate_sharding_integrity = True
     # Get checkpointing strategies
-    save_strategy = TorchDistSaveShardedStrategy(backend="torch_dist", version=1)
+    save_strategy = _MemoryEfficientSyncSaveStrategy()
     save_strategy = FullyParallelSaveStrategyWrapper(
         save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
     )
