@@ -1,0 +1,307 @@
+From d6fead116a93ba7ecbb28677f27836983ebdf7a7 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:41 +0800
+Subject: [data, reward] feat: add CountBenchQA preprocessing and rewards
+
+---
+ .../prepare_countbenchqa_lite_parquet.py      | 78 ++++++++++++++++
+ tests/utils/reward_score/test_countbenchqa.py | 81 ++++++++++++++++
+ verl/utils/reward_score/__init__.py           |  6 +-
+ verl/utils/reward_score/countbenchqa.py       | 92 +++++++++++++++++++
+ 4 files changed, 256 insertions(+), 1 deletion(-)
+ create mode 100644 examples/data_preprocess/prepare_countbenchqa_lite_parquet.py
+ create mode 100644 tests/utils/reward_score/test_countbenchqa.py
+ create mode 100644 verl/utils/reward_score/countbenchqa.py
+
+diff --git a/examples/data_preprocess/prepare_countbenchqa_lite_parquet.py b/examples/data_preprocess/prepare_countbenchqa_lite_parquet.py
+new file mode 100644
+index 0000000..23cdd58
+--- /dev/null
++++ b/examples/data_preprocess/prepare_countbenchqa_lite_parquet.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""Convert a raw CountBenchQA-lite parquet shard to verl RL parquet.
++
++The raw shard contains ``image``, ``text``, ``question`` and ``number``.
++verl's RLHFDataset expects a chat-style ``prompt`` column and multimodal
++images in an ``images`` column, plus the ground-truth answer in
++``reward_model``.
++
++This script deliberately does not copy ``text`` into the output prompt:
++CountBenchQA captions can contain the answer and would leak the label.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++
++import datasets
++
++INSTRUCTION = (
++    " You FIRST think about the reasoning process as an internal monologue and then provide the final answer."
++    " The reasoning process MUST BE enclosed within <think> </think> tags."
++    " The final answer MUST BE put in \\boxed{}."
++)
++
++
++def convert(input_path: str, output_path: str, split: str = "test") -> None:
++    dataset = datasets.load_dataset("parquet", data_files={"data": input_path})["data"]
++    required = {"image", "question", "number"}
++    missing = required.difference(dataset.column_names)
++    if missing:
++        raise ValueError(f"Raw CountBenchQA parquet is missing columns {sorted(missing)}; found {dataset.column_names}")
++
++    def make_example(example: dict, index: int) -> dict:
++        question = str(example["question"])
++        answer = str(example["number"])
++        return {
++            "data_source": "countbenchqa_lite",
++            "prompt": [
++                {
++                    "role": "user",
++                    "content": f"<image>\n{question}{INSTRUCTION}",
++                }
++            ],
++            "images": [example["image"]],
++            "ability": "math",
++            "reward_model": {"style": "rule", "ground_truth": answer},
++            "extra_info": {
++                "split": split,
++                "index": index,
++                "answer": answer,
++                "question": question,
++            },
++        }
++
++    converted = dataset.map(
++        make_example,
++        with_indices=True,
++        remove_columns=dataset.column_names,
++        desc="Converting CountBenchQA-lite to verl format",
++    )
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    converted.to_parquet(output_path)
++
++    print(f"wrote {len(converted)} rows to {output_path}")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--input", required=True, help="raw CountBenchQA parquet shard")
++    parser.add_argument("--output", required=True, help="verl-format parquet output")
++    parser.add_argument("--split", default="test")
++    args = parser.parse_args()
++    convert(args.input, args.output, args.split)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/utils/reward_score/test_countbenchqa.py b/tests/utils/reward_score/test_countbenchqa.py
+new file mode 100644
+index 0000000..f83284d
+--- /dev/null
++++ b/tests/utils/reward_score/test_countbenchqa.py
+@@ -0,0 +1,81 @@
++from verl.utils.reward_score import countbenchqa
++
++
++def _output(think: str, response: str, suffix: str = "") -> str:
++    return f"{think}<|close|> think <|sep|><|open|> response <|sep|>{response}<|close|> response <|sep|>{suffix}"
++
++
++def _result(think: str, response: str, ground_truth: str = "4") -> dict:
++    return countbenchqa.compute_score(_output(think, response), ground_truth)
++
++
++def test_correct_strict_response_gets_full_reward():
++    result = _result("guess 9", "There are four. \\boxed{4}")
++    assert result["score"] == 1.0
++    assert result["predicted"] == "4"
++    assert result["expected"] == "4"
++
++
++def test_correct_relaxed_box_gets_accuracy_without_format_reward():
++    assert _result("", "\\boxed(4)")["score"] == 0.9
++    assert _result("", "\\boxed4")["score"] == 0.9
++
++
++def test_answer_in_think_channel_is_never_rewarded():
++    assert _result("I think \\boxed{4}", "\\boxed{5}")["score"] == 0.1
++    assert countbenchqa.compute_score("I think \\boxed{4}", "4")["score"] == 0.0
++
++
++def test_first_response_is_authoritative_over_trailing_generated_xtml():
++    output = _output("", "\\boxed{5}", suffix="noise <|close|> think <|sep|>\\boxed{4}")
++    assert countbenchqa.compute_score(output, "4")["score"] == 0.1
++
++
++def test_invalid_ground_truth_is_not_rewarded():
++    assert countbenchqa.compute_score(_output("", "\\boxed{4}"), "four")["score"] == 0.0
++
++
++def test_integer_text_is_compared_canonically():
++    result = _result("", "\\boxed{+0004}", ground_truth="0004")
++    assert result["score"] == 1.0
++    assert result["predicted"] == "4"
++    assert result["expected"] == "4"
++
++
++def test_arbitrary_precision_prediction_is_transfer_queue_serializable():
++    from transfer_queue.utils.serial_utils import encode
++
++    huge_integer = "9" * 5000
++    result = _result("", f"\\boxed{{{huge_integer}}}")
++
++    assert result["score"] == 0.1
++    assert result["predicted"] == huge_integer
++    # This is the exact encoder that raised in the 33-step long run.
++    assert list(encode({"extra_fields": {"reward_extra_info": result}}))
++
++
++def test_kimi_stop_conditions_preserve_existing_values():
++    from verl.utils.model_adapters import add_kimi_k3_stop_conditions
++
++    params = {"stop": ["existing"], "stop_token_ids": [7]}
++    add_kimi_k3_stop_conditions(params, "kimi_k3", 163586)
++    assert params == {
++        "stop": ["existing", "<|close|> response <|sep|>"],
++        "stop_token_ids": [7, 163586],
++    }
++
++
++def test_stop_conditions_ignore_other_models():
++    from verl.utils.model_adapters import add_kimi_k3_stop_conditions
++
++    params = {}
++    add_kimi_k3_stop_conditions(params, "qwen3", None)
++    assert params == {}
++
++
++def test_kimi_ignore_eos_does_not_add_implicit_stop_conditions():
++    from verl.utils.model_adapters import add_kimi_k3_stop_conditions
++
++    params = {"ignore_eos": True, "stop": ["explicit"], "stop_token_ids": [7]}
++    add_kimi_k3_stop_conditions(params, "kimi_k3", 163586)
++    assert params == {"ignore_eos": True, "stop": ["explicit"], "stop_token_ids": [7]}
+diff --git a/verl/utils/reward_score/__init__.py b/verl/utils/reward_score/__init__.py
+index 180dc6b..955a958 100644
+--- a/verl/utils/reward_score/__init__.py
++++ b/verl/utils/reward_score/__init__.py
+@@ -86,10 +86,14 @@ def default_compute_score(
+ 
+             # Assuming prime_code doesn't need the URL
+             res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+-    elif data_source in ["hiyouga/geometry3k"]:
++    elif data_source == "hiyouga/geometry3k":
+         from . import geo3k
+ 
+         res = geo3k.compute_score(solution_str, ground_truth)
++    elif data_source == "countbenchqa_lite":
++        from . import countbenchqa
++
++        res = countbenchqa.compute_score(solution_str, ground_truth)
+     elif data_source in [
+         "searchR1_nq",
+         "searchR1_triviaqa",
+diff --git a/verl/utils/reward_score/countbenchqa.py b/verl/utils/reward_score/countbenchqa.py
+new file mode 100644
+index 0000000..949c40f
+--- /dev/null
++++ b/verl/utils/reward_score/countbenchqa.py
+@@ -0,0 +1,92 @@
++"""Reward for CountBenchQA outputs rendered with the Kimi K3 XTML template."""
++
++from __future__ import annotations
++
++import re
++
++_THINK_CLOSE_RE = re.compile(r"<\|close\|>\s*think\s*<\|sep\|>", re.IGNORECASE)
++_RESPONSE_OPEN_RE = re.compile(r"^\s*<\|open\|>\s*response\s*<\|sep\|>", re.IGNORECASE)
++_RESPONSE_END_RE = re.compile(
++    r"<\|close\|>\s*(?:response|message)\s*<\|sep\|>|<\|end_of_msg\|>",
++    re.IGNORECASE,
++)
++_BOXED_INTEGER_RE = re.compile(
++    r"\\boxed\s*(?:\{\s*([+-]?\d+)\s*\}|\(\s*([+-]?\d+)\s*\)|([+-]?\d+))",
++    re.IGNORECASE,
++)
++_INTEGER_RE = re.compile(r"^[+-]?\d+$")
++_STRICT_FINAL_RE = re.compile(r".*\\boxed\s*\{\s*[+-]?\d+\s*\}\s*$", re.DOTALL | re.IGNORECASE)
++
++
++def extract_response(solution_str: str) -> str | None:
++    """Return the first response channel, never an answer from the think channel."""
++    think_close = _THINK_CLOSE_RE.search(solution_str)
++    if think_close is None:
++        return None
++    response = solution_str[think_close.end() :]
++    response = _RESPONSE_OPEN_RE.sub("", response, count=1)
++    response_end = _RESPONSE_END_RE.search(response)
++    if response_end is not None:
++        response = response[: response_end.start()]
++    return response.strip()
++
++
++def _canonicalize_integer_text(value: object) -> str | None:
++    """Return a canonical decimal string without constructing an unbounded int.
++
++    TransferQueue's wire encoder only accepts integers in its 64-bit range.  A
++    model response is untrusted text and can contain an arbitrarily long boxed
++    integer, so converting it to ``int`` before transport can crash an otherwise
++    healthy rollout.  Canonical strings preserve exact equality and auditability
++    without depending on Python's integer-string digit limit or a wire integer
++    width.
++    """
++    text = str(value).strip()
++    if _INTEGER_RE.fullmatch(text) is None:
++        return None
++
++    negative = text.startswith("-")
++    digits = text.lstrip("+-").lstrip("0") or "0"
++    if digits == "0":
++        return "0"
++    return f"-{digits}" if negative else digits
++
++
++def extract_boxed_integer(response: str) -> str | None:
++    """Extract the last boxed integer as a canonical decimal string."""
++    matches = list(_BOXED_INTEGER_RE.finditer(response))
++    if not matches:
++        return None
++    groups = matches[-1].groups()
++    value = next(group for group in groups if group is not None)
++    return _canonicalize_integer_text(value)
++
++
++def compute_score(
++    solution_str: str, ground_truth: str, format_score: float = 0.1
++) -> dict[str, float | str | bool | None]:
++    """Score CountBench and expose auditable components without changing the total."""
++    expected = _canonicalize_integer_text(ground_truth)
++    if expected is None:
++        return {
++            "score": 0.0,
++            "acc": 0.0,
++            "format": 0.0,
++            "predicted": None,
++            "expected": None,
++            "has_response": False,
++        }
++
++    response = extract_response(str(solution_str))
++    predicted = extract_boxed_integer(response) if response is not None else None
++    accuracy = float(predicted == expected)
++    valid_format = float(response is not None and bool(_STRICT_FINAL_RE.fullmatch(response)))
++    score = (1.0 - format_score) * accuracy + format_score * valid_format
++    return {
++        "score": score,
++        "acc": accuracy,
++        "format": valid_format,
++        "predicted": predicted,
++        "expected": expected,
++        "has_response": response is not None,
++    }
+-- 
+2.43.0
+
