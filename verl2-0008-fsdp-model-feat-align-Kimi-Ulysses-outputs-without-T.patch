@@ -1,0 +1,419 @@
+From 22a3939d8a78d63e96636e4b5ca284b511dd4aff Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:41 +0800
+Subject: [fsdp, model] feat: align Kimi Ulysses outputs without TND
+
+---
+ .../zh/model_support/kimi_k3_fsdpturbo_npu.md |  28 +++
+ .../grpo_trainer/run_kimi_k3_fsdpturbo.sh     |   9 +-
+ tests/workers/engine/test_kimi_turbo_cp.py    | 190 ++++++++++++++++++
+ verl/workers/engine/fsdp/fsdp_turbo_impl.py   |  95 ++++++++-
+ verl/workers/engine/fsdp/transformer_impl.py  |   4 +-
+ 5 files changed, 322 insertions(+), 4 deletions(-)
+ create mode 100644 tests/workers/engine/test_kimi_turbo_cp.py
+
+diff --git a/docs/ascend_tutorial/zh/model_support/kimi_k3_fsdpturbo_npu.md b/docs/ascend_tutorial/zh/model_support/kimi_k3_fsdpturbo_npu.md
+index 26f182e..723630c 100644
+--- a/docs/ascend_tutorial/zh/model_support/kimi_k3_fsdpturbo_npu.md
++++ b/docs/ascend_tutorial/zh/model_support/kimi_k3_fsdpturbo_npu.md
+@@ -68,6 +68,34 @@ Kimi 的 `gate_up_proj` 保持输入优先布局并使用 `Shard(2)`，`down_pro
+ 并行度必须同时整除 6144 和 3072，因此支持三机 48 卡、训练 EP=16、eFSDP=3。
+ 训练与推理 EP 不同时，权重同步按专家、行、列区间直接交换分片。
+ 
++### FSDPTurbo Ulysses CP（关闭 TND）
++
++设置 `TURBO_CP_SIZE=2` 或 `4`，启动脚本会同时配置 actor 和 ref 的
++`fsdp_config.turbo_config.distributed.ulysses_parallel_size`、MLA/KDA 通信替换以及
++Kimi 多模态融合后的序列切分。保持 `actor_rollout_ref.model.use_remove_padding=False`，
++不要同时开启 verl 的 `ulysses_sequence_parallel_size`。
++
++单机 16 卡示例：
++
++```bash
++NNODES=1 NPUS_PER_NODE=16 TURBO_EP_SIZE=8 TURBO_CP_SIZE=2 \
++  bash examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh
++```
++
++CP 大小需要整除设备数和 attention/KDA 的 head 数。CP 分组内处理同一批样本，
++数据并行大小为设备数除以 CP 大小；FSDP 仍覆盖全部训练设备。
++本配置保持 rollout routing replay 开启。verl 将完整展开序列的路由 ID、权重和重放 mask
++对齐到图文融合位置，然后使用与模型隐藏状态相同的 CP padding 和切分。
++模型先完成图文融合，再切分展开后的序列。verl 在各分片选择其负责的原始 token 位置，
++只同步 log probability、entropy 和 sum_pi_squared 等逐 token 标量，不聚合完整词表 logits。
++
++CPU 输出和梯度回归测试：
++
++```bash
++torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29458 \
++  tests/workers/engine/test_kimi_turbo_cp.py
++```
++
+ ## 数据和模型准备
+ 
+ 使用已准备好的 Geo3K Parquet 数据：
+diff --git a/examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh b/examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh
+index fb8f86d..d8e8f20 100644
+--- a/examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh
++++ b/examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh
+@@ -29,6 +29,7 @@ esac
+ 
+ turbo_fsdp_size=$((nnodes * npus_per_node))
+ turbo_ep_size=${TURBO_EP_SIZE:-$npus_per_node}
++turbo_cp_size=${TURBO_CP_SIZE:-1}
+ rollout_tp_size=${ROLLOUT_TP:-$rollout_tp_default}
+ mc2_hierarchy_comm=${VLLM_ASCEND_ENABLE_MC2_HIERARCHY_COMM:-$mc2_hierarchy_comm_default}
+ rollout_dp_size=${ROLLOUT_DP:-1}
+@@ -258,7 +259,7 @@ for role in actor ref; do
+         "$prefix.fsdp_config.turbo_config.distributed.fsdp_plan.reduce_dtype=bf16"
+         "$prefix.fsdp_config.turbo_config.distributed.fsdp_plan.fsdp_implementation=native"
+         "$prefix.fsdp_config.turbo_config.distributed.fully_shard_parallel_size=$turbo_fsdp_size"
+-        "$prefix.fsdp_config.turbo_config.distributed.ulysses_parallel_size=1"
++        "$prefix.fsdp_config.turbo_config.distributed.ulysses_parallel_size=$turbo_cp_size"
+         "$prefix.fsdp_config.turbo_config.distributed.expert_parallel_size=$turbo_ep_size"
+         "+$prefix.fsdp_config.turbo_config.distributed.ep_plan.apply_modules=['language_model.model.layers.{*}.block_sparse_moe.experts']"
+         "+$prefix.fsdp_config.turbo_config.distributed.ep_plan.dispatcher=custom_ep_forward_fused"
+@@ -271,6 +272,12 @@ for role in actor ref; do
+         "$prefix.entropy_from_logits_with_chunking=True"
+         "$prefix.use_torch_compile=False"
+     )
++    if ((turbo_cp_size > 1)); then
++        FSDP_CONFIG+=(
++            "+$prefix.fsdp_config.turbo_config.distributed.cp_plan.ulysses_function_patches=[{target_functions:[modeling_kimi_linear.eager_attention_forward],type:full_attention},{target_functions:[modeling_kimi_linear.KimiDeltaAttention.forward],type:kda}]"
++            "+$prefix.fsdp_config.turbo_config.module_patches=[{target:modeling_kimi_k3.KimiK3ForConditionalGeneration.forward,replacement:fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward}]"
++        )
++    fi
+ done
+ FSDP_CONFIG+=(
+     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+diff --git a/tests/workers/engine/test_kimi_turbo_cp.py b/tests/workers/engine/test_kimi_turbo_cp.py
+new file mode 100644
+index 0000000..672bac2
+--- /dev/null
++++ b/tests/workers/engine/test_kimi_turbo_cp.py
+@@ -0,0 +1,190 @@
++"""Compare Turbo CP token outputs and averaged parameter gradients with CP=1."""
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++import torch.distributed as dist
++from tensordict import TensorDict
++
++import verl.utils.tensordict_utils as tu
++from verl.utils.model_adapters import kimi_k3_logits_to_input_indices
++from verl.workers.engine.fsdp.fsdp_turbo_impl import FSDPTurboEngineWithLMHead
++from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
++
++
++def check_case(raw_rows, grids, temperatures, cp_size, *, force_fp32=False, checkpoint_entropy=False):
++    rank = dist.get_rank()
++    torch.manual_seed(42)
++    config = SimpleNamespace(
++        model_type="kimi_k3",
++        media_placeholder_token_id=31,
++        pad_token_id=0,
++        vision_config=SimpleNamespace(merge_type="sd2_tpool", merge_kernel_size=[2, 2]),
++    )
++    ids = torch.nested.as_nested_tensor([torch.tensor(row) for row in raw_rows], layout=torch.jagged)
++    dense_ids = torch.nested.to_padded_tensor(ids, 0)
++    indices = kimi_k3_logits_to_input_indices(dense_ids, {"grid_thws": torch.tensor(grids)}, config)
++    output_indices = indices
++    if indices is None:
++        indices = torch.arange(dense_ids.shape[1]).expand(len(raw_rows), -1)
++    expanded_length = int(indices.max()) + 1
++    padded_length = (expanded_length + cp_size - 1) // cp_size * cp_size
++    hidden = torch.randn(len(raw_rows), padded_length, 7, dtype=torch.float64)
++    weight = torch.randn(7, 32, dtype=torch.float64, requires_grad=True)
++    reference_weight = weight.detach().clone().requires_grad_()
++    chunk = padded_length // cp_size
++    local_logits = hidden[:, rank * chunk : (rank + 1) * chunk] @ weight
++    engine = SimpleNamespace(
++        _is_ulysses_enabled=lambda: True,
++        model_config=SimpleNamespace(hf_config=config),
++        _parallel_state=SimpleNamespace(get_ulysses_rank=lambda: rank),
++        ulysses_parallel_group=dist.group.WORLD,
++        engine_config=SimpleNamespace(entropy_checkpointing=checkpoint_entropy),
++    )
++    data = TensorDict({"input_ids": ids}, batch_size=[len(raw_rows)])
++    tu.assign_non_tensor(data, use_remove_padding=False, calculate_entropy=True, calculate_sum_pi_squared=True)
++    labels = ids.values().roll(-1)
++    args = {
++        "logits_to_input_indices": output_indices,
++        "input_ids_rmpad_rolled": labels,
++        "temperature": torch.tensor(temperatures, dtype=torch.float64),
++        "temperature_is_one": all(value == 1 for value in temperatures),
++    }
++    result = FSDPTurboEngineWithLMHead.prepare_model_outputs(
++        engine, SimpleNamespace(logits=local_logits), args, data, None if force_fp32 else object()
++    )
++    full_logits = hidden @ reference_weight
++    aligned = full_logits[torch.arange(len(raw_rows))[:, None], indices]
++    aligned = aligned / args["temperature"][:, None, None]
++    valid = torch.arange(indices.shape[1])[None, :] < ids.offsets().diff()[:, None]
++    logits = aligned[valid]
++    probs = logits.softmax(-1)
++    expected = {
++        "log_probs": (logits.float() if force_fp32 else logits).log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1),
++        "entropy": -(probs * logits.log_softmax(-1)).sum(-1),
++        "sum_pi_squared": probs.square().sum(-1),
++    }
++    coefficients = torch.linspace(0.1, 1.1, len(labels), dtype=torch.float64)
++    loss, reference_loss = 0, 0
++    tolerance = 1e-6 if force_fp32 else 1e-10
++    for name in expected:
++        torch.testing.assert_close(
++            result[name].values(), expected[name].to(result[name].dtype), atol=tolerance, rtol=tolerance
++        )
++        loss = loss + (result[name].values() * coefficients).sum()
++        reference_loss = reference_loss + (expected[name] * coefficients).sum()
++    loss.backward()
++    reference_loss.backward()
++    # FSDP's parameter-gradient averaging includes the CP replicas.
++    dist.all_reduce(weight.grad)
++    weight.grad /= cp_size
++    torch.testing.assert_close(weight.grad, reference_weight.grad, atol=tolerance * 10, rtol=tolerance * 10)
++    torch.testing.assert_close(
++        weight - 0.01 * weight.grad,
++        reference_weight - 0.01 * reference_weight.grad,
++        atol=tolerance * 10,
++        rtol=tolerance * 10,
++    )
++
++
++def check_replay(raw_rows, grids, cp_size):
++    config = SimpleNamespace(
++        model_type="kimi_k3",
++        media_placeholder_token_id=31,
++        pad_token_id=0,
++        vision_config=SimpleNamespace(merge_type="sd2_tpool", merge_kernel_size=[2, 2]),
++    )
++    raw_width = max(map(len, raw_rows))
++    ids = torch.zeros(len(raw_rows), raw_width, dtype=torch.long)
++    mask = torch.zeros_like(ids, dtype=torch.bool)
++    lengths = []
++    image = iter(grids)
++    for row, tokens in enumerate(raw_rows):
++        ids[row, : len(tokens)] = torch.tensor(tokens)
++        mask[row, : len(tokens)] = True
++        length = len(tokens)
++        for token in tokens:
++            if token == 31:
++                _, height, width = next(image)
++                length += height * width // 4 - 1
++        lengths.append(length)
++    fused_width = max(length + raw_width - len(tokens) for length, tokens in zip(lengths, raw_rows, strict=True))
++    route_width = max(lengths) - 1
++    routes = torch.arange(len(raw_rows) * route_width * 4).reshape(len(raw_rows), route_width, 2, 2)
++    weights = routes.float() / 100
++    replay_mask = torch.arange(route_width)[None, :] < torch.tensor(lengths)[:, None] - 1
++    inputs = dict(
++        input_ids=ids,
++        attention_mask=mask,
++        grid_thws=torch.tensor(grids),
++        routed_experts=routes,
++        routed_expert_weights=weights,
++        router_replay_mask=replay_mask,
++    )
++    args = {"logits_to_input_indices": kimi_k3_logits_to_input_indices(ids, inputs, config)}
++    engine = object.__new__(FSDPTurboEngineWithLMHead)
++    engine._is_ulysses_enabled = lambda: True
++    engine.model_config = SimpleNamespace(hf_config=config)
++    engine.ulysses_parallel_group = dist.group.WORLD
++    padded_width = (fused_width + cp_size - 1) // cp_size * cp_size
++    expected_ids = torch.zeros(len(raw_rows), padded_width, 2, 2, dtype=torch.long)
++    expected_weights = torch.zeros_like(expected_ids, dtype=torch.float32)
++    expected_mask = torch.zeros(len(raw_rows), padded_width, dtype=torch.bool)
++    left_padding = all(len(tokens) == raw_width for tokens in raw_rows) and bool(grids)
++    for row, length in enumerate(lengths):
++        start = fused_width - length if left_padding else 0
++        expected_ids[row, start : start + length - 1] = routes[row, : length - 1]
++        expected_weights[row, start : start + length - 1] = weights[row, : length - 1]
++        expected_mask[row, start : start + length - 1] = True
++    with patch.object(FSDPEngineWithLMHead, "prepare_model_inputs", return_value=(inputs, args)):
++        actual, _ = engine.prepare_model_inputs(None)
++    for key, expected in zip(
++        ("routed_experts", "routed_expert_weights", "router_replay_mask"),
++        (expected_ids, expected_weights, expected_mask),
++        strict=True,
++    ):
++        torch.testing.assert_close(actual[key], expected.chunk(cp_size, dim=1)[dist.get_rank()])
++
++
++def check_attention_padding(cp_size):
++    from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import _full_causal_mask_from_local
++
++    local_length = 5
++    full_length = local_length * cp_size
++    positions = torch.arange(full_length)
++    valid_keys = torch.stack((positions >= 3, positions < full_length - 3))
++    local_keys = valid_keys.chunk(cp_size, dim=-1)[dist.get_rank()]
++    local_causal = torch.ones(local_length, local_length, dtype=torch.bool).tril()
++    local_mask = local_causal[None, None] & local_keys[:, None, None, :]
++    query = torch.zeros(2, 4, local_length, 2)
++    expected = torch.ones(full_length, full_length, dtype=torch.bool).tril()[None, None]
++    expected = expected & valid_keys[:, None, None, :]
++    for mask in (local_mask, torch.zeros_like(local_mask, dtype=torch.float32).masked_fill(~local_mask, -float("inf"))):
++        actual = _full_causal_mask_from_local(mask, query, dist.group.WORLD, seq_dim=2)
++        torch.testing.assert_close(actual == 0, expected)
++
++
++def main():
++    # A torch_npu installation sets the checkpoint default to NPU even for CPU tensors.
++    torch.utils.checkpoint.DefaultDeviceType.set_device_type("cpu")
++    dist.init_process_group("gloo")
++    cp_size = dist.get_world_size()
++    check_attention_padding(cp_size)
++    check_case([[2, 31, 4, 5, 6], [7, 31, 8]], [[1, 4, 6], [1, 4, 4]], [0.8, 1.3], cp_size)
++    check_case([[31, 9]], [[1, 8, 8]], [1.0], cp_size)
++    check_case([[2, 31, 3, 31, 4], [5, 31, 6, 7, 8]], [[1, 4, 4], [1, 4, 6], [1, 4, 4]], [1.0, 1.0], cp_size)
++    check_case([[2, 3, 4], [5]], [], [0.8, 1.0], cp_size, force_fp32=True, checkpoint_entropy=True)
++    check_replay([[2, 31, 4, 5, 6], [7, 31, 8]], [[1, 4, 6], [1, 4, 4]], cp_size)
++    check_replay([[31, 9], [31, 8]], [[1, 8, 8], [1, 4, 4]], cp_size)
++    check_replay([[2, 3, 4], [5]], [], cp_size)
++    if dist.get_rank() == 0:
++        print(
++            f"PASS CP={cp_size}: uneven lengths, multi-image, empty ownership, "
++            "outputs, gradients, SGD update, R3 route alignment"
++        )
++    dist.destroy_process_group()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/verl/workers/engine/fsdp/fsdp_turbo_impl.py b/verl/workers/engine/fsdp/fsdp_turbo_impl.py
+index d1a1df6..e27cf6d 100644
+--- a/verl/workers/engine/fsdp/fsdp_turbo_impl.py
++++ b/verl/workers/engine/fsdp/fsdp_turbo_impl.py
+@@ -18,12 +18,17 @@ import math
+ from contextlib import contextmanager
+ 
+ import torch
++from torch.distributed.nn.functional import all_reduce
+ 
++import verl.utils.tensordict_utils as tu
++import verl.utils.torch_functional as verl_F
+ from verl.utils.device import get_device_id, get_device_name
+ from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
++from verl.utils.model_adapters import kimi_k3_logits_to_input_indices
++from verl.utils.torch_functional import logprobs_from_logits
+ 
+ from ..base import EngineRegistry
+-from .transformer_impl import FSDPEngineWithLMHead
++from .transformer_impl import FSDPEngineWithLMHead, _scale_logits_by_temperature
+ 
+ logger = logging.getLogger(__file__)
+ 
+@@ -154,6 +159,94 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
+             is_collect = True
+         return is_collect
+ 
++    def prepare_model_inputs(self, micro_batch):
++        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
++        if self._is_ulysses_enabled() and "routed_experts" in model_inputs:
++            from fsdp_turbo.distributed.context_parallel.batch import pad_tensor_to_group, split_tensor_to_group
++            from fsdp_turbo.models.kimi.kimi_r3_utils import align_kimi_full_model_routes
++
++            # The CP forward receives routes already aligned to its local fused
++            # rows. Preserve image rows and left padding before slicing all three
++            # replay tensors on exactly the same axis as the hidden states.
++            raw_mask = model_inputs["attention_mask"]
++            raw_lengths = raw_mask.sum(-1)
++            indices = output_args.get("logits_to_input_indices")
++            if indices is None:
++                expanded_mask = raw_mask
++            else:
++                unpadded_indices = kimi_k3_logits_to_input_indices(
++                    model_inputs["input_ids"], model_inputs, self.model_config.hf_config, padding_mask=raw_mask
++                )
++                last_raw = (raw_lengths - 1).unsqueeze(-1)
++                ends = indices.gather(1, last_raw) + 1
++                lengths = unpadded_indices.gather(1, last_raw) + 1
++                positions = torch.arange(int(indices[:, -1].max()) + 1, device=indices.device)[None, :]
++                expanded_mask = (positions >= ends - lengths) & (positions < ends)
++            keys = ("routed_experts", "routed_expert_weights", "router_replay_mask")
++            aligned = align_kimi_full_model_routes(*(model_inputs[key] for key in keys), expanded_mask)
++            for key, value in zip(keys, aligned, strict=True):
++                model_inputs[key] = split_tensor_to_group(
++                    pad_tensor_to_group(value, self.ulysses_parallel_group, dim=1),
++                    self.ulysses_parallel_group,
++                    dim=1,
++                )
++        return model_inputs, output_args
++
++    def prepare_model_outputs(self, output, output_args, micro_batch, logits_processor_func):
++        if (
++            not self._is_ulysses_enabled()
++            or self.model_config.hf_config.model_type != "kimi_k3"
++            or tu.get_non_tensor_data(micro_batch, "use_remove_padding", default=True)
++        ):
++            return super().prepare_model_outputs(output, output_args, micro_batch, logits_processor_func)
++
++        # Turbo shards the image-expanded sequence. Select only raw-token
++        # positions owned by this rank and exchange scalar outputs, not logits.
++        logits = output.logits
++        input_ids = micro_batch["input_ids"]
++        offsets = input_ids.offsets()
++        lengths = offsets.diff()
++        indices = output_args.get("logits_to_input_indices")
++        if indices is None:
++            indices = torch.arange(int(lengths.max()), device=logits.device).expand(len(lengths), -1)
++        valid = torch.arange(indices.shape[1], device=logits.device)[None, :] < lengths[:, None]
++        start = self._parallel_state.get_ulysses_rank() * logits.shape[1]
++        owned = valid & (indices >= start) & (indices < start + logits.shape[1])
++        batch_indices, token_indices = owned.nonzero(as_tuple=True)
++        local_logits = logits[batch_indices, indices[owned] - start]
++        local_logits = _scale_logits_by_temperature(
++            local_logits,
++            output_args["temperature"][batch_indices, None],
++            is_unit_temperature=output_args["temperature_is_one"],
++        )
++        flat_indices = offsets[batch_indices] + token_indices
++        labels = output_args["input_ids_rmpad_rolled"][flat_indices]
++        values = {
++            "log_probs": logprobs_from_logits(
++                logits=local_logits, labels=labels, inplace_backward=False, force_fp32=logits_processor_func is None
++            )
++            if local_logits.shape[0]
++            else local_logits.sum(dim=-1)
++        }
++        if tu.get_non_tensor_data(micro_batch, "calculate_entropy", default=False):
++            if self.engine_config.entropy_checkpointing:
++                values["entropy"] = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, local_logits)
++            else:
++                values["entropy"] = verl_F.entropy_from_logits(local_logits)
++        if tu.get_non_tensor_data(micro_batch, "calculate_sum_pi_squared", default=False):
++            values["sum_pi_squared"] = verl_F.calculate_sum_pi_squared_from_logits(local_logits)
++
++        local_values = torch.stack(list(values.values()), dim=-1)
++        dense_values = local_values.new_zeros((*indices.shape, len(values)))
++        dense_values = dense_values.index_put((batch_indices, token_indices), local_values)
++        # Backward sums the replicated loss gradients across CP; FSDP averages
++        # them with the other model replicas, matching the CP=1 normalization.
++        dense_values = all_reduce(dense_values, group=self.ulysses_parallel_group)
++        return {
++            name: torch.nested.nested_tensor_from_jagged(dense_values[..., column][valid], offsets)
++            for column, name in enumerate(values)
++        }
++
+     @contextmanager
+     def _gradient_sync_context(self, *, is_last_micro_batch: bool):
+         # FSDP-Turbo owns gradient synchronization at its collective boundary.
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 51102f0..82b094a 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -1648,8 +1648,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
+         if logits_to_input_indices is not None:
+             if use_fused_kernels:
+                 raise NotImplementedError("Kimi K3 image-expanded logits are not supported by fused log-prob kernels")
+-            if self.use_ulysses_sp:
+-                raise NotImplementedError("Kimi K3 image-expanded logit alignment is not implemented with Ulysses SP")
++            if self.use_ulysses_sp and use_remove_padding:
++                raise NotImplementedError("Kimi K3 packed image-expanded logits are not supported with Ulysses SP")
+             output_args["logits_to_input_indices"] = logits_to_input_indices
+ 
+         return model_inputs, output_args
+-- 
+2.43.0
+
