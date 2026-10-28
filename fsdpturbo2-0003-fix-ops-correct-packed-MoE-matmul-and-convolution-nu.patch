@@ -1,0 +1,210 @@
+From 25fc9d69a9c5febe3de82e52f08dc9e7572cdb74 Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: fix(ops): correct packed MoE matmul and convolution numerics
+
+---
+ fsdp_turbo/modules/short_conv.py              |  6 +-
+ fsdp_turbo/ops/cpu/permute.py                 |  2 +-
+ fsdp_turbo/ops/npu/grouped_matmul.py          | 10 +--
+ .../unit_tests/ops/test_npu_grouped_matmul.py | 88 +++++++++++++++++++
+ tests/unit_tests/ops/test_npu_permute.py      | 17 ++++
+ 5 files changed, 112 insertions(+), 11 deletions(-)
+ create mode 100644 tests/unit_tests/ops/test_npu_grouped_matmul.py
+
+diff --git a/fsdp_turbo/modules/short_conv.py b/fsdp_turbo/modules/short_conv.py
+index a41b0a0..d4df19b 100644
+--- a/fsdp_turbo/modules/short_conv.py
++++ b/fsdp_turbo/modules/short_conv.py
+@@ -180,10 +180,12 @@ class ShortConvolution(nn.Conv1d):
+                 f"weight channels ({weight.shape[0]}) must be a multiple of channels_per_head ({channels_per_head})."
+             )
+         local_head_num = weight.shape[0] // channels_per_head
++        conv_weight = rearrange(weight, "d 1 w -> w d").to(dtype=x.dtype)
++        conv_bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+         return causal_conv1d(
+             x=x,
+-            weight=rearrange(weight, "d 1 w -> w d"),
+-            bias=self.bias,
++            weight=conv_weight,
++            bias=conv_bias,
+             residual=residual,
+             initial_state=cache,
+             output_final_state=output_final_state,
+diff --git a/fsdp_turbo/ops/cpu/permute.py b/fsdp_turbo/ops/cpu/permute.py
+index 025a971..e69c38c 100644
+--- a/fsdp_turbo/ops/cpu/permute.py
++++ b/fsdp_turbo/ops/cpu/permute.py
+@@ -63,4 +63,4 @@ def unpermute_cpu(
+         return unpermuted_tokens
+     unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
+     unpermuted_tokens *= probs.unsqueeze(-1)
+-    return unpermuted_tokens.sum(dim=1)
++    return unpermuted_tokens.sum(dim=1).to(permuted_tokens.dtype)
+diff --git a/fsdp_turbo/ops/npu/grouped_matmul.py b/fsdp_turbo/ops/npu/grouped_matmul.py
+index 5ad9ae2..318b713 100644
+--- a/fsdp_turbo/ops/npu/grouped_matmul.py
++++ b/fsdp_turbo/ops/npu/grouped_matmul.py
+@@ -18,16 +18,13 @@ class GroupedMatmul(torch.autograd.Function):
+ 
+         ctx.group_list_type = group_list_type
+ 
+-        # Get weight chunks
+-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+-
+         # Weights follow the linear-layer convention [output_dim, input_dim] per expert.
+         # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
+         # Always transpose rather than guessing from shape, since shape-based detection is
+         # unreliable when input_dim == output_dim (square weight matrices).
+         # With one x/weight/y, split-M selects the packed-weight API:
+         # its sole weight must keep the expert axis [1, K, N].
+-        weights_for_matmul = [weights.transpose(1, 2)] if weights.shape[0] == 1 else [w.T for w in weight_chunks]
++        weights_for_matmul = [weights.transpose(1, 2).contiguous()]
+ 
+         ctx.save_for_backward(input_tensor, weights)
+ 
+@@ -48,14 +45,11 @@ class GroupedMatmul(torch.autograd.Function):
+         inp, weights = ctx.saved_tensors
+         group_list_type = ctx.group_list_type
+ 
+-        # Get weight chunks (original [output_dim, input_dim] format)
+-        weight_chunks = [weights] if weights.shape[0] == 1 else [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+-
+         # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
+         # Forward used transposed weights, so the original weights are used directly here.
+         grad = torch_npu.npu_grouped_matmul(
+             [grad_output],
+-            weight_chunks,
++            [weights.contiguous()],
+             bias=None,
+             group_list=group_list,
+             split_item=2,
+diff --git a/tests/unit_tests/ops/test_npu_grouped_matmul.py b/tests/unit_tests/ops/test_npu_grouped_matmul.py
+new file mode 100644
+index 0000000..5f51db3
+--- /dev/null
++++ b/tests/unit_tests/ops/test_npu_grouped_matmul.py
+@@ -0,0 +1,88 @@
++import importlib.util
++import itertools
++from pathlib import Path
++from typing import ClassVar
++
++import torch
++
++_MODULE_PATH = Path(__file__).parents[3] / "fsdp_turbo" / "ops" / "npu" / "grouped_matmul.py"
++_SPEC = importlib.util.spec_from_file_location("test_npu_grouped_matmul_impl", _MODULE_PATH)
++assert _SPEC is not None and _SPEC.loader is not None
++npu_grouped_matmul = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(npu_grouped_matmul)
++
++
++class _FakeTorchNPU:
++    calls: ClassVar[list] = []
++
++    @classmethod
++    def npu_grouped_matmul(
++        cls,
++        inputs,
++        weights,
++        *,
++        bias,
++        group_list,
++        split_item,
++        group_type,
++        group_list_type,
++    ):
++        cls.calls.append((inputs, weights, split_item, group_type, group_list_type))
++        assert bias is None
++        assert len(inputs) == 1
++        assert len(weights) == 1
++
++        sizes = group_list.tolist()
++        offsets = [0]
++        for size in sizes:
++            offsets.append(offsets[-1] + size)
++
++        if split_item == 2:
++            packed_weight = weights[0]
++            assert packed_weight.ndim == 3
++            output = [
++                inputs[0][start:end] @ packed_weight[expert_id]
++                for expert_id, (start, end) in enumerate(itertools.pairwise(offsets))
++            ]
++            return [torch.cat(output)]
++
++        assert split_item == 3
++        assert group_type == 2
++        input_transposed = inputs[0]
++        grad_output = weights[0]
++        output = [
++            input_transposed[:, start:end] @ grad_output[start:end]
++            for start, end in itertools.pairwise(offsets)
++        ]
++        return [torch.stack(output)]
++
++
++def test_grouped_matmul_uses_packed_3d_weight_and_preserves_gradients(monkeypatch):
++    monkeypatch.setattr(npu_grouped_matmul, "torch_npu", _FakeTorchNPU)
++    _FakeTorchNPU.calls.clear()
++
++    inputs = torch.randn(5, 3, dtype=torch.float64, requires_grad=True)
++    weights = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
++    group_sizes = torch.tensor([2, 3], dtype=torch.int64)
++
++    output = npu_grouped_matmul.GroupedMatmul.apply(inputs, weights, None, group_sizes, 1)
++    output.square().sum().backward()
++
++    reference_inputs = inputs.detach().clone().requires_grad_()
++    reference_weights = weights.detach().clone().requires_grad_()
++    reference_output = torch.cat(
++        (
++            reference_inputs[:2] @ reference_weights[0].T,
++            reference_inputs[2:] @ reference_weights[1].T,
++        )
++    )
++    reference_output.square().sum().backward()
++
++    torch.testing.assert_close(output, reference_output)
++    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
++    torch.testing.assert_close(weights.grad, reference_weights.grad)
++
++    forward_weight = _FakeTorchNPU.calls[0][1][0]
++    input_grad_weight = _FakeTorchNPU.calls[1][1][0]
++    assert forward_weight.shape == (2, 3, 4)
++    assert input_grad_weight.shape == (2, 4, 3)
+diff --git a/tests/unit_tests/ops/test_npu_permute.py b/tests/unit_tests/ops/test_npu_permute.py
+index 994dd0d..b37502a 100644
+--- a/tests/unit_tests/ops/test_npu_permute.py
++++ b/tests/unit_tests/ops/test_npu_permute.py
+@@ -2,6 +2,7 @@ import importlib.util
+ from pathlib import Path
+ 
+ import torch
++import pytest
+ 
+ 
+ _MODULE_PATH = Path(__file__).parents[3] / "fsdp_turbo" / "ops" / "npu" / "permute.py"
+@@ -27,3 +28,19 @@ def test_unpermute_npu_preserves_activation_dtype(monkeypatch):
+     output = npu_permute.unpermute_npu(activations, sorted_indices, router_probs)
+ 
+     assert output.dtype == activations.dtype
++
++
++@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires NPU autocast")
++@pytest.mark.parametrize("weighted", [False, True])
++def test_eager_unpermute_preserves_dtype_under_npu_autocast(weighted):
++    from fsdp_turbo.ops.cpu.permute import unpermute_cpu
++
++    x = torch.arange(16, device="npu", dtype=torch.bfloat16).reshape(4, 4).requires_grad_()
++    probs = torch.full((2, 2), 0.5, device="npu") if weighted else None
++    with torch.autocast("npu", dtype=torch.bfloat16):
++        output = unpermute_cpu(x, torch.arange(4, device="npu"), probs)
++    assert output.dtype == x.dtype
++    expected = x.reshape(2, 2, 4).float().mean(1).to(x.dtype) if weighted else x
++    torch.testing.assert_close(output, expected)
++    output.float().sum().backward()
++    torch.testing.assert_close(x.grad, torch.full_like(x, 0.5 if weighted else 1.0))
+-- 
+2.43.0
+
