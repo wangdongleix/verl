@@ -1,0 +1,197 @@
+From b3dc6bbe9fc13ef057aac465b060329c3d9346eb Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: [BugFix] Defer Kimi projection processing until reload completes
+
+---
+ .../worker/test_patch_layerwise_reload.py     | 95 +++++++++++++++++++
+ vllm_ascend/patch/worker/__init__.py          |  1 +
+ .../patch/worker/patch_layerwise_reload.py    | 62 ++++++++++++
+ 3 files changed, 158 insertions(+)
+ create mode 100644 tests/ut/patch/worker/test_patch_layerwise_reload.py
+ create mode 100644 vllm_ascend/patch/worker/patch_layerwise_reload.py
+
+diff --git a/tests/ut/patch/worker/test_patch_layerwise_reload.py b/tests/ut/patch/worker/test_patch_layerwise_reload.py
+new file mode 100644
+index 000000000..f9e62f2c5
+--- /dev/null
++++ b/tests/ut/patch/worker/test_patch_layerwise_reload.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++from functools import partial
++
++import pytest
++import torch
++from torch import nn
++from vllm.model_executor.model_loader.reload import layerwise
++
++import vllm_ascend.patch.worker.patch_layerwise_reload  # noqa: F401
++
++
++def test_partial_loaders_reuse_caller_owned_weights_and_keep_kernel_storage():
++    layer = nn.Linear(3, 2)
++
++    def load(param, loaded_weight):
++        param.data.copy_(loaded_weight)
++
++    layer.weight.weight_loader = partial(load)
++    layer.bias.weight_loader = partial(load)
++    layerwise.record_metadata_for_reloading(layer)
++    pointer = layer.weight.data_ptr()
++    buffer = torch.empty(6)
++    for version in (0, 1):
++        expected_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3) + version * 10
++        expected_bias = torch.tensor([3.0, 5.0]) + version
++        layerwise.initialize_layerwise_reload(layer)
++        buffer.copy_(expected_weight.flatten())
++        # Verl owns the IPC view once, before calling the upstream loader.
++        owned_weight = buffer.view(2, 3).clone()
++        layer.weight.weight_loader(layer.weight, owned_weight)
++        _, bound_args = layerwise.get_layerwise_info(layer).loaded_weights[-1]
++        assert bound_args.arguments["loaded_weight"].data_ptr() == owned_weight.data_ptr()
++        buffer.fill_(-999)
++        layer.bias.weight_loader(layer.bias, expected_bias)
++        torch.testing.assert_close(layer.weight, expected_weight, rtol=0, atol=0)
++        torch.testing.assert_close(layer.bias, expected_bias, rtol=0, atol=0)
++        assert layer.weight.data_ptr() == pointer
++
++
++@pytest.mark.parametrize("buffer_name", ["log2phy", "moe_load", "load_counter", "expert_ids_per_ep_rank"])
++@pytest.mark.parametrize("persistent", [True, False])
++def test_runtime_routing_buffers_do_not_delay_reload_or_lose_live_state(buffer_name, persistent):
++    layer = nn.Linear(3, 2, bias=False)
++    runtime_state = torch.arange(16, dtype=torch.int64)
++    layer.register_buffer(buffer_name, runtime_state, persistent=persistent)
++    layerwise.record_metadata_for_reloading(layer)
++    weight_pointer = layer.weight.data_ptr()
++    for version in (1, 2):
++        # Routing state may change after the initial metadata snapshot.
++        runtime_state.add_(version)
++        expected_state = runtime_state.clone()
++        layerwise.initialize_layerwise_reload(layer)
++        assert getattr(layer, buffer_name) is runtime_state
++        expected_weight = torch.full((2, 3), float(version))
++        layer.weight.weight_loader(layer.weight, expected_weight)
++        info = layerwise.get_layerwise_info(layer)
++        assert not info.can_load()
++        assert not info.loaded_weights
++        assert layer.weight.data_ptr() == weight_pointer
++        assert getattr(layer, buffer_name) is runtime_state
++        assert (buffer_name not in layer._non_persistent_buffers_set) == persistent
++        torch.testing.assert_close(layer.weight, expected_weight, rtol=0, atol=0)
++        torch.testing.assert_close(runtime_state, expected_state, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("parent_first", [True, False])
++def test_kda_derived_conv_reload_preserves_new_values_and_kernel_storage(parent_first):
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++
++    from vllm_ascend.ops.kimi_kda import _PACKED_CONV_WEIGHT_NAME, AscendKimiK3DeltaAttention
++
++    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
++    nn.Module.__init__(attention)
++    attention.conv1d = nn.Module()
++    attention.conv1d.weight = nn.Parameter(torch.zeros(6, 1, 4), requires_grad=False)
++    attention.register_buffer(_PACKED_CONV_WEIGHT_NAME, torch.zeros(4, 6), persistent=False)
++    attention.A_log = nn.Parameter(torch.zeros(2), requires_grad=False)
++    attention.conv1d.quant_method = UnquantizedLinearMethod()
++    attention.conv1d.quant_method.process_weights_after_loading = lambda layer: attention._pack_conv_weights()
++    layerwise.record_metadata_for_reloading(attention)
++    pointer = attention.get_buffer(_PACKED_CONV_WEIGHT_NAME).data_ptr()
++    for version in (1, 2):
++        layerwise.initialize_layerwise_reload(attention)
++        source = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4) + version
++        expected = source[:, 0, :].T.clone()
++        if parent_first:
++            attention.A_log.weight_loader(attention.A_log, torch.full((2,), float(version)))
++        attention.conv1d.weight.weight_loader(attention.conv1d.weight, source)
++        source.fill_(-999)
++        if not parent_first:
++            attention.A_log.weight_loader(attention.A_log, torch.full((2,), float(version)))
++        layerwise.finalize_layerwise_reload(attention, None)
++        packed = attention.get_buffer(_PACKED_CONV_WEIGHT_NAME)
++        torch.testing.assert_close(packed, expected, rtol=0, atol=0)
++        assert packed.data_ptr() == pointer
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index c54e34a78..b50fef0f1 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -56,6 +56,7 @@ import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
+ import vllm_ascend.patch.worker.patch_v2.patch_use_v2_model_runner  # noqa
+ 
+ import vllm_ascend.patch.worker.patch_fused_moe  # noqa
++import vllm_ascend.patch.worker.patch_layerwise_reload  # noqa
+ 
+ import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
+ import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
+diff --git a/vllm_ascend/patch/worker/patch_layerwise_reload.py b/vllm_ascend/patch/worker/patch_layerwise_reload.py
+new file mode 100644
+index 000000000..1b8592794
+--- /dev/null
++++ b/vllm_ascend/patch/worker/patch_layerwise_reload.py
+@@ -0,0 +1,62 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Adapt upstream layerwise reload for Ascend loaders and runtime tensors."""
++
++from collections.abc import Callable
++
++import torch
++from vllm.model_executor.model_loader.reload import layerwise as layerwise_reload
++from vllm.model_executor.model_loader.reload import meta as reload_meta
++
++# Ascend routing/communication state is restored by level-2 wake-up, never
++# supplied by a checkpoint. Match upstream's handling of its expert maps:
++# exclude these tensors from both reload accounting and meta materialization.
++# KDA packed convolution weights are derived by the child convolution loader;
++# preserve their live kernel storage so that parent finalization cannot restore
++# stale values over the freshly packed weights.
++_ASCEND_NON_CHECKPOINT_TENSORS = {
++    "log2phy",
++    "moe_load",
++    "load_counter",
++    "expert_ids_per_ep_rank",
++    "ascend_conv1d_weight",
++}
++reload_meta.SKIP_LOAD_TENSORS.update(_ASCEND_NON_CHECKPOINT_TENSORS)
++reload_meta.SKIP_TENSORS.update(_ASCEND_NON_CHECKPOINT_TENSORS)
++
++
++def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
++    """Wrap partial and other callable loaders without assuming __name__."""
++    for name, tensor in layerwise_reload.get_layer_tensors(layer).items():
++        if name in layerwise_reload.SKIP_LOAD_TENSORS:
++            continue
++        loader = layerwise_reload._get_weight_loader(tensor)
++        if getattr(loader, "__name__", None) != "online_process_loader":
++            tensor.weight_loader = layerwise_reload.make_online_process_loader(layer, name)
++
++
++def _get_original_loader(tensor: torch.Tensor) -> Callable:
++    """Remove layerwise wrappers from an arbitrary callable loader."""
++    loader = layerwise_reload._get_weight_loader(tensor)
++    while getattr(loader, "__name__", None) == "online_process_loader":
++        loader = loader.__wrapped__
++    return loader
++
++
++layerwise_reload._wrap_parameters_weight_loader = _wrap_parameters_weight_loader
++layerwise_reload._get_original_loader = _get_original_loader
+-- 
+2.43.0
+
