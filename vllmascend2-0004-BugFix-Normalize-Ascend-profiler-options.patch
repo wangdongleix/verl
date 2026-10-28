@@ -1,0 +1,85 @@
+From 2883d3793a7039158e4ec6c157910f1dfc32a1ff Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:06:42 +0800
+Subject: [BugFix] Normalize Ascend profiler options
+
+---
+ tests/ut/profiler/test_torch_npu_profiler.py | 8 ++++++--
+ vllm_ascend/profiler/torch_npu_profiler.py   | 9 ++++-----
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/tests/ut/profiler/test_torch_npu_profiler.py b/tests/ut/profiler/test_torch_npu_profiler.py
+index ff8fbcd11..a0fefa632 100644
+--- a/tests/ut/profiler/test_torch_npu_profiler.py
++++ b/tests/ut/profiler/test_torch_npu_profiler.py
+@@ -67,9 +67,11 @@ class TestTorchNPUProfilerWrapper(TestBase):
+             torch_profiler_dir="/path/to/traces",
+             torch_profiler_with_stack=True,
+             torch_profiler_with_memory=True,
++            torch_profiler_record_shapes=True,
+         )
+ 
+         mock_export_type.Text = "Text"
++        mock_export_type.Db = "Db"
+         mock_profiler_level.Level1 = "Level1"
+         mock_aic_metrics.PipeUtilization = "PipeUtilization"
+         mock_profiler_activity.CPU = "CPU"
+@@ -88,12 +90,12 @@ class TestTorchNPUProfilerWrapper(TestBase):
+         mock_experimental_config.assert_called_once()
+         config_kwargs = mock_experimental_config.call_args.kwargs
+         expected_config = {
+-            "export_type": "Text",
++            "export_type": ["Db", "Text"],
+             "profiler_level": "Level1",
+             "msprof_tx": False,
+             "aic_metrics": "PipeUtilization",
+             "l2_cache": False,
+-            "op_attr": False,
++            "op_attr": True,
+             "data_simplification": True,
+             "record_op_args": False,
+             "gc_detect_threshold": None,
+@@ -110,6 +112,8 @@ class TestTorchNPUProfilerWrapper(TestBase):
+         profile_kwargs = mock_profile.call_args.kwargs
+         self.assertEqual(profile_kwargs["activities"], ["CPU", "NPU"])
+         self.assertTrue(profile_kwargs["profile_memory"])
++        self.assertTrue(profile_kwargs["with_stack"])
++        self.assertTrue(profile_kwargs["record_shapes"])
+         self.assertEqual(profile_kwargs["with_modules"], True)
+         self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
+         self.assertEqual(result, mock_profiler_instance)
+diff --git a/vllm_ascend/profiler/torch_npu_profiler.py b/vllm_ascend/profiler/torch_npu_profiler.py
+index 2f5c09c68..1ea5a8763 100644
+--- a/vllm_ascend/profiler/torch_npu_profiler.py
++++ b/vllm_ascend/profiler/torch_npu_profiler.py
+@@ -48,12 +48,12 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
+             )
+ 
+         experimental_config = torch_npu.profiler._ExperimentalConfig(
+-            export_type=torch_npu.profiler.ExportType.Text,
++            export_type=[torch_npu.profiler.ExportType.Db, torch_npu.profiler.ExportType.Text],
+             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+             msprof_tx=False,
+             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+             l2_cache=False,
+-            op_attr=False,
++            op_attr=True,
+             data_simplification=True,
+             record_op_args=False,
+             gc_detect_threshold=None,
+@@ -64,10 +64,9 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
+                 torch_npu.profiler.ProfilerActivity.CPU,
+                 torch_npu.profiler.ProfilerActivity.NPU,
+             ],
+-            with_stack=False,
++            with_stack=profiler_config.torch_profiler_with_stack,
++            record_shapes=profiler_config.torch_profiler_record_shapes,
+             profile_memory=profiler_config.torch_profiler_with_memory,
+-            # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
+-            # The with_stack option in torch_npu.profiler introduces significant time overhead.
+             with_modules=profiler_config.torch_profiler_with_stack,
+             experimental_config=experimental_config,
+             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+-- 
+2.43.0
+
