@@ -1,0 +1,181 @@
+From 18015771ec01bd2e16864fdcdd6ffba5716e1cbb Mon Sep 17 00:00:00 2001
+From: Kimi integration <kimi-integration@local>
+Date: Wed, 28 Oct 2026 11:40:51 +0800
+Subject: fix(cp): preserve KDA kernel binding and global padding
+
+---
+ docs/zh/features/context_parallel.md          |  8 +++
+ .../ulysses/ulysses_attention.py              | 11 +++-
+ fsdp_turbo/modules/kda.py                     | 20 ++----
+ .../test_kda_context_parallel.py              | 62 ++++++++++++++++++-
+ 4 files changed, 85 insertions(+), 16 deletions(-)
+
+diff --git a/docs/zh/features/context_parallel.md b/docs/zh/features/context_parallel.md
+index f7c9481..84b867c 100644
+--- a/docs/zh/features/context_parallel.md
++++ b/docs/zh/features/context_parallel.md
+@@ -60,3 +60,11 @@ CP将序列切分到多个rank，每个rank只持有部分序列片段。为保
+ - **与Chunk Loss互斥**：开启Ulysses CP后不能同时设置`enable_chunk_loss`，模型会直接报错，详见[分块损失计算](./chunk_loss.md)。
+ - **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，该组合无显式报错守护、行为未定义，详见[微批次切分](./chunk_batch.md)。
+ - **典型长序列配置**：对于32k+ 长序列训练，建议`ulysses_parallel_size=2~4`，配合重计算与FSDP2使用。
++
++### Kimi KDA 与 FSDP 包装
++
++Ulysses KDA forward 在安装时从原始 forward 所属模块绑定 `chunk_kda`。
++FSDP 后续生成包装类时不再改变算子查找来源，可用于 verl 的非 TND CP + R3 训练。
++
++Ulysses 从各分片的 causal mask 收集有效 key 位置，重建全局 causal mask 时保留左右 padding，
++避免不同图像展开长度的样本对 padding key 产生注意力。
+diff --git a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
+index d541d36..732084b 100644
+--- a/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
++++ b/fsdp_turbo/distributed/context_parallel/ulysses/ulysses_attention.py
+@@ -27,7 +27,16 @@ def _full_causal_mask_from_local(attention_mask: torch.Tensor | None, query, gro
+         device=query.device,
+         dtype=query.dtype,
+     )
+-    return mask.masked_fill(~causal.view(1, 1, full_seq_len, full_seq_len), torch.finfo(query.dtype).min)
++    allowed = causal.view(1, 1, full_seq_len, full_seq_len)
++    if attention_mask is not None:
++        # The last local causal row exposes every non-padding local key.
++        local_keys = attention_mask[:, :, -1, :]
++        if local_keys.dtype != torch.bool:
++            local_keys = local_keys == 0
++        key_masks = [torch.empty_like(local_keys) for _ in range(dist.get_world_size(group))]
++        dist.all_gather(key_masks, local_keys.contiguous(), group=group)
++        allowed = allowed & torch.cat(key_masks, dim=-1).unsqueeze(-2)
++    return mask.masked_fill(~allowed, torch.finfo(query.dtype).min)
+ 
+ 
+ def ulysses_context_parallel_attention(
+diff --git a/fsdp_turbo/modules/kda.py b/fsdp_turbo/modules/kda.py
+index 9c7b36b..fa19c8d 100644
+--- a/fsdp_turbo/modules/kda.py
++++ b/fsdp_turbo/modules/kda.py
+@@ -1,8 +1,9 @@
+ # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+ """Ulysses context parallelism for Kimi Delta Attention (KDA)."""
+ 
+-from functools import wraps
+ import importlib
++from collections.abc import Callable
++from functools import wraps
+ 
+ import torch
+ import torch.distributed as dist
+@@ -64,18 +65,9 @@ def _sliced_short_convolution(conv, projected, rank):
+     return output
+ 
+ 
+-def _get_chunk_kda(module):
+-    modeling_module = importlib.import_module(type(module).__module__)
+-    chunk_kda = getattr(modeling_module, "chunk_kda", None)
+-    if not callable(chunk_kda):
+-        raise RuntimeError(
+-            f"KDA module {type(module).__module__}.{type(module).__name__} does not expose its chunk_kda kernel."
+-        )
+-    return chunk_kda
+-
+-
+-def get_ulysses_kda_forward(original_forward, group):
+-    """Build a KimiDeltaAttention forward using sequence/head all-to-all."""
++def get_ulysses_kda_forward(original_forward: Callable, group: dist.ProcessGroup) -> Callable:
++    """Bind the original KDA kernel before FSDP wraps the module class."""
++    chunk_kda = importlib.import_module(original_forward.__module__).chunk_kda
+ 
+     @wraps(original_forward)
+     def forward(
+@@ -134,7 +126,7 @@ def get_ulysses_kda_forward(original_forward, group):
+         a_log = module.A_log[head_start:head_end]
+         dt_bias = module.dt_bias.view(module.num_heads, module.head_dim)[head_start:head_end].reshape(-1)
+ 
+-        output, _ = _get_chunk_kda(module)(
++        output, _ = chunk_kda(
+             q=query,
+             k=key,
+             v=value,
+diff --git a/tests/unit_tests/distributed/context_parallel/test_kda_context_parallel.py b/tests/unit_tests/distributed/context_parallel/test_kda_context_parallel.py
+index 9853ace..647285a 100644
+--- a/tests/unit_tests/distributed/context_parallel/test_kda_context_parallel.py
++++ b/tests/unit_tests/distributed/context_parallel/test_kda_context_parallel.py
+@@ -1,9 +1,11 @@
+ import unittest
++from types import SimpleNamespace
++from unittest import mock
+ 
+ import torch
+ import torch.nn.functional as F
+ 
+-from fsdp_turbo.modules.kda import _sliced_short_convolution
++from fsdp_turbo.modules.kda import _sliced_short_convolution, get_ulysses_kda_forward
+ 
+ 
+ class _ShortConv(torch.nn.Conv1d):
+@@ -43,6 +45,64 @@ class _ShortConv(torch.nn.Conv1d):
+ 
+ 
+ class KDAUlyssesTests(unittest.TestCase):
++    def test_kernel_binding_survives_fsdp_class_replacement(self):
++        def original_forward(module, hidden_states, **kwargs):
++            raise AssertionError("CP must execute the distributed forward")
++
++        wrapped_class = type(
++            "FSDPKimiDeltaAttention",
++            (torch.nn.Module,),
++            {
++                "__module__": "torch.distributed.fsdp._fully_shard._fully_shard",
++            },
++        )
++        module = wrapped_class()
++        module.num_heads = 2
++        module.head_dim = module.head_k_dim = 2
++        module.use_full_rank_gate = True
++        module.gate_lower_bound = None
++        module.config = SimpleNamespace(skip_kda_recompute=False)
++        module.A_log = torch.nn.Parameter(torch.zeros(2))
++        module.dt_bias = torch.nn.Parameter(torch.zeros(4))
++        for name in (
++            "q_proj",
++            "k_proj",
++            "v_proj",
++            "f_a_proj",
++            "f_b_proj",
++            "g_proj",
++            "o_proj",
++        ):
++            setattr(module, name, torch.nn.Linear(4, 4, bias=False))
++        module.b_proj = torch.nn.Linear(4, 2, bias=False)
++        module.q_conv1d = module.k_conv1d = module.v_conv1d = torch.nn.Identity()
++        module.o_norm = lambda output, gate: output
++        hidden = torch.randn(1, 3, 4, requires_grad=True)
++        kernel = mock.Mock(side_effect=lambda **kwargs: (kwargs["v"], None))
++        with (
++            mock.patch(__name__ + ".chunk_kda", kernel, create=True),
++            mock.patch("torch.distributed.get_world_size", return_value=2),
++            mock.patch("torch.distributed.get_rank", return_value=0),
++            mock.patch(
++                "fsdp_turbo.modules.kda._sequence_to_local_channels",
++                side_effect=lambda tensor, group: tensor[..., : tensor.size(-1) // 2],
++            ),
++            mock.patch(
++                "fsdp_turbo.modules.kda._local_channels_to_sequence",
++                side_effect=lambda tensor, group: tensor.repeat(1, 1, 2),
++            ),
++            mock.patch(
++                "fsdp_turbo.modules.kda._sliced_short_convolution",
++                side_effect=lambda conv, projected, rank: projected,
++            ),
++        ):
++            forward = get_ulysses_kda_forward(original_forward, object())
++            output = forward(module, hidden)
++            output.sum().backward()
++        kernel.assert_called_once()
++        self.assertEqual(output.shape, hidden.shape)
++        self.assertIsNotNone(module.v_proj.weight.grad)
++
+     def test_sliced_short_convolution_matches_full_channel_slice(self):
+         torch.manual_seed(7)
+         conv = _ShortConv(channels=4, kernel_size=3)
+-- 
+2.43.0
+
