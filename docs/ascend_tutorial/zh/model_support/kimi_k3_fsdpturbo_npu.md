@@ -68,6 +68,34 @@ Kimi 的 `gate_up_proj` 保持输入优先布局并使用 `Shard(2)`，`down_pro
 并行度必须同时整除 6144 和 3072，因此支持三机 48 卡、训练 EP=16、eFSDP=3。
 训练与推理 EP 不同时，权重同步按专家、行、列区间直接交换分片。
 
+### FSDPTurbo Ulysses CP（关闭 TND）
+
+设置 `TURBO_CP_SIZE=2` 或 `4`，启动脚本会同时配置 actor 和 ref 的
+`fsdp_config.turbo_config.distributed.ulysses_parallel_size`、MLA/KDA 通信替换以及
+Kimi 多模态融合后的序列切分。保持 `actor_rollout_ref.model.use_remove_padding=False`，
+不要同时开启 verl 的 `ulysses_sequence_parallel_size`。
+
+单机 16 卡示例：
+
+```bash
+NNODES=1 NPUS_PER_NODE=16 TURBO_EP_SIZE=8 TURBO_CP_SIZE=2 \
+  bash examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh
+```
+
+CP 大小需要整除设备数和 attention/KDA 的 head 数。CP 分组内处理同一批样本，
+数据并行大小为设备数除以 CP 大小；FSDP 仍覆盖全部训练设备。
+本配置保持 rollout routing replay 开启。verl 将完整展开序列的路由 ID、权重和重放 mask
+对齐到图文融合位置，然后使用与模型隐藏状态相同的 CP padding 和切分。
+模型先完成图文融合，再切分展开后的序列。verl 在各分片选择其负责的原始 token 位置，
+只同步 log probability、entropy 和 sum_pi_squared 等逐 token 标量，不聚合完整词表 logits。
+
+CPU 输出和梯度回归测试：
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29458 \
+  tests/workers/engine/test_kimi_turbo_cp.py
+```
+
 ## 数据和模型准备
 
 使用已准备好的 Geo3K Parquet 数据：
