@@ -406,7 +406,12 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
                 if self.should_save_model:
-                    model_state_dict = self.model.state_dict()
+                    # Model-specific packed experts can export a different ABI for
+                    # inference. Training resume must retain their native shards.
+                    checkpoint_state_dict = self.model.state_dict
+                    if fsdp_version(self.model) != 1:
+                        checkpoint_state_dict = getattr(self.model, "sharded_checkpoint_state_dict", checkpoint_state_dict)
+                    model_state_dict = checkpoint_state_dict()
                     if self.should_save_lora_only and self._has_lora():
                         n_total = len(model_state_dict)
                         model_state_dict = {
