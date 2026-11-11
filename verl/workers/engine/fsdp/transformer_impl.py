@@ -80,7 +80,7 @@ from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, pad_packed_inputs, postprocess_batch_func, prepare_micro_batches
-from .kimi_packed_weights import export_kimi_packed_local_param
+from .kimi_packed_weights import export_kimi_packed_local_param, stream_kimi_packed_param
 from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
@@ -1125,6 +1125,8 @@ class FSDPEngine(BaseEngine):
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         kimi_rollout_layout = kwargs.pop("rollout_layout", None)
+        weight_sync_mode = kwargs.pop("weight_sync_mode", "naive")
+        stream_kimi_experts = kwargs.pop("stream_kimi_experts", False)
         kimi_model = self.model_config.hf_config.model_type == "kimi_k3"
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
@@ -1194,7 +1196,15 @@ class FSDPEngine(BaseEngine):
 
             def iter_rollout_params():
                 for name, param in params.items():
-                    if _is_kimi_packed_expert_param(name, param):
+                    if (
+                        kimi_model
+                        and _is_kimi_packed_expert_param(name, param)
+                        and weight_sync_mode == "nccl"
+                        and stream_kimi_experts
+                        and not self._qat_enabled
+                    ):
+                        yield from stream_kimi_packed_param(name, param, device)
+                    elif _is_kimi_packed_expert_param(name, param) and weight_sync_mode == "naive":
                         marked_name, local_param = export_kimi_packed_local_param(
                             name, param, device, kimi_rollout_layout
                         )

@@ -90,7 +90,7 @@ class DetachActorWorker(ActorRolloutRefWorker):
             )
 
             self._strategy_handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
-        elif strategy in ["fsdp2", "veomni"]:
+        elif strategy in ["fsdp2", "veomni", "fsdp_turbo"]:
             from verl.utils.fsdp_utils import (
                 fsdp2_sharded_load_from_cpu,
                 fsdp2_sharded_save_to_cpu,
@@ -151,7 +151,7 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if n in self.cpu_saved_models:
             strategy = self.config.actor.strategy
 
-            if strategy in ["fsdp2", "veomni"]:
+            if strategy in ["fsdp2", "veomni", "fsdp_turbo"]:
                 cpu_sharded_state, global_spec = self.cpu_saved_models[n]
                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
             else:

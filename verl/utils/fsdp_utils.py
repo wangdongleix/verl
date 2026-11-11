@@ -1155,10 +1155,10 @@ def fsdp2_sharded_save_to_cpu(
     Returns:
         cpu_sharded_state: Dictionary of CPU shards for the current process.
                           Key = parameter name, Value = (CPU shard tensor, original DTensorSpec)
-        global_spec: DTensorSpec of the first parameter (used to verify global rules during loading)
+        global_spec: Reference DTensorSpec of the first parameter for mesh validation during loading
     """
     cpu_sharded_state = {}
-    global_spec = None  # Record global sharding rules (all parameters follow the same spec)
+    global_spec = None  # Keep a reference spec; individual parameters may use different layouts.
 
     for param_name, param in model.named_parameters():
         # Only process sharded parameters of DTensor type (core parameters of FSDP2)
@@ -1168,7 +1168,7 @@ def fsdp2_sharded_save_to_cpu(
             cpu_sharded_state[param_name] = (cpu_tensor, None)
             continue
 
-        # Record global sharding rules (take spec of the first DTensor to ensure consistency)
+        # Keep the first DTensor spec as a reference; save each parameter's own spec below.
         if global_spec is None:
             global_spec = param._spec
             assert hasattr(global_spec, "device_mesh"), "DTensorSpec must contain 'device_mesh' attribute"
@@ -1198,7 +1198,7 @@ def fsdp2_sharded_load_from_cpu(
         model: FSDP2 model to be restored (must have the same structure as when saved)
         cpu_sharded_state: Shard data read from CPU memory by the current process
                           (from fsdp2_sharded_save_to_cpu)
-        target_spec: Global DTensorSpec from saving (used to verify sharding rule consistency)
+        target_spec: Reference spec of the first saved parameter; other layouts are checked per parameter
     """
     # Verify device_mesh consistency (core: ensure loaded shards map to original GPUs)
     current_device_mesh = None
@@ -1221,10 +1221,13 @@ def fsdp2_sharded_load_from_cpu(
 
         # Handle different parameter types: DTensor sharded parameters vs. regular parameters
         if isinstance(param, DTensor):
-            # 1. Verify sharding rule consistency (placements must match original Spec)
+            # 1. Match this parameter against its own saved layout (e.g., FSDP versus EP/eFSDP).
             assert saved_spec is not None, f"DTensorSpec missing in saved state for parameter {param_name}"
-            assert saved_spec.placements == target_spec.placements, (
-                f"Sharding strategy mismatch for parameter {param_name} (conflicts with global rules)!"
+            assert saved_spec.device_mesh == param._spec.device_mesh, (
+                f"Device mesh mismatch for parameter {param_name}"
+            )
+            assert saved_spec.placements == param._spec.placements, (
+                f"Sharding strategy mismatch for parameter {param_name}"
             )
 
             # 2. Move CPU shard data to the current GPU (device of param._local_tensor)
