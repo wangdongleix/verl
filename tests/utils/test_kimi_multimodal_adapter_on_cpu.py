@@ -10,14 +10,14 @@ from PIL import Image
 from verl.utils.model_adapters import get_vllm_adapter
 
 
-def test_kimi_images_use_typed_vision_chunks():
+def test_kimi_images_use_vllm_image_modality():
     image = Image.new("RGB", (14, 14))
     wrapped = {"type": "image", "image": image}
     adapter = get_vllm_adapter("kimi_k3")
     payload = adapter.build_vllm_multimodal_data([image, wrapped])
-    assert set(payload) == {"vision_chunk"}
-    assert payload["vision_chunk"] == [wrapped, wrapped]
-    assert payload["vision_chunk"][1] is wrapped
+    assert set(payload) == {"image"}
+    assert payload["image"] == [image, image]
+    assert payload["image"][1] is image
     assert adapter.build_vllm_multimodal_data() == {}
     with pytest.raises(ValueError, match="only supports image"):
         adapter.build_vllm_multimodal_data(video_data=[object()])
@@ -33,5 +33,5 @@ def test_kimi_prompt_normalization_matches_vllm_image_replacement_target():
     )
     assert adapter.prepare_vllm_prompt_ids([1, 2], tokenizer, [object()]) == [101, 102]
     tokenizer.encode.assert_called_once_with(
-        "before <|media_begin|>image<|media_content|><|media_pad|><|media_end|> after"
+        "before <|kimi_image_placeholder|> after", add_special_tokens=False
     )

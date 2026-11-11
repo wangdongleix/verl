@@ -39,7 +39,7 @@ class KimiK3Adapter(ProcessorAdapter):
     _MEDIA_PROMPT_PATTERN = re.compile(
         r"<\|media_begin\|>image \d+x\d+<\|media_content\|><\|media_pad\|><\|media_end\|>"
     )
-    _VLLM_MEDIA_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+    _VLLM_MEDIA_PROMPT = "<|kimi_image_placeholder|>"
 
     @staticmethod
     def _validate_media(video_data, audio_data):
@@ -73,7 +73,7 @@ class KimiK3Adapter(ProcessorAdapter):
             return prompt_ids
         from verl.utils.tokenizer import normalize_token_ids
 
-        return normalize_token_ids(tokenizer.encode(vllm_prompt))
+        return normalize_token_ids(tokenizer.encode(vllm_prompt, add_special_tokens=False))
 
     @classmethod
     def build_vllm_multimodal_data(cls, image_data=None, video_data=None, audio_data=None) -> dict:
@@ -81,8 +81,8 @@ class KimiK3Adapter(ProcessorAdapter):
         if image_data is None:
             return {}
         return {
-            "vision_chunk": [
-                image if isinstance(image, dict) and image.get("type") == "image" else {"type": "image", "image": image}
+            "image": [
+                image["image"] if isinstance(image, dict) and image.get("type") == "image" else image
                 for image in image_data
             ]
         }
