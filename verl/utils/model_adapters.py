@@ -39,7 +39,7 @@ class KimiK3Adapter(ProcessorAdapter):
     _MEDIA_PROMPT_PATTERN = re.compile(
         r"<\|media_begin\|>image \d+x\d+<\|media_content\|><\|media_pad\|><\|media_end\|>"
     )
-    _VLLM_MEDIA_PROMPT = "<|kimi_image_placeholder|>"
+    _VLLM_MEDIA_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
 
     @staticmethod
     def _validate_media(video_data, audio_data):
@@ -74,24 +74,6 @@ class KimiK3Adapter(ProcessorAdapter):
         from verl.utils.tokenizer import normalize_token_ids
 
         return normalize_token_ids(tokenizer.encode(vllm_prompt, add_special_tokens=False))
-
-    @classmethod
-    def build_vllm_multimodal_data(cls, image_data=None, video_data=None, audio_data=None) -> dict:
-        cls._validate_media(video_data, audio_data)
-        if image_data is None:
-            return {}
-        return {
-            "image": [
-                image["image"] if isinstance(image, dict) and image.get("type") == "image" else image
-                for image in image_data
-            ]
-        }
-
-
-class KimiK3VisionChunkAdapter(KimiK3Adapter):
-    """Match the Kimi K3 processor registered by the Ascend merge-backend branch."""
-
-    _VLLM_MEDIA_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
 
     @classmethod
     def build_vllm_multimodal_data(cls, image_data=None, video_data=None, audio_data=None) -> dict:
@@ -212,13 +194,7 @@ def adapt_processor(processor):
     return processor if adapter_cls is None else adapter_cls(processor)
 
 
-def get_vllm_adapter(model_type, *, supported_mm_limits=None):
-    if model_type == "kimi_k3" and supported_mm_limits is not None:
-        if "image" in supported_mm_limits:
-            return KimiK3Adapter
-        if "vision_chunk" in supported_mm_limits:
-            return KimiK3VisionChunkAdapter
-        raise ValueError(f"Unsupported Kimi K3 rollout modalities: {list(supported_mm_limits)}")
+def get_vllm_adapter(model_type):
     return _VLLM_ADAPTERS.get(model_type)
 
 
