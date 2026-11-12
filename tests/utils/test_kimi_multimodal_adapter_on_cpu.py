@@ -33,6 +33,5 @@ def test_kimi_prompt_normalization_matches_vllm_image_replacement_target():
     )
     assert adapter.prepare_vllm_prompt_ids([1, 2], tokenizer, [object()]) == [101, 102]
     tokenizer.encode.assert_called_once_with(
-        "before <|media_begin|>image<|media_content|><|media_pad|><|media_end|> after",
-        add_special_tokens=False,
+        "before <|media_begin|>image<|media_content|><|media_pad|><|media_end|> after"
     )

@@ -73,7 +73,7 @@ class KimiK3Adapter(ProcessorAdapter):
             return prompt_ids
         from verl.utils.tokenizer import normalize_token_ids
 
-        return normalize_token_ids(tokenizer.encode(vllm_prompt, add_special_tokens=False))
+        return normalize_token_ids(tokenizer.encode(vllm_prompt))
 
     @classmethod
     def build_vllm_multimodal_data(cls, image_data=None, video_data=None, audio_data=None) -> dict:
