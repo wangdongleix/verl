@@ -88,6 +88,24 @@ class KimiK3Adapter(ProcessorAdapter):
         }
 
 
+class KimiK3VisionChunkAdapter(KimiK3Adapter):
+    """Match the Kimi K3 processor registered by the Ascend merge-backend branch."""
+
+    _VLLM_MEDIA_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+
+    @classmethod
+    def build_vllm_multimodal_data(cls, image_data=None, video_data=None, audio_data=None) -> dict:
+        cls._validate_media(video_data, audio_data)
+        if image_data is None:
+            return {}
+        return {
+            "vision_chunk": [
+                image if isinstance(image, dict) and image.get("type") == "image" else {"type": "image", "image": image}
+                for image in image_data
+            ]
+        }
+
+
 def kimi_k3_logits_to_input_indices(
     input_ids: torch.Tensor,
     multi_modal_inputs: dict,
@@ -194,7 +212,13 @@ def adapt_processor(processor):
     return processor if adapter_cls is None else adapter_cls(processor)
 
 
-def get_vllm_adapter(model_type):
+def get_vllm_adapter(model_type, *, supported_mm_limits=None):
+    if model_type == "kimi_k3" and supported_mm_limits is not None:
+        if "image" in supported_mm_limits:
+            return KimiK3Adapter
+        if "vision_chunk" in supported_mm_limits:
+            return KimiK3VisionChunkAdapter
+        raise ValueError(f"Unsupported Kimi K3 rollout modalities: {list(supported_mm_limits)}")
     return _VLLM_ADAPTERS.get(model_type)
 
 

@@ -529,6 +529,16 @@ class vLLMHttpServer:
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
+        if self._vllm_adapter is not None:
+            # Select the wire format from the processor actually registered by
+            # vLLM and its platform plugin, not from a package version number.
+            mm_limits = engine_client.renderer.get_mm_processor().info.get_supported_mm_limits()
+            self._vllm_adapter = get_vllm_adapter(
+                getattr(self.model_config.hf_config, "model_type", None),
+                supported_mm_limits=mm_limits,
+            )
+            logger.info("Kimi K3 rollout multimodal interface: %s", list(mm_limits))
+
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
         # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
