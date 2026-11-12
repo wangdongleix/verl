@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from enum import Enum
 
 import ray
@@ -47,6 +48,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     2. Partial rollout is enabled.
     """
 
+    # Default for instances that bypass __init__ (e.g. test stubs): hybrid
+    # replicas are enabled unless actor_rollout_ref.hybrid_engine=False.
+    _enable_hybrid_replicas = True
+
     def __init__(self, config: DictConfig):
         train_batch_size = config.data.train_batch_size
         ppo_mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -70,10 +75,23 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 "Use standalone mode (reward.reward_model.enable_resource_pool=True) instead."
             )
 
+        # actor_rollout_ref.hybrid_engine=False disables the colocated (hybrid)
+        # rollout replicas on the training GPUs: rollout is then served
+        # exclusively by the standalone rollout pool (v0 fully-async semantics).
+        # Read by PPOTrainer._setup() (triggered by init()).
+        self._enable_hybrid_replicas = bool(config.actor_rollout_ref.get("hybrid_engine", True))
+
         super().__init__(config)
+
         self.hybrid_rollout_config: HybridRolloutSwitchConfig = omega_conf_to_dataclass(
             self.config.trainer.v1.separate_async.hybrid_rollout
         )
+        if not self._enable_hybrid_replicas and self.hybrid_rollout_config.enable_switch:
+            logger.warning(
+                "trainer.v1.separate_async.hybrid_rollout.enable_switch is ignored because "
+                "actor_rollout_ref.hybrid_engine=False; disabling hybrid switching"
+            )
+            self.hybrid_rollout_config = replace(self.hybrid_rollout_config, enable_switch=False)
         if self.hybrid_rollout_config.enable_switch:
             # No support for PD disaggregation for switching
             rollout_cfg = self.config.get("actor_rollout_ref", {}).get("rollout", {})
@@ -97,8 +115,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         super()._init_resource_pool_mgr()
         # Replace ActorRolloutRefWorker with DetachActorWorker to get CPU save/restore
         # capability needed for Decoupled PPO when parameter_sync_step > 1.
-        # The base class adds exactly one of ActorRolloutRef or ActorRollout to the mapping.
-        if Role.ActorRolloutRef in self.role_worker_mapping:
+        # The base class uses a pure Actor role when hybrid replicas are disabled.
+        if Role.Actor in self.role_worker_mapping:
+            self.role_worker_mapping[Role.Actor] = ray.remote(DetachActorWorker)
+            if Role.RefPolicy in self.role_worker_mapping:
+                self.role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
+        elif Role.ActorRolloutRef in self.role_worker_mapping:
             self.role_worker_mapping[Role.ActorRolloutRef] = ray.remote(DetachActorWorker)
         elif Role.ActorRollout in self.role_worker_mapping:
             self.role_worker_mapping[Role.ActorRollout] = ray.remote(DetachActorWorker)
@@ -148,8 +170,18 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         )
 
         # hybrid engine is in rollout mode after initialization
-        self.current_mode = HybridEngineMode.ROLLOUT
-        self.add_replicas_to_balancer()
+        if self._enable_hybrid_replicas:
+            self.current_mode = HybridEngineMode.ROLLOUT
+            self.add_replicas_to_balancer()
+        else:
+            # No colocated replicas exist on the training GPUs (hybrid_engine=False):
+            # rollout is served exclusively by the standalone pool, so never enter
+            # ROLLOUT mode; the mode-switch hooks and balancer updates become no-ops.
+            self.current_mode = HybridEngineMode.TRAINER
+            logger.info(
+                "[V1SepAsync] hybrid replicas disabled (actor_rollout_ref.hybrid_engine=False): "
+                f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only"
+            )
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Version-aware old_log_probs computation for Decoupled PPO.
@@ -191,7 +223,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     def on_init_end(self):
         # update weights after loading checkpoint
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
-        self.checkpoint_manager.update_weights(self.global_steps)
+        if self._enable_hybrid_replicas:
+            self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
         self._add_async_warmup_batches(self.config.trainer.v1.separate_async.num_warmup_batches)
@@ -289,11 +322,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self._to_trainer_costs
         )
 
-    def on_step_end(self):
-        # _stop_profiling() already moved this step's flag to prev_step_profile.
-        if self.prev_step_profile:
-            self._stop_rollout_profiling()
+    def _stop_profiling(self) -> None:
+        # The base fit loop calls this before on_step_end(), but separate_async
+        # synchronizes weights in that hook. Keep both pools tracing until then.
+        self._profile_stop_pending = True
 
+    def on_step_end(self):
         config = self.hybrid_rollout_config
         should_switch = False
         prepare_seconds = 0.0
@@ -358,6 +392,18 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                     self.switch_to_rollout(already_registered=True)
                 self._to_rollout_costs.append(prepare_seconds + time.perf_counter() - switch_start)
 
+        if getattr(self, "_profile_stop_pending", False):
+            profiler = self.config.global_profiler
+            stop_rollout = self.curr_step_profile and (
+                not profiler.profile_continuous_steps or self.global_steps + 1 not in (profiler.steps or [])
+            )
+            if stop_rollout:
+                self._stop_rollout_profiling()
+            # Stop rollout first so its traces are flushed before the training
+            # workers' finish hooks can collect the complete profiling output.
+            super()._stop_profiling()
+            self._profile_stop_pending = False
+
     def _get_n_gpus_for_throughput(self) -> int:
         """Include standalone rollout GPUs in the throughput denominator."""
         trainer_gpus = self.resource_pool_manager.get_n_gpus()
@@ -368,6 +414,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def switch_to_rollout(self, *, already_registered: bool = False):
         """Install committed weights and make Hybrid replicas available for generation."""
+        if not self._enable_hybrid_replicas:
+            return
         self.checkpoint_manager.update_weights(self.global_steps)
         self.checkpoint_manager.resume_generation_replicas()
         if not already_registered:
@@ -376,12 +424,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def switch_to_trainer(self):
         """Stop routing to Hybrid, abort partial requests, and return its GPU memory to training."""
+        if not self._enable_hybrid_replicas:
+            return
         self.remove_replicas_from_balancer()
         self.checkpoint_manager.abort_replicas()
         self.checkpoint_manager.sleep_replicas()
         self.current_mode = HybridEngineMode.TRAINER
 
     def add_replicas_to_balancer(self):
+        if not self._enable_hybrid_replicas:
+            return
         global_load_balancer = self.standalone_server_manager.global_load_balancer
         servers = dict(
             zip(self.llm_server_manager.server_addresses, self.llm_server_manager.server_handles, strict=True)
@@ -389,6 +441,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         ray.get(global_load_balancer.add_servers.remote(servers))
 
     def remove_replicas_from_balancer(self):
+        if not self._enable_hybrid_replicas:
+            return
         global_load_balancer = self.standalone_server_manager.global_load_balancer
         ray.get(global_load_balancer.remove_servers.remote(self.llm_server_manager.server_addresses))
 
