@@ -8,8 +8,76 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from verl.utils.kimi_expert_stream import expert_tile_name
+
 KIMI_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
 _RESHARD_BUFFER_BYTES = 64 * 1024 * 1024
+
+
+@lru_cache(maxsize=32)
+def _source_shards(shape, mesh_shape, ranks, shard_dims):
+    """Choose one owner of each disjoint physical shard, excluding replicas."""
+    owners = {}
+    for rank, coordinate in zip(ranks, product(*(range(size) for size in mesh_shape)), strict=True):
+        sizes, offsets = list(shape), [0, 0, 0]
+        for dim, size, index in zip(shard_dims, mesh_shape, coordinate, strict=True):
+            if dim >= 0:
+                chunk = (sizes[dim] + size - 1) // size
+                offset = min(index * chunk, sizes[dim])
+                offsets[dim] += offset
+                sizes[dim] = min(chunk, sizes[dim] - offset)
+        if all(sizes):
+            owners.setdefault((*offsets, *sizes), rank)
+    return tuple((*bounds, owner) for bounds, owner in sorted(owners.items()))
+
+
+def stream_kimi_packed_param(name, param, device, max_tile_bytes=_RESHARD_BUFFER_BYTES):
+    """Export all experts through bounded actor-group broadcasts.
+
+    Every actor walks the same collective sequence. The checkpoint engine's
+    rank 0 forwards the tiles; other actors consume them as before. CPU-offloaded
+    shards are staged a tile at a time, without DTensor.to()/full_tensor().
+    """
+    if not isinstance(param, DTensor) or param.ndim != 3:
+        raise TypeError(f"Kimi expert streaming requires a 3-D DTensor: {name}")
+    if max_tile_bytes < param.element_size():
+        raise ValueError("Kimi expert tile budget is smaller than one element")
+    mesh = param.device_mesh
+    ranks = tuple(mesh.mesh.flatten().tolist())
+    if sorted(ranks) != list(range(dist.get_world_size())):
+        raise ValueError("Kimi expert streaming requires the full actor mesh")
+    if any(not isinstance(p, (Shard, Replicate)) for p in param.placements):
+        raise ValueError("Kimi expert streaming requires Shard/Replicate placements")
+    dims = tuple(p.dim if isinstance(p, Shard) else -1 for p in param.placements)
+    if any(dim not in (-1, 0, 1, 2) for dim in dims):
+        raise ValueError("Invalid Kimi expert sharding dimension")
+    shards = _source_shards(tuple(param.shape), tuple(mesh.shape), ranks, dims)
+    local = param.to_local().detach()
+    rank = dist.get_rank()
+    elements = max_tile_bytes // param.element_size()
+    for expert in range(param.shape[0]):
+        for expert_start, row_start, column_start, count, rows, columns, source in shards:
+            if not expert_start <= expert < expert_start + count:
+                continue
+            tile_columns = min(columns, elements)
+            tile_rows = max(1, elements // tile_columns)
+            for row in range(0, rows, tile_rows):
+                height = min(tile_rows, rows - row)
+                for column in range(0, columns, tile_columns):
+                    width = min(tile_columns, columns - column)
+                    tile = torch.empty((height, width), dtype=param.dtype, device=device)
+                    if rank == source:
+                        tile.copy_(local[expert - expert_start, row : row + height, column : column + width])
+                    dist.broadcast(tile, src=source)
+                    yield expert_tile_name(
+                        name,
+                        expert,
+                        param.shape[1],
+                        param.shape[2],
+                        row_start + row,
+                        column_start + column,
+                        num_experts=param.shape[0],
+                    ), tile
 
 
 @lru_cache(maxsize=32)

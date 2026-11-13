@@ -28,6 +28,7 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
+from verl.utils.kimi_expert_stream import EXPERT_MARKER
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.rocm_vllm_moe_expert_map import restore_moe_expert_maps
@@ -43,7 +44,9 @@ from verl.utils.vllm.vllm_unquant_utils import fold_unquantized_moe_params, stag
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 from verl.workers.rollout.vllm_rollout.weight_update_utils import (
     apply_buffer_updates,
+    capture_expert_ownership,
     drop_tied_alias_updates,
+    localize_streamed_experts,
     split_buffer_updates,
 )
 
@@ -264,6 +267,10 @@ class vLLMColocateWorkerExtension:
             for model in self._iter_all_models():
                 restore_moe_expert_maps(model)
 
+        self._kimi_expert_ownership = {
+            id(model): capture_expert_ownership(model) for model in self._iter_all_models()
+        }
+
         if peft_config and base_sync_done:
             # Remove the old LoRA before the new one arrives (applied after is_last below).
             self.remove_lora(VLLM_LORA_INT_ID)
@@ -375,6 +382,14 @@ class vLLMColocateWorkerExtension:
             apply_buffer_updates(model, buffer_updates)
         return loaded
 
+    def _localize_streamed_experts(self, model, weights):
+        if not any(EXPERT_MARKER in name for name, _ in weights):
+            return weights
+        ownership = getattr(self, "_kimi_expert_ownership", {}).get(id(model))
+        if ownership is None:
+            ownership = capture_expert_ownership(model)
+        return list(localize_streamed_experts(weights, ownership))
+
     def _update_weights(
         self,
         weights: list[tuple[str, torch.Tensor]],
@@ -382,6 +397,8 @@ class vLLMColocateWorkerExtension:
         base_sync_done: bool,
         layerwise_reload: bool = False,
     ):
+        if not layerwise_reload:
+            weights = self._localize_streamed_experts(self.model_runner.model, weights)
         if peft_config and base_sync_done:
             # The caller already copied these out of the receiver's reused IPC bucket buffer (#6454).
             weights = dict(weights)
@@ -398,7 +415,8 @@ class vLLMColocateWorkerExtension:
             # Layerwise loaders may retain inputs until a later bucket completes
             # the layer. Own each tensor before the IPC receiver reuses its storage.
             for model in self._iter_all_models():
-                model.load_weights((name, tensor.clone()) for name, tensor in weights)
+                local_weights = self._localize_streamed_experts(model, weights)
+                model.load_weights((name, tensor.clone()) for name, tensor in local_weights)
         else:
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
             # Add the FP8 related logic here as sharding manager has been deprecated.

@@ -126,6 +126,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.pyhccl = None
+        self._dist_listen_socket = None
         self.device = torch.npu.current_device()
 
         # start zeromq server for broadcasting bucket tensor metadata
@@ -133,9 +134,13 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.topic = "bucket_metadata"
         if self.is_master:
             self._start_zmq_server()
-            self.dist_port, _ = get_free_port(self.ip)
+            self.dist_port, self._dist_listen_socket = get_free_port(self.ip, with_alive_sock=True)
+            self._dist_listen_socket.listen()
 
     def prepare(self) -> MasterMetadata:
+        if self.is_master and self.pyhccl is None and self._dist_listen_socket is None:
+            self.dist_port, self._dist_listen_socket = get_free_port(self.ip, with_alive_sock=True)
+            self._dist_listen_socket.listen()
         self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
         self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="npu")
 
@@ -214,8 +219,15 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         if self.rebuild_group or self.pyhccl is None:
             self.pyhccl = stateless_init_process_group(
-                master_metadata.dist_ip, master_metadata.dist_port, rank, world_size, self.device
+                master_metadata.dist_ip,
+                master_metadata.dist_port,
+                rank,
+                world_size,
+                self.device,
+                listen_socket=self._dist_listen_socket,
             )
+            # TCPStore now owns the reserved descriptor.
+            self._dist_listen_socket = None
             self.rank = rank
             self.world_size = world_size
         else:

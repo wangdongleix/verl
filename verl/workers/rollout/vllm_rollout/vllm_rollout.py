@@ -189,7 +189,7 @@ class ServerAdapter(BaseRollout):
         if not self._ensure_server_handle():
             return None
 
-        future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
+        future = self.server_handle.collective_rpc.remote(method=method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
 
     async def resume(self, tags: list[str]):
@@ -247,7 +247,7 @@ class ServerAdapter(BaseRollout):
         if self._has_server:
             await self.server_handle.clear_kv_cache.remote()
             if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+                await self.server_handle.set_global_steps.remote(global_steps=global_steps)
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
@@ -273,7 +273,7 @@ class ServerAdapter(BaseRollout):
             # marker: weights are unchanged, so advance the step tag without
             # touching the transfer engine or the KV cache.
             if global_steps is not None and self._ensure_server_handle():
-                await self.server_handle.set_global_steps.remote(global_steps)
+                await self.server_handle.set_global_steps.remote(global_steps=global_steps)
             return
 
         first_named_tensors, saw_last = first_item
@@ -316,7 +316,7 @@ class ServerAdapter(BaseRollout):
         if self._has_server:
             await self.server_handle.clear_kv_cache.remote()
             if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+                await self.server_handle.set_global_steps.remote(global_steps=global_steps)
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

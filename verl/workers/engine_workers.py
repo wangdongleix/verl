@@ -900,7 +900,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
             else:
-                per_tensor_param, _ = self.actor.engine.get_per_tensor_param(rollout_layout=rollout_layout)
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
+                    rollout_layout=rollout_layout,
+                    weight_sync_mode=effective_mode,
+                    stream_kimi_experts=getattr(self.config.rollout, "name", "vllm") == "vllm",
+                )
                 metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             if self.actor.engine.is_param_offload_enabled:
                 self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)

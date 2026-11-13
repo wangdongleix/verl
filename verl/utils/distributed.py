@@ -122,7 +122,9 @@ def create_tcp_store(
         raise
 
 
-def stateless_init_process_group(master_address, master_port, rank, world_size, device):
+def stateless_init_process_group(
+    master_address, master_port, rank, world_size, device, *, listen_socket: socket.socket | None = None
+):
     """
     vLLM provides `StatelessProcessGroup` to create a process group
     without considering the global process group in torch.distributed.
@@ -158,13 +160,14 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
         This is copied from vllm/distributed/utils.py:StatelessProcessGroup.create
         Modified to support ipv6 stateless communication groups."""
         launch_server = rank == 0
-        if launch_server and listen_socket is None:
-            if is_ipv6(master_address):
-                listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            else:
-                listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listen_socket.bind((host, port))
+        if launch_server:
+            if listen_socket is None:
+                if is_ipv6(host):
+                    listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                else:
+                    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listen_socket.bind((host, port))
             listen_socket.listen()
             listen_fd = listen_socket.fileno()
         else:
@@ -211,7 +214,9 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
             )
         return pg
 
-    pg = create_process_group(host=master_address, port=master_port, rank=rank, world_size=world_size)
+    pg = create_process_group(
+        host=master_address, port=master_port, rank=rank, world_size=world_size, listen_socket=listen_socket
+    )
 
     pynccl = PyNcclCommunicator(pg, device=device)
     return pynccl
