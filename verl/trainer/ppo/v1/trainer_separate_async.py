@@ -337,12 +337,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self._to_trainer_costs
         )
 
-    def _stop_profiling(self) -> None:
-        # The base fit loop calls this before on_step_end(), but separate_async
-        # synchronizes weights in that hook. Keep both pools tracing until then.
-        self._profile_stop_pending = True
-
     def on_step_end(self):
+        # _stop_profiling() already moved this step's flag to prev_step_profile.
+        if self.prev_step_profile:
+            self._stop_rollout_profiling()
+
         config = self.hybrid_rollout_config
         should_switch = False
         prepare_seconds = 0.0
@@ -406,18 +405,6 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                     logger.info("Switching hybrid engine to rollout mode for the next step")
                     self.switch_to_rollout(already_registered=True)
                 self._to_rollout_costs.append(prepare_seconds + time.perf_counter() - switch_start)
-
-        if getattr(self, "_profile_stop_pending", False):
-            profiler = self.config.global_profiler
-            stop_rollout = self.curr_step_profile and (
-                not profiler.profile_continuous_steps or self.global_steps + 1 not in (profiler.steps or [])
-            )
-            if stop_rollout:
-                self._stop_rollout_profiling()
-            # Stop rollout first so its traces are flushed before the training
-            # workers' finish hooks can collect the complete profiling output.
-            super()._stop_profiling()
-            self._profile_stop_pending = False
 
     def _get_n_gpus_for_throughput(self) -> int:
         """Include standalone rollout GPUs in the throughput denominator."""
